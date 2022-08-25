@@ -1,13 +1,15 @@
 [package]
 name = "cuttlefish"
 version = "0.0.0"
+description = "Hypervisor for wasm, defined by wit-bindgen"
 authors = ["Michael-F-Bryan <michaelfbryan@gmail.com>", "Kartik Thakore <kartik@thakore.ai>"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/cuttlefishvm/cuttlefish-vm.git"
-homepage = "https://cuttlefishvm.github.io/"
+categories = ["wasm"]
 edition = "2021"
-rust-version = "1.62.1"
+homepage = "https://cuttlefishvm.github.io/"
+license = "MIT OR Apache-2.0"
 readme = "../../README.md"
+repository = "https://github.com/cuttlefishvm/cuttlefish-vm.git"
+rust-version = "1.62.1"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
