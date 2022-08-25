@@ -6,10 +6,8 @@
   <br />
   <br />
   <a href="https://discord.gg/KZGmKcayAT" target="_blank"><img height=20 src="https://img.shields.io/discord/1012403879557738637" /></a>
+   <a href="https://github.com/cuttlefishvm/cuttlefish-vm/actions" target="_blank"><img height=20 src="https://github.com/cuttlefishvm/cuttlefish-vm/workflows/Continuous%20Integration/badge.svg?branch=main" /></a>
 </p>
-
-
-[![Continuous integration](https://github.com/cuttlefishvm/cuttlefish-vm/workflows/Continuous%20Integration/badge.svg?branch=main)](https://github.com/cuttlefishvm/cuttlefish-vm/actions)
 
 ([API Docs][api-docs])
 
