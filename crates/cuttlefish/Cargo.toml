@@ -1,11 +1,13 @@
 [package]
 name = "cuttlefish"
-version = "0.1.0"
-authors = ["Michael-F-Bryan <michaelfbryan@gmail.com>"]
+version = "0.0.0"
+authors = ["Michael-F-Bryan <michaelfbryan@gmail.com>", "Kartik Thakore <kartik@thakore.ai>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cuttlefishvm/cuttlefish-vm.git"
+homepage = "https://cuttlefishvm.github.io/"
 edition = "2021"
 rust-version = "1.62.1"
+readme = "../../README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

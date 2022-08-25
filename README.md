@@ -1,6 +1,6 @@
-# cuttlefish-vm
+# The Cuttlefish VM
 
-[![Continuous integration](https://github.com/cuttlefishvm/cuttlefish-vm/workflows/Continuous%20integration/badge.svg?branch=main)](https://github.com/cuttlefishvm/cuttlefish-vm/actions)
+[![Continuous integration](https://github.com/cuttlefishvm/cuttlefish-vm/workflows/Continuous%20Integration/badge.svg?branch=main)](https://github.com/cuttlefishvm/cuttlefish-vm/actions)
 
 ([API Docs][api-docs])
 

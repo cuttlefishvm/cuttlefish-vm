@@ -1,9 +1,5 @@
-#[cfg(test)]
-mod tests {
-    use super::*;
+//! Placeholder crate for the [Cuttlefish][cuttlefish] project.
+//!
+//! [cuttlefish]: https://cuttlefishvm.github.io/
 
-    #[test]
-    fn it_works() {
-        assert_eq!(1 + 1, 2);
-    }
-}
+#![doc(html_logo_url = "https://cuttlefishvm.github.io/assets/images/logo.png")]
