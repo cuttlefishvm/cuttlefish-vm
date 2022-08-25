@@ -1,4 +1,4 @@
-# The Cuttlefish VM
+# Cuttlefish VM
 
 
 <p align="center">
