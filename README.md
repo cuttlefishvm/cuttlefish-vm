@@ -1,5 +1,14 @@
 # The Cuttlefish VM
 
+
+<p align="center">
+  <a href="https://cuttlefishvm.github.io"><img src="https://cuttlefishvm.github.io/assets/images/logo.png" alt="Logo" height=170></a>
+  <br />
+  <br />
+  <a href="https://discord.gg/KZGmKcayAT" target="_blank"><img height=20 src="https://img.shields.io/discord/1012403879557738637" /></a>
+</p>
+
+
 [![Continuous integration](https://github.com/cuttlefishvm/cuttlefish-vm/workflows/Continuous%20Integration/badge.svg?branch=main)](https://github.com/cuttlefishvm/cuttlefish-vm/actions)
 
 ([API Docs][api-docs])
