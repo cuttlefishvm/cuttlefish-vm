@@ -1,0 +1,18 @@
+[project]
+name = "cuttlefish"
+version = "0.1.0"
+description = "Native tooling for agents — llama.cpp-backed task runner driven by Cuttlefish.spec."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
