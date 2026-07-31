@@ -90,7 +90,7 @@ jobs:
       # fails, either fix the code or raise that field deliberately — bumping
       # this in isolation just hides the break from anyone on an older rustc.
       # The floor is imposed by wasmtime, which declares 1.94.0.
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-unknown-unknown
       - name: Rust Cache
