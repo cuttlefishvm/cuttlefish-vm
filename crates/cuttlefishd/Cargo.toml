@@ -9,8 +9,6 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-[dependencies]
-
 [lib]
 name = "cuttlefishd"
 path = "src/lib.rs"
@@ -18,3 +16,22 @@ path = "src/lib.rs"
 [[bin]]
 name = "cuttlefishd"
 path = "src/main.rs"
+
+[dependencies]
+cuttlefish-abi = { workspace = true }
+cuttlefish-core = { workspace = true }
+cuttlefish-host = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["signal", "fs"] }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+wasmtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { workspace = true }
