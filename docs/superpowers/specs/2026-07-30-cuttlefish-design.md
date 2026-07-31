@@ -34,8 +34,8 @@ Rejected alternatives: a single multi-mode binary (Rune's own shape) couples the
 Cuttlefish ships an agent-harness package alongside the daemon so a calling coding agent learns it exists and when to delegate:
 
 - **Skills plugin** (multi-platform adapter dirs, mirroring superpowers). Core skill `using-cuttlefish`, injected at session start: tells the agent when to delegate — bulk/repetitive subtasks, and any step touching data flagged local-only.
-- **Per-spec discovery**: `GET /specs` lists installed specs with their `description` field. That field is trigger-conditions-only ("Use when...") by convention — never a workflow summary, per superpowers' tested finding that summarizing lets the agent skip the real contract. (Worth a compile-time lint that flags a description matching workflow-summary patterns.)
-- **Data boundary**: a spec declares `data_policy: local_only`. The harness skill instructs the agent to pass file *paths*, not file contents, for such jobs — `cuttlefishd` reads the files itself. The privacy guarantee is that the frontier-model agent never reads the proprietary bytes into its own context, not merely "we also ran something locally."
+- **Per-spec discovery**: `GET /specs` lists installed specs with their `description` field. That field is trigger-conditions-only ("Use when...") by convention — never a workflow summary, per superpowers' tested finding that summarizing lets the agent skip the real contract. A compile-time lint flagging a description that matches workflow-summary patterns is in scope for v1 (see Testing strategy).
+- **Data boundary**: a spec declares `data_policy: local_only`. This field is discovery metadata only — consumed by the harness skill, which instructs the calling agent to pass file *paths*, not file contents, for such jobs, so `cuttlefishd` reads the files itself. `data_policy` carries no runtime enforcement of its own: the thing that actually gates `host_read` is the `capabilities` list (below), checked at compile time and again by the daemon at runtime. A spec can declare `Read` capability independent of `data_policy` — `data_policy: local_only` is what tells the *agent* to behave differently (paths not content); `capabilities` is what tells the *sandbox* what it's allowed to touch. The privacy guarantee is that the frontier-model agent never reads the proprietary bytes into its own context, not merely "we also ran something locally."
 - **Enforcement boundary**: the wasm program + daemon are the *enforced* contract (deterministic, sandboxed, capability-checked). Spec/skill prose only governs the calling agent's *decision to delegate* — natural language never controls the runtime.
 - **Sandbox default-deny**: a proc-block gets no network/filesystem access by default. The daemon grants only the capabilities a spec declares (see below), visible via `cuttlefish inspect`.
 
@@ -57,7 +57,7 @@ spec summarize_docs = {
                   text and content must not leave the machine.";
   model = Hf "Qwen/Qwen2.5-7B-Instruct-GGUF#q4_k_m" ~ctx:8192;  (* or: Path "./models/foo.gguf" *)
   data_policy = Local_only;
-  capabilities = [ Read "./docs" ];
+  capabilities = [ Read "./docs" ];  (* capabilities : (Read of string | Network) list *)
 
   pipeline =
     let chunks = block Chunk_text ~max_tokens:2000 (Input files) in
@@ -91,7 +91,7 @@ GET    /models            loaded models + memory budget status
 
 **Result envelope** (fixed, spec-independent): `{status, result: <output-typed payload>, error?, usage: {tokens_in, tokens_out, duration_ms, model}}`.
 
-**Model pool** — keyed by resolved model ref (hash of gguf + quant). A configured memory budget (`--vram-budget`/`--ram-budget`) gates loading; exceeding it evicts the least-recently-used *idle* model (never one with an in-flight job). Multiple models load concurrently up to budget — jobs on different models run in true parallel; jobs on the same model share its context, queued at the inference-call level, not the job level.
+**Model pool** — keyed by resolved model ref (hash of gguf + quant). A configured memory budget (`--vram-budget`/`--ram-budget`) gates loading; exceeding it evicts the least-recently-used *idle* model (never one with an in-flight job). Multiple models load concurrently up to budget — jobs on different models run in true parallel; jobs on the same model are serialized against that one loaded instance, queued at the inference-call level (not the job level) so throughput isn't blocked on a whole job finishing — but no prompt/conversation state is ever shared or visible between jobs, each job's wasm instance holds its own context independently.
 
 **Scheduler / job lifecycle** — direct lift from claurst_bridge's async pattern: each job is a `tokio::spawn`ed task running one wasmtime instance (no shared mutable state between jobs) plus a `CancellationToken`. Host ABI calls go through `tokio::select!` against that token, so cancel works mid-inference, not just between pipeline steps. States: `queued → running → completed | failed | cancelled`. A job queues on model-pool availability, not a global lock.
 
@@ -120,6 +120,8 @@ Any call outside the spec's declared capabilities traps the wasm instance immedi
 - Multi-language proc-block authoring (WASI/WIT component model) — v1 is Rust-only via a `cuttlefish-sdk` crate.
 - Streaming/cancel was scoped into the host ABI from v1 (not deferred) per the "what does the wasm program need at minimum" decision — noted here only because it was one of several ABI-scope options considered.
 
-## Open question carried into implementation planning
+## Implementation planning scope
 
-None blocking — the one internal inconsistency found in review (native runtime scope wrongly stated as "inference only" when it also needs capability-gated file IO) is resolved above.
+This document is the whole-system architecture pass, by design (chosen explicitly over sub-project-first specs, since these pieces share one compile→link→run pipeline and needed to be designed together to keep the wasm/native split and capability model consistent end to end). It is **not** meant to be planned and built as a single implementation pass — it bundles five subsystems (DSL compiler, daemon, CLI, block registry, agent-harness plugin) that don't need to land simultaneously.
+
+Recommended first implementation plan: **compiler + daemon + CLI, local-path-only** — a minimal end-to-end job (`.cuttlefish` spec with `Path`-referenced model and local-path block refs, no registry network calls) that exercises the full architecture (typed DSL → wasm link → daemon load → host ABI → streamed result) without standing up registry infrastructure or the harness plugin. Registry (`push`/`pull`/hash-verify service) and the agent-harness skills plugin are each substantial enough to warrant their own follow-on spec once the core loop is proven.
