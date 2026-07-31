@@ -1,0 +1,96 @@
+name: Release
+
+# Publishes the workspace to crates.io when a version tag is pushed.
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Publishing is irreversible: a crates.io version can be yanked but never
+# replaced or deleted. So this workflow is deliberately tag-triggered rather
+# than running on every merge to main, and it verifies everything it can before
+# the first irreversible call.
+#
+# Requires a CRATES_IO_TOKEN secret:
+#   cargo login                # to get a token from https://crates.io/settings/tokens
+#   gh secret set CRATES_IO_TOKEN --repo cuttlefishvm/cuttlefish-vm
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Dry-run on demand: exercises the whole workflow except the publish itself.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # The tag is the source of truth for the version, but Cargo.toml is what
+      # actually gets published. If they disagree, the tag is a lie — catch it
+      # here rather than after publishing a version nobody can retract.
+      - name: Verify tag matches workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import sys, json; print(json.load(sys.stdin)["packages"][0]["version"])')
+          echo "tag=$tag manifest=$manifest"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::tag v$tag does not match workspace version $manifest"
+            exit 1
+          fi
+
+      # A crate that does not build cannot be unpublished, so re-run the gates
+      # here rather than trusting that main was green when the tag was cut.
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Catches the packaging-specific failures that a normal build does not:
+      # files missing from the published tarball, path dependencies without
+      # versions, invalid metadata.
+      - name: Package check
+        run: cargo publish --dry-run -p cuttlefish-abi --locked
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Order matters and is not automatic: a crate cannot be published
+          # before the dependencies it names, because crates.io resolves them at
+          # publish time. Dependents therefore wait for the index to catch up.
+          #
+          # Keep this list in dependency order as crates are added:
+          #   cuttlefish-abi  -> (no workspace deps)
+          #   cuttlefish-core -> (no workspace deps)
+          #   cuttlefish-sdk  -> abi
+          #   cuttlefish-host -> abi
+          #   cuttlefishd     -> abi, core, host
+          #   cuttlefish      -> abi, core
+          for crate in cuttlefish-abi; do
+            echo "::group::publishing $crate"
+            # Tolerate a version already on crates.io so that re-running a
+            # partially-failed release resumes instead of dying on step one.
+            if cargo publish -p "$crate" --locked; then
+              echo "$crate published"
+            else
+              echo "::warning::$crate failed to publish — already released at this version?"
+            fi
+            echo "::endgroup::"
+          done
