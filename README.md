@@ -8,7 +8,7 @@
   <a href="https://codecov.io/gh/cuttlefishvm/cuttlefish-vm" target="_blank"><img alt="Coverage" src="https://codecov.io/gh/cuttlefishvm/cuttlefish-vm/branch/main/graph/badge.svg" /></a>
   <a href="https://crates.io/crates/cuttlefish" target="_blank"><img alt="crates.io" src="https://img.shields.io/crates/v/cuttlefish.svg" /></a>
   <a href="https://docs.rs/cuttlefish" target="_blank"><img alt="docs.rs" src="https://docs.rs/cuttlefish/badge.svg" /></a>
-  <img alt="MSRV" src="https://img.shields.io/badge/rustc-1.79+-blue.svg" />
+  <img alt="MSRV" src="https://img.shields.io/badge/rustc-1.94+-blue.svg" />
   <a href="#license" target="_blank"><img alt="License" src="https://img.shields.io/crates/l/cuttlefish.svg" /></a>
   <a href="https://discord.gg/KZGmKcayAT" target="_blank"><img alt="Discord" src="https://img.shields.io/discord/1012403879557738637" /></a>
 </p>

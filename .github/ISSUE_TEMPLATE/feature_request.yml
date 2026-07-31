@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a change in behaviour or a new capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation, not the solution you have in mind.
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to see?
+    validations: { required: true }
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you considered instead?
+      description: >
+        Especially relevant if this would widen what a guest block can reach —
+        those changes need an argument for why existing primitives are
+        insufficient.

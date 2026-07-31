@@ -4,12 +4,45 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+        };
+
+        # Guest proc-blocks compile to wasm32-unknown-unknown; the host is
+        # native. Pinned as one toolchain so both targets come from the same
+        # rustc — nixpkgs' plain `rustc` ships no wasm std, which is why this
+        # goes through rust-overlay rather than pkgs.rustc.
+        #
+        # On wasm64: guests are capped at 4 GiB of linear memory here, which is
+        # deliberate rather than accidental. Bulk data never enters guest memory
+        # (blocks pull bounded windows through Open/Slice handles), so the cap
+        # binds on nothing we actually do. If a future block genuinely needs a
+        # >4 GiB resident working set, switch THAT block to
+        # wasm64-unknown-unknown rather than the whole project: one wasmtime
+        # engine with wasm_memory64(true) runs 32- and 64-bit modules side by
+        # side, and cuttlefish-host detects width via MemoryType::is_64.
+        # The cost is real, so weigh it: wasm64 is Tier 3 with no prebuilt std,
+        # so it needs
+        #   pkgs.rust-bin.nightly.latest.default.override {
+        #     targets = [ "wasm64-unknown-unknown" ];
+        #     extensions = [ "rust-src" ];   # required by -Z build-std
+        #   }
+        # plus `-Z build-std=std,panic_abort` on the guest build, and 64-bit
+        # memories lose wasmtime's guard-page bounds-check elision.
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+          targets = [ "wasm32-unknown-unknown" ];
+          extensions = [ "rust-src" "rust-analyzer" "llvm-tools-preview" ];
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -17,14 +50,14 @@
             pkgs.python312
             pkgs.uv          # python env / runner
 
-            # Rust — native runner + wasm host (wasmtime/wasmer bindings) + llama.cpp bindings.
-            pkgs.rustc
-            pkgs.cargo
+            # Rust — host runtime, wasm guest blocks, and the CLI.
+            rustToolchain
             pkgs.maturin     # only needed if/when a PyO3 bridge crate shows up
             pkgs.libiconv    # darwin linking for any cdylib/native extension
 
-            # wasm target for the task-prep/return programs Cuttlefish.spec compiles against.
-            pkgs.wasm-pack
+            # Coverage, matching what CI reports to Codecov. Needs the
+            # llvm-tools-preview component above.
+            pkgs.cargo-llvm-cov
           ];
 
           shellHook = ''

@@ -1,2 +1,49 @@
 [workspace]
-members = ["crates/*"]
+resolver = "2"
+# Members are listed explicitly rather than globbed as `crates/*`, because guest
+# proc-blocks live in `blocks/` outside `crates/`, and a glob would silently miss
+# them — a missing member surfaces later as a confusing "package not found".
+# Add each new crate here as it lands.
+members = [
+    "crates/cuttlefish", # facade + `cuttlefish` binary; the published crate
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cuttlefishvm/cuttlefish-vm.git"
+homepage = "https://cuttlefishvm.github.io/"
+authors = [
+    "Michael-F-Bryan <michaelfbryan@gmail.com>",
+    "Kartik Thakore <kartik@thakore.ai>",
+]
+# Kept in lockstep with the `msrv` job in .github/workflows/ci.yml. These are one
+# decision recorded in two places; moving only the CI pin hides a break from
+# everyone on an older compiler.
+#
+# The floor is not chosen, it is imposed: wasmtime 47 declares rust-version
+# 1.94.0, so nothing below that can build. (reqwest wants 1.85, axum 1.78 — both
+# are below the binding constraint.) Verify before lowering.
+rust-version = "1.94"
+
+# Dependency versions are pinned once here and inherited with
+# `foo = { workspace = true }` so that the host, the daemon, and the guest SDK
+# can never drift onto different versions of a shared type.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }  # `sync` gates BroadcastStream
+futures-util = "0.3"
+wasmtime = "47"
+# axum 0.8, not 0.7: its `serve` accepts any listener including a UnixListener,
+# which is the whole reason this project needs no hand-rolled hyper accept loop.
+# Note 0.8 also changed path syntax from `/jobs/:id` to `/jobs/{id}`.
+axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
