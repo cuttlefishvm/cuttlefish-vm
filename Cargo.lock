@@ -5,6 +5,10 @@ version = 4
 [[package]]
 name = "cf-block-echo-summarize"
 version = "0.0.1"
+dependencies = [
+ "cuttlefish-sdk",
+ "serde_json",
+]
 
 [[package]]
 name = "cuttlefish"
@@ -34,6 +38,8 @@ name = "cuttlefish-sdk"
 version = "0.0.1"
 dependencies = [
  "cuttlefish-abi",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

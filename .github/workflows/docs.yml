@@ -85,7 +85,14 @@ jobs:
           # "no coverage data found". That is a real state — it is true right
           # now — not a failure worth blocking a docs deploy on, so it degrades
           # to an "unknown" badge instead.
-          pct=$(cargo llvm-cov --workspace --locked --json --summary-only 2>/dev/null \
+          # `blocks/` is excluded deliberately. Guest proc-blocks execute inside wasm,
+          # where llvm-cov's instrumentation cannot reach, so they report as 0%
+          # regardless of how well they are tested — they are covered
+          # behaviourally through the host's integration tests instead. Leaving
+          # them in would make the figure track "how much guest code exists"
+          # rather than "how much host logic is tested".
+          pct=$(cargo llvm-cov --workspace --locked --json --summary-only \
+                  --ignore-filename-regex '(^|/)blocks/' 2>/dev/null \
                 | python3 -c 'import sys, json; print(round(json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"], 1))' \
                 2>/dev/null || true)
 
