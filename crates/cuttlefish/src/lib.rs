@@ -65,6 +65,12 @@
 //! [cuttlefish]: https://cuttlefishvm.github.io/
 
 #![doc(html_logo_url = "https://cuttlefishvm.github.io/assets/images/logo.png")]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+// No `#![cfg_attr(docsrs, feature(doc_auto_cfg))]`: that feature was removed in
+// Rust 1.92 (merged into `doc_cfg`) and now hard-errors under `--cfg docsrs`.
+// The crate has no cargo features to annotate anyway. If features are added
+// later and their docs need "available on feature X" labels, reach for the
+// then-current `doc_cfg` spelling and verify it against the pinned toolchain
+// before committing — this exact line already broke CI once.

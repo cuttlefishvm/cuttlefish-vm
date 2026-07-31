@@ -39,8 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Nightly for `--cfg docsrs` feature annotations; the rest of CI is stable.
-      - uses: dtolnay/rust-toolchain@nightly
+      # Stable, same as the rest of CI. This was nightly to enable
+      # `doc_auto_cfg`, which Rust 1.92 removed — there is now nothing here that
+      # needs an unstable compiler, and building docs on a different channel
+      # than the tests only invites drift.
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
