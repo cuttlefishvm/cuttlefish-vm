@@ -1510,6 +1510,8 @@ reqwest = { version = "0.12.20", default-features = false, features = ["json", "
 
 `crates/cuttlefishd/src/state.rs`. Finished envelopes are retained here rather than existing only on the SSE stream — that is what makes a dropped connection non-fatal.
 
+Events are *also* retained, in a per-job replay log. This is not optional polish: `tokio::sync::broadcast` has no replay for late subscribers — `send` returns early when the receiver count is zero and does not even write to the ring buffer, and `subscribe()` starts at the current tail. A client that POSTs a job and then makes a second round trip to attach to `/events` will reliably miss every event of a fast job. The spec's `Last-Event-ID` replay requirement lands on this same log.
+
 ```rust
 use cuttlefish_abi::{Envelope, JobStatus};
 use std::collections::HashMap;
@@ -1523,8 +1525,12 @@ pub struct Job {
     pub status: JobStatus,
     pub envelope: Option<Envelope>,
     pub cancel: CancellationToken,
-    /// Live events; late subscribers rely on `envelope` instead.
+    /// Live events for already-attached subscribers.
     pub events: broadcast::Sender<String>,
+    /// Everything ever published, so a late subscriber can catch up.
+    /// Unbounded, which is fine at this slice's scale (a job emits tens of
+    /// events); a real cap belongs here once jobs get long.
+    pub log: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -1539,6 +1545,24 @@ impl JobStore {
 
     pub async fn get(&self, id: &str) -> Option<Job> {
         self.jobs.lock().await.get(id).cloned()
+    }
+
+    /// Append to the replay log and fan out to live subscribers under one lock,
+    /// so an event can never be both missed by a subscriber and absent from the
+    /// log. `send` failing just means nobody is attached yet — the log covers it.
+    pub async fn publish(&self, id: &str, payload: String) {
+        if let Some(job) = self.jobs.lock().await.get_mut(id) {
+            job.log.push(payload.clone());
+            let _ = job.events.send(payload);
+        }
+    }
+
+    /// Snapshot the backlog and attach a live receiver under the *same* lock
+    /// guard. Splitting these would reopen the gap this exists to close.
+    pub async fn subscribe(&self, id: &str) -> Option<(Vec<String>, broadcast::Receiver<String>)> {
+        let jobs = self.jobs.lock().await;
+        let job = jobs.get(id)?;
+        Some((job.log.clone(), job.events.subscribe()))
     }
 
     pub async fn finish(&self, id: &str, envelope: Envelope) {
@@ -1634,6 +1658,7 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
             envelope: None,
             cancel: cancel.clone(),
             events: events_tx.clone(),
+            log: Vec::new(),
         })
         .await;
 
@@ -1643,24 +1668,30 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         caps: Capabilities::new(st.spec.read_roots.clone()),
     };
 
+    // Every event goes through `publish` so it lands in the replay log as well
+    // as the live broadcast — a client that attaches after the job finished
+    // still sees the whole stream.
     let (tx, mut rx) = mpsc::channel::<JobEvent>(256);
-    let forward = events_tx.clone();
+    let (fwd_store, fwd_id) = (st.jobs.clone(), id.clone());
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let payload = match ev {
                 JobEvent::Token(t) => serde_json::json!({"type": "token", "text": t}),
                 JobEvent::Progress(p) => serde_json::json!({"type": "progress", "progress": p}),
             };
-            let _ = forward.send(payload.to_string());
+            fwd_store.publish(&fwd_id, payload.to_string()).await;
         }
     });
 
     let (engine, backend, store, jid) = (st.engine.clone(), st.backend.clone(), st.jobs.clone(), id.clone());
     tokio::spawn(async move {
         let envelope = run_job(engine, backend, job_spec, tx, cancel).await;
-        let _ = events_tx.send(
-            serde_json::json!({"type": "result", "envelope": envelope}).to_string(),
-        );
+        store
+            .publish(
+                &jid,
+                serde_json::json!({"type": "result", "envelope": envelope}).to_string(),
+            )
+            .await;
         store.finish(&jid, envelope).await;
     });
 
@@ -1696,11 +1727,13 @@ async fn job_events(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, StatusCode> {
-    let job = st.jobs.get(&id).await.ok_or(StatusCode::NOT_FOUND)?;
-    let rx = job.events.subscribe();
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+    let (backlog, rx) = st.jobs.subscribe(&id).await.ok_or(StatusCode::NOT_FOUND)?;
+    let replay = futures_util::stream::iter(
+        backlog.into_iter().map(|m| Ok(SseEvent::default().data(m))),
+    );
+    let live = tokio_stream::wrappers::BroadcastStream::new(rx)
         .filter_map(|msg| futures_util::future::ready(msg.ok().map(|m| Ok(SseEvent::default().data(m)))));
-    Ok(Sse::new(stream))
+    Ok(Sse::new(replay.chain(live)))
 }
 ```
 
@@ -1929,10 +1962,12 @@ async fn streams_tokens_over_sse() {
         .unwrap()
         .to_string();
 
-    // The stream never closes on its own — the JobStore keeps a broadcast
-    // sender alive — so read chunks until both markers appear, under one
-    // overall timeout. This is a smoke test that streaming works at all, not
-    // an SSE conformance test, so the raw bytes are matched rather than parsed.
+    // Attaching here is a second round trip, by which time this stub job has
+    // usually finished — so this only passes because the JobStore replays its
+    // event log to late subscribers. The stream also never closes on its own
+    // (the store holds a live sender), hence reading chunks until both markers
+    // appear under one overall timeout rather than awaiting the whole body.
+    // A smoke test that streaming works, not an SSE conformance test.
     let resp = h
         .client
         .get(format!("http://localhost/jobs/{id}/events"))
