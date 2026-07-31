@@ -66,6 +66,49 @@ jobs:
           echo '<meta http-equiv="refresh" content="0; url=${{ env.DEFAULT_CRATE_NAME }}/index.html" />' > target/doc/index.html
         shell: bash
 
+      # The coverage badge is generated here rather than by a hosted service.
+      # cargo-llvm-cov produces the percentage; this writes a shields.io
+      # "endpoint" descriptor next to the docs, and the README points a badge at
+      # it. No account, no upload token, and no coverage data leaving CI — the
+      # only third party involved is shields.io rendering an SVG from a JSON
+      # file we host ourselves.
+      #
+      # It lives in this workflow because this workflow already owns the
+      # gh-pages branch. Publishing it from the CI workflow instead would mean
+      # two workflows racing to push to the same branch.
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage badge
+        shell: bash
+        run: |
+          set -uo pipefail
+          # A workspace with no test binaries makes llvm-cov exit non-zero with
+          # "no coverage data found". That is a real state — it is true right
+          # now — not a failure worth blocking a docs deploy on, so it degrades
+          # to an "unknown" badge instead.
+          pct=$(cargo llvm-cov --workspace --locked --json --summary-only 2>/dev/null \
+                | python3 -c 'import sys, json; print(round(json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"], 1))' \
+                2>/dev/null || true)
+
+          if [ -z "${pct:-}" ]; then
+            msg="unknown"
+            color="lightgrey"
+          else
+            msg="${pct}%"
+            # Thresholds are deliberately unambitious: a red badge should mean
+            # "genuinely untested", not "missed an aspiration".
+            whole=${pct%.*}
+            if   [ "$whole" -ge 80 ]; then color="brightgreen"
+            elif [ "$whole" -ge 70 ]; then color="green"
+            elif [ "$whole" -ge 50 ]; then color="yellow"
+            elif [ "$whole" -ge 30 ]; then color="orange"
+            else                           color="red"
+            fi
+          fi
+
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s","color":"%s"}\n' \
+            "$msg" "$color" > target/doc/coverage.json
+          echo "coverage badge: $msg ($color)"
+
       # rustdoc emits `static.files/`; without this Jekyll would try to process
       # the output and drop paths it treats as special.
       - name: Disable Jekyll processing

@@ -5,7 +5,7 @@
   <br />
   <br />
   <a href="https://github.com/cuttlefishvm/cuttlefish-vm/actions/workflows/ci.yml" target="_blank"><img alt="Continuous Integration" src="https://github.com/cuttlefishvm/cuttlefish-vm/actions/workflows/ci.yml/badge.svg?branch=main" /></a>
-  <a href="https://codecov.io/gh/cuttlefishvm/cuttlefish-vm" target="_blank"><img alt="Coverage" src="https://codecov.io/gh/cuttlefishvm/cuttlefish-vm/branch/main/graph/badge.svg" /></a>
+  <a href="https://cuttlefishvm.github.io/cuttlefish-vm/" target="_blank"><img alt="Coverage" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fcuttlefishvm.github.io%2Fcuttlefish-vm%2Fcoverage.json" /></a>
   <a href="https://crates.io/crates/cuttlefish" target="_blank"><img alt="crates.io" src="https://img.shields.io/crates/v/cuttlefish.svg" /></a>
   <a href="https://docs.rs/cuttlefish" target="_blank"><img alt="docs.rs" src="https://docs.rs/cuttlefish/badge.svg" /></a>
   <img alt="MSRV" src="https://img.shields.io/badge/rustc-1.94+-blue.svg" />
@@ -68,11 +68,17 @@ $ nix develop --command cargo test --workspace
 
 Running `cargo` outside that shell will pick up whatever toolchain happens to be on your `PATH`, which is a reliable source of confusing errors. If you'd rather not use Nix, check `flake.nix` for the pinned versions and match them yourself.
 
-Test coverage is measured with [`cargo-llvm-cov`][llvm-cov] and reported to Codecov on every push:
+Test coverage is measured with [`cargo-llvm-cov`][llvm-cov]:
 
 ```console
-$ nix develop --command cargo llvm-cov --workspace --all-features
+$ nix develop --command cargo llvm-cov --workspace          # summary
+$ nix develop --command cargo llvm-cov --workspace --html   # browsable report
 ```
+
+That is the same command CI runs. There is no coverage service and no upload
+token — CI publishes the resulting percentage as a small JSON file alongside the
+API docs, and the badge above renders from it. Coverage data never leaves the
+build.
 
 ## Contributing
 

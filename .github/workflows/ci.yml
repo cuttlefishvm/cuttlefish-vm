@@ -71,15 +71,16 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Collect coverage
-        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v7
-        with:
-          files: lcov.info
-          # Coverage reporting going down should not block a correct change.
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+      # Measurement only — no third-party upload. cargo-llvm-cov produces the
+      # number locally, which is all a coverage figure ever required; the badge
+      # is published from the docs workflow, which already owns gh-pages.
+      #
+      # `|| true` covers the legitimate case of a workspace with no test
+      # binaries, where llvm-cov exits non-zero with "no coverage data found".
+      # Replace this with a real `--fail-under-lines` threshold once there is
+      # enough code for a number to mean something.
+      - name: Coverage summary
+        run: cargo llvm-cov --workspace --locked --summary-only || true
 
   msrv:
     name: Minimum Supported Rust Version
