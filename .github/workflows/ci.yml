@@ -74,7 +74,7 @@ jobs:
       - name: Collect coverage
         run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           # Coverage reporting going down should not block a correct change.
