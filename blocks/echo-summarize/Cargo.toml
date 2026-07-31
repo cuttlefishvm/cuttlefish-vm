@@ -1,0 +1,20 @@
+[package]
+name = "cf-block-echo-summarize"
+description = "Example cuttlefish proc-block: summarizes a local file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Never goes to crates.io. This is a test fixture and a worked example — it is
+# built by the host's integration tests, not consumed as a dependency. Marking
+# it here means `cargo publish` cannot push it by accident, which matters
+# because publishing is irreversible: a version can be yanked, never replaced.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
