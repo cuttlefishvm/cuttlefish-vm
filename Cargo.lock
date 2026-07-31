@@ -334,6 +334,9 @@ dependencies = [
 [[package]]
 name = "cuttlefish-core"
 version = "0.0.1"
+dependencies = [
+ "thiserror 2.0.19",
+]
 
 [[package]]
 name = "cuttlefish-host"
