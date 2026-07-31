@@ -4,15 +4,15 @@ version = 4
 
 [[package]]
 name = "cf-block-echo-summarize"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "cuttlefish"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "cuttlefish-abi"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -20,25 +20,25 @@ dependencies = [
 
 [[package]]
 name = "cuttlefish-core"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "cuttlefish-host"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cuttlefish-core",
 ]
 
 [[package]]
 name = "cuttlefish-sdk"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cuttlefish-abi",
 ]
 
 [[package]]
 name = "cuttlefishd"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "itoa"
