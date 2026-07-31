@@ -62,6 +62,10 @@ jobs:
       # Catches the packaging-specific failures that a normal build does not:
       # files missing from the published tarball, path dependencies without
       # versions, invalid metadata.
+      # Only the leaf crate can be dry-run before its dependencies exist on
+      # crates.io — a dry run of a dependent tries to resolve siblings from the
+      # registry, where this version is not published yet. So this checks what it
+      # can; the ordered loop below is what proves the rest, on the real run.
       - name: Package check
         run: cargo publish --dry-run -p cuttlefish-abi --locked
 
@@ -72,25 +76,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Order matters and is not automatic: a crate cannot be published
-          # before the dependencies it names, because crates.io resolves them at
-          # publish time. Dependents therefore wait for the index to catch up.
+          # Order matters and is not automatic: crates.io resolves a package's
+          # dependencies at publish time, so a crate cannot go up before the
+          # crates it names. This list is in dependency order — keep it that way
+          # when adding crates, and note what depends on what:
           #
-          # Keep this list in dependency order as crates are added:
-          #   cuttlefish-abi  -> (no workspace deps)
-          #   cuttlefish-core -> (no workspace deps)
-          #   cuttlefish-sdk  -> abi
-          #   cuttlefish-host -> abi
-          #   cuttlefishd     -> abi, core, host
-          #   cuttlefish      -> abi, core
-          for crate in cuttlefish-abi; do
+          #   cuttlefish-abi   -> (none)
+          #   cuttlefish-core  -> (none)
+          #   cuttlefish-sdk   -> abi
+          #   cuttlefish-host  -> core (abi later)
+          #   cuttlefishd      -> abi, core, host
+          #   cuttlefish       -> abi, core        (the facade; published last)
+          #
+          # cf-block-echo-summarize is absent deliberately: it is a test fixture
+          # and carries `publish = false`.
+          for crate in \
+            cuttlefish-abi \
+            cuttlefish-core \
+            cuttlefish-sdk \
+            cuttlefish-host \
+            cuttlefishd \
+            cuttlefish
+          do
             echo "::group::publishing $crate"
-            # Tolerate a version already on crates.io so that re-running a
-            # partially-failed release resumes instead of dying on step one.
+            # Tolerate a version already on crates.io, so re-running a
+            # partially-failed release resumes rather than dying on step one.
             if cargo publish -p "$crate" --locked; then
               echo "$crate published"
             else
-              echo "::warning::$crate failed to publish — already released at this version?"
+              echo "::warning::$crate did not publish — already at this version?"
             fi
+            # crates.io's index is not immediately consistent: the next crate in
+            # this list may depend on the one just published and fail to resolve
+            # it. `cargo publish` waits for the index by default, but a short
+            # settle keeps a fast runner from racing ahead of propagation.
+            sleep 15
             echo "::endgroup::"
           done

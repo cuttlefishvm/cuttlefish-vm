@@ -6,7 +6,12 @@ resolver = "2"
 # Add each new crate here as it lands.
 members = [
     "crates/cuttlefish",     # facade + `cuttlefish` binary; the published crate
-    "crates/cuttlefish-abi", # wire types shared by host and guest
+    "crates/cuttlefish-abi",  # wire types shared by host and guest
+    "crates/cuttlefish-core", # spec parsing
+    "crates/cuttlefish-sdk",  # guest-side block authoring
+    "crates/cuttlefish-host", # wasmtime host + capability enforcement
+    "crates/cuttlefishd",     # the daemon
+    "blocks/echo-summarize",  # example block; publish = false
 ]
 
 [workspace.package]
@@ -32,6 +37,16 @@ rust-version = "1.94"
 # `foo = { workspace = true }` so that the host, the daemon, and the guest SDK
 # can never drift onto different versions of a shared type.
 [workspace.dependencies]
+# Internal crates carry BOTH a path and a version. The path is what the
+# workspace builds against; the version is what a published crate records for
+# its dependents. crates.io rejects a package whose dependency has only a path,
+# so omitting the version breaks `cargo publish` and nothing else — the
+# workspace builds fine right up until release day.
+cuttlefish-abi = { path = "crates/cuttlefish-abi", version = "0.1.0" }
+cuttlefish-core = { path = "crates/cuttlefish-core", version = "0.1.0" }
+cuttlefish-sdk = { path = "crates/cuttlefish-sdk", version = "0.1.0" }
+cuttlefish-host = { path = "crates/cuttlefish-host", version = "0.1.0" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

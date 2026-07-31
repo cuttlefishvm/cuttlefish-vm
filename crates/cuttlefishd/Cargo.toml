@@ -1,0 +1,20 @@
+[package]
+name = "cuttlefishd"
+description = "The cuttlefish daemon: accepts delegated jobs, runs them, streams results"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lib]
+name = "cuttlefishd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cuttlefishd"
+path = "src/main.rs"
