@@ -4,15 +4,26 @@ on:
   pull_request:
   push:
     branches:
-    - main
+      - main
 
+# The published crate is `cuttlefish`, and rustdoc emits it as `cuttlefish/`.
+# (This was `cuttlefish_vm`, which no crate in the workspace produces, so the
+# Pages redirect below pointed at a 404.)
 env:
-  DEFAULT_CRATE_NAME: cuttlefish_vm
+  DEFAULT_CRATE_NAME: cuttlefish
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+# A new push to a PR makes the in-flight run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
-    name: Compile and Test
+    name: Compile and Test (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -20,109 +31,98 @@ jobs:
           - macos-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v2
-      - name: Rust Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - uses: actions/checkout@v4
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+          # Tests build the guest proc-blocks, so the wasm target must be
+          # present on every platform in the matrix, not just Linux.
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
       - name: Type Checking
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --workspace --verbose --locked
+        run: cargo check --workspace --all-targets --locked --verbose
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --workspace --verbose --locked
+        run: cargo build --workspace --locked --verbose
       - name: Test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --workspace --verbose --locked
+        run: cargo test --workspace --locked --verbose
 
   lints:
     name: Linting and Formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: Rust Cache
-        uses: actions/cache@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: nightly
-          override: true
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
       - name: Check Formatting
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all --verbose --check
+        run: cargo fmt --all --check --verbose
       - name: Clippy
-        uses: actions-rs/clippy-check@v1
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  coverage:
+    name: Test Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --workspace --verbose
+          components: llvm-tools-preview
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Collect coverage
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          # Coverage reporting going down should not block a correct change.
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  msrv:
+    name: Minimum Supported Rust Version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Keep pinned to `rust-version` in the workspace Cargo.toml. If this job
+      # fails, either fix the code or raise that field deliberately — bumping
+      # this in isolation just hides the break from anyone on an older rustc.
+      - uses: dtolnay/rust-toolchain@1.79.0
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
 
   api-docs:
     name: Publish API Docs to GitHub Pages
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
       - name: Rust Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: nightly
-          override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --workspace --verbose --locked
+        uses: Swatinem/rust-cache@v2
+      # PRs build the docs too, so broken intra-doc links fail before merge
+      # rather than silently shipping; only main actually deploys.
+      - name: Build docs
+        run: cargo doc --workspace --no-deps --locked --verbose
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: Redirect top-level GitHub Pages
         run: 'echo ''<meta http-equiv="refresh" content="0; url=${{ env.DEFAULT_CRATE_NAME }}/index.html" />'' > target/doc/index.html'
         shell: bash
       - name: Upload API Docs
-        uses: JamesIves/github-pages-deploy-action@v4.4.0
+        uses: JamesIves/github-pages-deploy-action@v4
         if: github.ref == 'refs/heads/main'
         with:
           branch: gh-pages
           folder: target/doc
           single-commit: true
-

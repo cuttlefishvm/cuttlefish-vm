@@ -117,18 +117,28 @@ git commit -m "build: pin rust toolchain with wasm32-unknown-unknown target"
 [workspace]
 resolver = "2"
 members = [
+    "crates/cuttlefish",        # facade + `cuttlefish` binary; the published crate
     "crates/cuttlefish-abi",
     "crates/cuttlefish-core",
     "crates/cuttlefish-sdk",
     "crates/cuttlefish-host",
     "crates/cuttlefishd",
-    "crates/cuttlefish-cli",
     "blocks/echo-summarize",
 ]
+
+# Members are listed explicitly rather than via the inherited `crates/*` glob,
+# because `blocks/` sits outside `crates/` and a glob would silently miss it.
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Dual-licensed to match the existing published crate; do not diverge per-crate.
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cuttlefishvm/cuttlefish-vm.git"
+homepage = "https://cuttlefishvm.github.io/"
+# wasmtime 27 needs a far newer compiler than the 1.62.1 the placeholder crate
+# declared. Raise this deliberately, not by accident.
+rust-version = "1.79"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -346,10 +356,9 @@ Crate names and stub contents — note the block's package name is **not** its d
 | `crates/cuttlefish-sdk` | `cuttlefish-sdk` | empty `src/lib.rs` |
 | `crates/cuttlefish-host` | `cuttlefish-host` | empty `src/lib.rs` |
 | `crates/cuttlefishd` | `cuttlefishd` | `src/main.rs` with `fn main() {}` |
-| `crates/cuttlefish-cli` | `cuttlefish-cli` | `src/main.rs` with `fn main() {}` |
 | `blocks/echo-summarize` | `cf-block-echo-summarize` | empty `src/lib.rs` |
 
-`cuttlefish-cli`'s stub also needs the `[[bin]] name = "cuttlefish"` stanza from Task 8 so the binary name is right from the start. Later tasks fill in dependencies and code.
+`crates/cuttlefish` already exists from the merged repo — do **not** recreate it. It keeps its published identity (name `cuttlefish`, the crates.io slug) and gains the CLI in Task 8; leave its `Cargo.toml` alone until then apart from switching `version`/`edition`/`license` to `.workspace = true`.
 
 - [ ] **Step 7: Run the tests**
 
@@ -2411,18 +2420,35 @@ git commit -m "feat(daemon): serve job API over a unix socket with SSE and durab
 
 ---
 
-### Task 8: CLI client
+### Task 8: CLI client, in the published `cuttlefish` crate
+
+`crates/cuttlefish` is the crate already published to crates.io (v0.0.0 placeholder, name secured since 2022). It becomes the user-facing entry point: it re-exports the workspace pieces for docs, and ships the `cuttlefish` binary — so `cargo install cuttlefish` gives you the CLI and the published name matches the command name.
 
 **Files:**
-- Create: `crates/cuttlefish-cli/Cargo.toml`, `crates/cuttlefish-cli/src/main.rs`
+- Modify: `crates/cuttlefish/Cargo.toml`, `crates/cuttlefish/src/lib.rs`
+- Create: `crates/cuttlefish/src/main.rs`
 
-- [ ] **Step 1: Write the manifest**
+- [ ] **Step 1: Update the manifest**
+
+Keep the existing package identity — `name`, `description`, `authors`, `homepage`, `repository`, `readme`, `categories`, and the `html_logo_url` in `lib.rs` are the crate's published face and must survive. Change only what the workspace now owns, plus the corrected description:
 
 ```toml
 [package]
-name = "cuttlefish-cli"
+name = "cuttlefish"
+description = "Native tooling for agents: a local wasm runtime that runs jobs against local models"
+authors = ["Michael-F-Bryan <michaelfbryan@gmail.com>", "Kartik Thakore <kartik@thakore.ai>"]
+categories = ["wasm"]
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "cuttlefish"
+path = "src/lib.rs"
 
 [[bin]]
 name = "cuttlefish"
@@ -2430,6 +2456,7 @@ path = "src/main.rs"
 
 [dependencies]
 cuttlefish-abi = { path = "../cuttlefish-abi" }
+cuttlefish-core = { path = "../cuttlefish-core" }
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
 # Same UDS client as the daemon's tests; do not pin below 0.12.20.
@@ -2438,9 +2465,29 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 ```
 
-- [ ] **Step 2: Write `cuttlefish run`**
+- [ ] **Step 2: Keep the library as the documented facade**
 
-`crates/cuttlefish-cli/src/main.rs`. It POSTs the job, polls `GET /jobs/:id` until terminal, prints the envelope as JSON, and exits 0/1/2 for completed/failed/cancelled so shell callers and agents can branch without parsing stdout.
+`crates/cuttlefish/src/lib.rs` — preserve the existing `html_logo_url` doc attribute (it's what makes the published API docs carry the project logo) and re-export the workspace pieces so the crates.io docs have real surface instead of a placeholder:
+
+```rust
+//! Native tooling for agents: a local wasm runtime that runs jobs against
+//! local models.
+//!
+//! This crate is the facade. The moving parts live in sibling crates and are
+//! re-exported here so that `docs.rs/cuttlefish` documents the whole system
+//! from one page.
+//!
+//! [cuttlefish]: https://cuttlefishvm.github.io/
+
+#![doc(html_logo_url = "https://cuttlefishvm.github.io/assets/images/logo.png")]
+
+pub use cuttlefish_abi as abi;
+pub use cuttlefish_core as core;
+```
+
+- [ ] **Step 3: Write `cuttlefish run`**
+
+`crates/cuttlefish/src/main.rs`. It POSTs the job, polls `GET /jobs/:id` until terminal, prints the envelope as JSON, and exits 0/1/2 for completed/failed/cancelled so shell callers and agents can branch without parsing stdout.
 
 ```rust
 use anyhow::{bail, Context};
@@ -2522,7 +2569,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 3: Verify against a live daemon**
+- [ ] **Step 4: Verify against a live daemon**
 
 ```bash
 nix develop --command bash -c '
@@ -2544,41 +2591,66 @@ Expected: a JSON envelope with `"status":"completed"` and `"summary":"a stub sum
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/cuttlefish-cli examples Cargo.lock
-git commit -m "feat(cli): add cuttlefish run client"
+git add crates/cuttlefish examples Cargo.lock
+git commit -m "feat(cli): add cuttlefish run client to the published facade crate"
 ```
 
 ---
 
-### Task 9: README and slice wrap-up
+### Task 9: Green CI and slice wrap-up
+
+The repository scaffolding — README, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, the modernized CI workflow, and `codecov.yml` — already exists on `main`. This task makes it *true* rather than aspirational.
 
 **Files:**
-- Create: `README.md`
+- Modify: `README.md`, `.github/workflows/ci.yml` (only if a job proves wrong)
 
-- [ ] **Step 1: Write the README**
+- [ ] **Step 1: Run the full suite the way CI will**
 
-Cover: what cuttlefish is (one paragraph, pointing at the design spec), what this slice does and explicitly does not do (stub inference, no registry, no typechecker), how to enter the dev shell, how to build and run the example end to end, and where the plan and spec documents live.
+```bash
+nix develop --command cargo fmt --all --check
+nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+nix develop --command cargo test --workspace --locked
+```
+Expected: all pass. `--locked` matters — CI uses it, so a `Cargo.lock` that drifts from the manifests fails there and not here.
 
-- [ ] **Step 2: Verify the README's commands actually work**
+- [ ] **Step 2: Check coverage locally and see where it's thin**
 
-Run each command block from the README verbatim in a clean shell. Fix the README, not your memory of it, wherever they diverge.
+```bash
+nix develop --command cargo llvm-cov --workspace --locked
+```
 
-- [ ] **Step 3: Run the whole suite**
+Read the per-file output rather than the headline number. The parts that matter are `caps.rs` and `handles.rs` — they are the sandbox boundary, and an uncovered branch there is an unenforced rule, not a missing test. If either has uncovered lines, add tests before moving on.
 
-Run: `nix develop --command cargo test --workspace`
-Expected: all tests pass.
+Note that `blocks/` will show as uncovered and that is expected: guest blocks execute inside wasm, where the host's instrumentation cannot reach. They are covered behaviourally through the host's tests, which is why `codecov.yml` ignores them.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Verify the MSRV job would pass**
+
+```bash
+nix develop --command cargo check --workspace --all-targets --locked
+```
+
+If the workspace needs a newer compiler than the `rust-version = "1.79"` in `Cargo.toml`, raise that field *and* the pin in the `msrv` CI job together, and say why in the commit message.
+
+- [ ] **Step 4: Verify every command in the README actually works**
+
+Run each command block from the README verbatim in a clean shell, including the end-to-end example. Fix the README, not your memory of it, wherever they diverge. Then update its Status section to say what now runs.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add README.md
-git commit -m "docs: add README covering the vertical slice"
+git commit -m "docs: describe the working vertical slice"
 ```
 
 ---
 
 ## What this slice proves, and what comes next
 
-Proven end to end once Task 9 is green: the reactor host ABI works over real wasm, capabilities are enforced deny-by-default with traversal-safe path checks, cancellation is a host-side decision needing no guest cooperation, results survive a dropped connection, and the spec file drives all of it.
+Proven end to end once Task 9 is green: the reactor host ABI works over real wasm, capabilities are enforced deny-by-default with traversal-safe path checks, bulk data reaches blocks through bounded windows so guest memory never tracks input size, cancellation is a host-side decision needing no guest cooperation, results survive a dropped connection, and the spec file drives all of it.
 
 Deliberately still missing, roughly in the order the follow-on plans should take them: real llama.cpp behind `InferBackend`, the typed DSL with `.cfi` unification and parametric block signatures, multi-block DAG pipelines, the model pool with per-job contexts and memory budgets, the block registry, and the agent-harness skills plugin.
+
+Two decisions made here that later work should honour rather than quietly undo:
+
+- **`wasm64` is a config change, not a rewrite.** No pointer packing anywhere, and `Abi::detect` reads width from the module. Adding 64-bit support means a second set of `TypedFunc` signatures and dropping the bail — not a hunt for assumed pointer sizes.
+- **`crates/cuttlefish` is the published identity.** It carries the crates.io name (secured since 2022), the logo, and the dual MIT/Apache-2.0 licensing. Renaming or splitting it costs the published slug; the workspace grows around it instead.
