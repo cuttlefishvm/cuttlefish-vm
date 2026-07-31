@@ -80,7 +80,14 @@ jobs:
       # Replace this with a real `--fail-under-lines` threshold once there is
       # enough code for a number to mean something.
       - name: Coverage summary
-        run: cargo llvm-cov --workspace --locked --summary-only || true
+        # `blocks/` is excluded because guest proc-blocks execute inside wasm,
+        # where llvm-cov cannot instrument them — they report 0% however well
+        # they are tested. Keep this regex identical to the one in docs.yml,
+        # which generates the badge; a mismatch would make the badge and the CI
+        # log disagree about the same codebase.
+        run: |
+          cargo llvm-cov --workspace --locked --summary-only \
+            --ignore-filename-regex '(^|/)blocks/' || true
 
   msrv:
     name: Minimum Supported Rust Version
