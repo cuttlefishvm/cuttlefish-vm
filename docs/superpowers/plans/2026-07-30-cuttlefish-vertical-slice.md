@@ -2,21 +2,25 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the thinnest end-to-end path — a `.cuttlefish` spec file compiles to a wasm job that the daemon runs under the reactor host ABI and streams a result back over a unix socket — with a stub inference backend instead of llama.cpp.
+**Goal:** Build the thinnest end-to-end path — a `.cuttlefish` spec file configures a wasm job that the daemon runs under the reactor host ABI and streams a result back over a unix socket — with a stub inference backend instead of llama.cpp.
 
 **Architecture:** A Cargo workspace of four crates. `cuttlefish-abi` holds the wire types shared by host and guest. `cuttlefish-sdk` is the guest-side library a proc-block author writes against; it hides the reactor state machine behind ordinary Rust and emits the raw wasm exports. `cuttlefish-host` is the wasmtime driver that calls those exports, executes the commands the guest returns, and enforces capabilities. `cuttlefishd` is the daemon binary wrapping the host in an HTTP-over-UDS API, plus `cuttlefish`, the CLI client. Spec parsing in this slice is deliberately minimal: a single-block pipeline, `Path` model refs, local block paths, no registry.
 
-**Tech Stack:** Rust (workspace), wasmtime (host), `wasm32-wasip1` (guest target), axum + hyper over `UnixListener` (daemon API), tokio (async runtime + `CancellationToken`), serde/serde_json (wire format), chumsky (spec parser).
+**Tech Stack:** Rust (workspace), wasmtime (host), `wasm32-unknown-unknown` (guest target), axum routing served over a hand-rolled hyper accept loop on a `UnixListener` (daemon API), tokio (async runtime + `CancellationToken`), serde/serde_json (wire format), a hand-written scanner for the spec subset.
 
 **Spec:** `docs/superpowers/specs/2026-07-30-cuttlefish-design.md`
 
-**Explicitly out of scope for this slice** (each is later-plan material, do not build): real llama.cpp inference, the type unifier and `.cfi` interface files, block registry, model pool with memory budgets and eviction, the agent-harness skills plugin, `Network` capability, DAG-level loops, `cuttlefish push`/`inspect`/`graph`.
+**Explicitly out of scope for this slice** (each is later-plan material, do not build): real llama.cpp inference, the type unifier and `.cfi` interface files, block registry, model pool with memory budgets and eviction, the agent-harness skills plugin, `Network` capability, DAG-level loops, and the whole `cuttlefish build` compile-and-link step — in this slice the daemon takes an already-built `.wasm` path as an argument, and `cuttlefish inspect`/`graph`/`push` do not exist.
+
+**Environment rule:** every build/test command in this plan runs through `nix develop --command ...`. The toolchain is pinned by `flake.nix`; a bare `cargo` picks up whatever Homebrew or rustup has on `PATH`.
+
+**Why `wasm32-unknown-unknown` and not `wasm32-wasip1`:** a Rust cdylib built for wasip1 links wasi-libc, so even the panic path imports `wasi_snapshot_preview1::fd_write` and `proc_exit`. Those imports must be satisfied at instantiation or `Linker::instantiate` fails with `unknown import`. Guest blocks in this slice do all their IO through host commands and need no WASI at all, so the unknown-unknown target keeps the host's `Store<()>`/`Linker<()>` genuinely empty. When a later plan needs WASI in guests, add `wasmtime-wasi`, switch the store type to `WasiP1Ctx`, call `add_to_linker_sync`, and invoke the module's `_initialize` export before `cf_alloc`.
 
 ---
 
 ### Task 1: Nix devShell gains the wasm target
 
-The guest crates compile to `wasm32-wasip1`. Stock `pkgs.rustc` in nixpkgs does not ship that target's std, so the flake needs `rust-overlay` to select a toolchain with it.
+The guest crates compile to `wasm32-unknown-unknown`. Stock `pkgs.rustc` in nixpkgs does not ship that target's std, so the flake needs `rust-overlay` to select a toolchain with it.
 
 **Files:**
 - Modify: `flake.nix`
@@ -42,10 +46,10 @@ Replace the `inputs` block and the `pkgs` binding in `flake.nix`:
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
-        # Guest proc-blocks compile to wasm32-wasip1; the host is native. One
-        # toolchain pinned here so both targets come from the same rustc.
+        # Guest proc-blocks compile to wasm32-unknown-unknown; the host is
+        # native. One toolchain pinned here so both come from the same rustc.
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ "wasm32-wasip1" ];
+          targets = [ "wasm32-unknown-unknown" ];
         };
       in
 ```
@@ -56,14 +60,14 @@ In `devShells.default.buildInputs`, replace the `pkgs.rustc`, `pkgs.cargo`, and 
 
 - [ ] **Step 3: Verify the shell provides both targets**
 
-Run: `nix develop --command bash -c "rustc --print target-list | grep -x wasm32-wasip1 && cargo --version"`
-Expected: prints `wasm32-wasip1` then a cargo version line.
+Run: `nix develop --command bash -c "rustc --print target-list | grep -x wasm32-unknown-unknown && cargo --version"`
+Expected: prints `wasm32-unknown-unknown` then a cargo version line.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add flake.nix flake.lock
-git commit -m "build: pin rust toolchain with wasm32-wasip1 target"
+git commit -m "build: pin rust toolchain with wasm32-unknown-unknown target"
 ```
 
 ---
@@ -84,6 +88,7 @@ git commit -m "build: pin rust toolchain with wasm32-wasip1 target"
 resolver = "2"
 members = [
     "crates/cuttlefish-abi",
+    "crates/cuttlefish-core",
     "crates/cuttlefish-sdk",
     "crates/cuttlefish-host",
     "crates/cuttlefishd",
@@ -104,7 +109,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tokio-util = "0.7"
 wasmtime = "27"
 axum = "0.7"
-chumsky = "0.9"
 ```
 
 - [ ] **Step 2: Write `.gitignore`**
@@ -268,15 +272,28 @@ mod tests {
 }
 ```
 
-- [ ] **Step 6: Run the tests**
+- [ ] **Step 6: Create stub crates for every other workspace member**
+
+Cargo refuses to build a workspace whose members don't exist, so create all of them now rather than leaving the build knowingly broken between tasks. For each of `crates/cuttlefish-core`, `crates/cuttlefish-sdk`, `crates/cuttlefish-host`, `crates/cuttlefishd`, `crates/cuttlefish-cli`, `blocks/echo-summarize`, create a `Cargo.toml` with just the package stanza and an empty `src/lib.rs` (or `src/main.rs` for the two binaries):
+
+```toml
+[package]
+name = "<crate-name>"
+version.workspace = true
+edition.workspace = true
+```
+
+Later tasks fill in dependencies and code. `cuttlefish-cli`'s stub needs the `[[bin]] name = "cuttlefish"` stanza from Task 8 so the binary name is right from the start; a `fn main() {}` body is fine for now.
+
+- [ ] **Step 7: Run the tests**
 
 Run: `nix develop --command cargo test -p cuttlefish-abi`
-Expected: 3 tests pass. (Workspace members not yet created will break the build — if so, temporarily reduce `members` to just `cuttlefish-abi`, and restore entries as each crate lands. Simpler: create empty stub crates now.)
+Expected: 3 tests pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock .gitignore crates/cuttlefish-abi
+git add Cargo.toml Cargo.lock .gitignore crates blocks
 git commit -m "feat(abi): add wire types shared by wasm host and guest"
 ```
 
@@ -477,17 +494,26 @@ serde_json = { workspace = true }
 `blocks/echo-summarize/src/lib.rs`:
 
 ```rust
-use cuttlefish_abi::{Command, Event};
+use cuttlefish_abi::{Command, Event, TokenAction};
 use cuttlefish_sdk::{export_block, Block};
 
 /// Reads one file, summarizes it, returns the summary.
+///
+/// The `stop_after_first` input flag exists so the host's early-stop path has
+/// a block that actually exercises it; a real block would decide from content.
 #[derive(Default)]
 struct EchoSummarize {
     path: String,
+    stop_after_first: bool,
+    seen_tokens: u32,
 }
 
 impl Block for EchoSummarize {
     fn start(&mut self, input: serde_json::Value) -> Command {
+        self.stop_after_first = input
+            .get("stop_after_first")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         match input.get("path").and_then(|v| v.as_str()) {
             Some(path) => {
                 self.path = path.to_string();
@@ -515,6 +541,15 @@ impl Block for EchoSummarize {
             },
         }
     }
+
+    fn on_token(&mut self, _token: &str) -> TokenAction {
+        self.seen_tokens += 1;
+        if self.stop_after_first && self.seen_tokens >= 1 {
+            TokenAction::Stop
+        } else {
+            TokenAction::Continue
+        }
+    }
 }
 
 export_block!(EchoSummarize);
@@ -522,8 +557,8 @@ export_block!(EchoSummarize);
 
 - [ ] **Step 3: Build it to wasm**
 
-Run: `nix develop --command cargo build -p cf-block-echo-summarize --target wasm32-wasip1`
-Expected: builds; `target/wasm32-wasip1/debug/cf_block_echo_summarize.wasm` exists.
+Run: `nix develop --command cargo build -p cf-block-echo-summarize --target wasm32-unknown-unknown`
+Expected: builds; `target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm` exists.
 
 - [ ] **Step 4: Commit**
 
@@ -541,7 +576,7 @@ The core of the slice. The host owns the loop: call `cf_init`, get a command, ex
 **Files:**
 - Create: `crates/cuttlefish-host/Cargo.toml`
 - Create: `crates/cuttlefish-host/src/lib.rs`, `src/infer.rs`, `src/caps.rs`, `src/runner.rs`
-- Test: `crates/cuttlefish-host/tests/runner.rs`
+- Test: `crates/cuttlefish-host/tests/caps.rs`, `crates/cuttlefish-host/tests/runner.rs`
 
 - [ ] **Step 1: Write the manifest**
 
@@ -564,7 +599,9 @@ thiserror = { workspace = true }
 async-trait = "0.1"
 ```
 
-- [ ] **Step 2: Write the capability checker with its failing tests**
+- [ ] **Step 2: Write the failing capability tests first**
+
+Write `crates/cuttlefish-host/tests/caps.rs` (below) and the `[dev-dependencies]` stanza, then run `nix develop --command cargo test -p cuttlefish-host --test caps` and confirm it fails to compile because `caps` does not exist. Only then write the implementation.
 
 `crates/cuttlefish-host/src/caps.rs`:
 
@@ -686,6 +723,12 @@ pub trait InferBackend: Send + Sync {
 
 /// Deterministic fake: echoes a fixed reply word by word so streaming,
 /// early-stop, and token accounting are all testable without a model.
+///
+/// It yields between tokens. That matters: without an await point the whole
+/// loop would run inside a single poll, every token would land in the channel
+/// at once, and the host could never interleave a guest `Stop` verdict — the
+/// early-stop path would look correct while being dead code. A real llama.cpp
+/// backend awaits naturally; the stub has to do it deliberately.
 pub struct StubBackend {
     pub reply: String,
 }
@@ -714,6 +757,7 @@ impl InferBackend for StubBackend {
             if !keep_going {
                 break;
             }
+            tokio::task::yield_now().await;
         }
         Ok(InferResult {
             text: out,
@@ -736,6 +780,7 @@ impl InferBackend for StubBackend {
 use crate::caps::Capabilities;
 use crate::infer::InferBackend;
 use cuttlefish_abi::{error_codes, Command, Envelope, Event, JobError, JobStatus, Usage};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -898,27 +943,54 @@ pub async fn run_job(
                 }
             }
             Command::Infer { prompt, max_tokens } => {
-                // Tokens are collected here rather than handed straight to the
-                // guest because the wasmtime Store is !Sync and cannot be
-                // touched from inside the backend's async context.
+                // Tokens must reach the guest *while* generation runs — the
+                // guest's Stop verdict is what ends it early. The wasmtime
+                // Store is !Sync so the guest can't be touched from inside the
+                // backend's callback; a channel carries tokens out and a shared
+                // flag carries the verdict back in, without sharing the Store.
                 let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-                let mut sink = move |t: &str| tx.send(t.to_string()).is_ok();
-                let result = tokio::select! {
-                    _ = cancel.cancelled() => None,
-                    r = backend.infer(&prompt, max_tokens, &mut sink) => Some(r),
+                let stop = Arc::new(AtomicBool::new(false));
+                let sink_stop = stop.clone();
+                let mut sink = move |t: &str| {
+                    tx.send(t.to_string()).is_ok() && !sink_stop.load(Ordering::Relaxed)
                 };
-                while let Ok(tok) = rx.try_recv() {
-                    let _ = events.send(JobEvent::Token(tok.clone())).await;
-                    match guest.call_on_token(&tok) {
-                        Ok(true) => {}
-                        Ok(false) => break,
-                        Err(e) => {
-                            usage.duration_ms = started.elapsed().as_millis() as u64;
-                            return fail(error_codes::WASM_TRAP, e.to_string(), usage);
+
+                let mut trap: Option<String> = None;
+                let outcome = {
+                    let infer = backend.infer(&prompt, max_tokens, &mut sink);
+                    tokio::pin!(infer);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break None,
+                            Some(tok) = rx.recv() => {
+                                let _ = events.send(JobEvent::Token(tok.clone())).await;
+                                match guest.call_on_token(&tok) {
+                                    Ok(true) => {}
+                                    Ok(false) => stop.store(true, Ordering::Relaxed),
+                                    Err(e) => {
+                                        trap = Some(e.to_string());
+                                        break None;
+                                    }
+                                }
+                            }
+                            r = &mut infer => break Some(r),
                         }
                     }
+                };
+
+                if let Some(message) = trap {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return fail(error_codes::WASM_TRAP, message, usage);
                 }
-                match result {
+
+                // Tokens generated in the same poll as the final one are still
+                // queued; forward them so the stream is complete.
+                while let Ok(tok) = rx.try_recv() {
+                    let _ = events.send(JobEvent::Token(tok)).await;
+                }
+
+                match outcome {
                     None => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
                         return Envelope {
@@ -977,14 +1049,23 @@ use wasmtime::Engine;
 
 /// Builds the example block and returns its wasm bytes. Building here rather
 /// than checking in a binary keeps the fixture honest as the SDK changes.
-fn example_block() -> Vec<u8> {
-    let status = std::process::Command::new("cargo")
-        .args(["build", "-p", "cf-block-echo-summarize", "--target", "wasm32-wasip1"])
+///
+/// The guest is always built in debug: `cargo test --release` would otherwise
+/// look in a `release/` directory this never populates.
+pub fn example_block() -> Vec<u8> {
+    let status = std::process::Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "-p",
+            "cf-block-echo-summarize",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
         .status()
         .expect("cargo build failed to start");
     assert!(status.success(), "building the example block failed");
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    std::fs::read(root.join("target/wasm32-wasip1/debug/cf_block_echo_summarize.wasm"))
+    std::fs::read(root.join("target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm"))
         .expect("built wasm artifact not found")
 }
 
@@ -1047,6 +1128,42 @@ async fn denies_read_outside_capability() {
 }
 
 #[tokio::test]
+async fn guest_stop_verdict_truncates_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("doc.txt");
+    std::fs::write(&file, "text").unwrap();
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        JobSpec {
+            module_bytes: example_block(),
+            input: serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "stop_after_first": true,
+            }),
+            caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        },
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed);
+    let summary = envelope.result.unwrap()["summary"].as_str().unwrap().to_string();
+    // The stub's full reply is three tokens. Asserting "fewer than three"
+    // rather than an exact string keeps the test honest about the one-token
+    // lag between the guest's verdict and the backend observing it.
+    assert!(
+        envelope.usage.tokens_out < 3,
+        "stop verdict must cut generation short, got {} tokens ({summary:?})",
+        envelope.usage.tokens_out
+    );
+    assert_ne!(summary, "a stub summary", "stop verdict must truncate output");
+}
+
+#[tokio::test]
 async fn cancelled_before_start_yields_cancelled() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("doc.txt");
@@ -1075,7 +1192,7 @@ async fn cancelled_before_start_yields_cancelled() {
 - [ ] **Step 7: Run the tests**
 
 Run: `nix develop --command cargo test -p cuttlefish-host`
-Expected: 7 pass (4 caps + 3 runner).
+Expected: 8 pass (4 caps + 4 runner).
 
 - [ ] **Step 8: Commit**
 
@@ -1091,10 +1208,10 @@ git commit -m "feat(host): add reactor-model job runner with capability enforcem
 The full typed DSL with `.cfi` unification is a later plan. This slice parses the subset the vertical slice needs: name, description, `Path` model, capabilities, and a single-block pipeline. Anything richer is a parse error, not a silent partial parse.
 
 **Files:**
-- Create: `crates/cuttlefish-core/Cargo.toml`, `crates/cuttlefish-core/src/lib.rs`, `src/spec.rs`
+- Create: `crates/cuttlefish-core/src/lib.rs`, `crates/cuttlefish-core/src/spec.rs`
+- Modify: `crates/cuttlefish-core/Cargo.toml` (stub from Task 2)
 - Test: `crates/cuttlefish-core/tests/parse.rs`
 - Create: `examples/summarize.cuttlefish`
-- Modify: `Cargo.toml` (add the member)
 
 - [ ] **Step 1: Write the example spec file**
 
@@ -1103,12 +1220,14 @@ The full typed DSL with `.cfi` unification is a later plan. This slice parses th
 ```
 spec summarize_docs = {
   description = "Use when the agent needs a summary of a local file and content must not leave the machine.";
-  model = Path "./models/stub.gguf";
+  model = Path "../models/stub.gguf";
   data_policy = Local_only;
-  capabilities = [ Read "./examples/docs" ];
-  block = "./blocks/echo-summarize";
+  capabilities = [ Read "./docs" ];
+  block = "../blocks/echo-summarize";
 }
 ```
+
+Paths here are relative to the spec file's own directory, not to the daemon's working directory — `Read "./docs"` means `examples/docs`. (`block` is parsed but unused in this slice; the daemon takes the built `.wasm` as an argument, since `cuttlefish build` is out of scope.)
 
 - [ ] **Step 2: Write the failing parse tests**
 
@@ -1311,7 +1430,7 @@ pub fn parse_spec(src: &str) -> Result<Spec, SpecError> {
 pub mod spec;
 ```
 
-Add `"crates/cuttlefish-core"` to the workspace `members`, and drop the `chumsky` workspace dependency — it is unused until the real DSL lands.
+`crates/cuttlefish-core` is already a workspace member (created as a stub in Task 2); this task fills it in.
 
 - [ ] **Step 5: Run the tests**
 
@@ -1348,7 +1467,9 @@ cuttlefish-host = { path = "../cuttlefish-host" }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal", "fs"] }
 tokio-util = { workspace = true }
-tokio-stream = "0.1"
+# `sync` is not a default feature and is what gates BroadcastStream.
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
 wasmtime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -1360,7 +1481,9 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+# `unix_socket` on ClientBuilder is cfg(unix) and needs no extra feature,
+# but it is recent — do not pin below 0.12.20.
+reqwest = { version = "0.12.20", default-features = false, features = ["json", "stream"] }
 ```
 
 - [ ] **Step 2: Write the job store**
@@ -1433,7 +1556,7 @@ use axum::{
 use cuttlefish_abi::{Envelope, JobStatus, Usage};
 use cuttlefish_core::spec::Spec;
 use cuttlefish_host::{caps::Capabilities, infer::InferBackend, runner::{run_job, JobEvent, JobSpec}};
-use futures_util::stream::Stream;
+use futures_util::{stream::Stream, StreamExt};
 use serde::Deserialize;
 use std::{convert::Infallible, sync::Arc};
 use tokio::sync::{broadcast, mpsc};
@@ -1561,58 +1684,281 @@ async fn job_events(
 }
 ```
 
-Add `futures-util = "0.3"` to the crate's dependencies, and import `futures_util::StreamExt` where `filter_map` is used.
-
 - [ ] **Step 4: Write `main.rs` binding a unix socket**
+
+`axum::serve` in 0.7 takes a concrete `tokio::net::TcpListener` — the generic listener trait only arrives in axum 0.8 — so a unix socket needs a hand-rolled accept loop. That is why the manifest carries `hyper`, `hyper-util`, and `tower`. (Bumping to axum 0.8 instead is not a free swap: its path syntax changes, so every `/jobs/:id` route would become `/jobs/{id}`.)
+
+`crates/cuttlefishd/src/serve.rs`:
+
+```rust
+use axum::Router;
+use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
+use std::path::Path;
+use tokio::net::UnixListener;
+
+/// Serve an axum Router over a unix socket.
+pub async fn serve_unix(app: Router, sock_path: &Path) -> anyhow::Result<()> {
+    // A stale socket file from a previous run would make bind() fail with
+    // EADDRINUSE even though nothing is listening.
+    let _ = std::fs::remove_file(sock_path);
+    let listener = UnixListener::bind(sock_path)?;
+    eprintln!("cuttlefishd listening on {}", sock_path.display());
+
+    loop {
+        let (stream, _addr) = listener.accept().await?;
+        let app = app.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = TowerToHyperService::new(app);
+            if let Err(e) = http1::Builder::new()
+                // SSE responses stay open indefinitely; without this the
+                // connection is closed out from under a streaming client.
+                .keep_alive(true)
+                .serve_connection(io, service)
+                .await
+            {
+                eprintln!("connection error: {e}");
+            }
+        });
+    }
+}
+```
 
 `crates/cuttlefishd/src/main.rs`:
 
 ```rust
-mod api;
-mod state;
-
 use anyhow::Context;
 use cuttlefish_host::infer::StubBackend;
+use cuttlefishd::{api, serve, state};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let spec_path = args.next().context("usage: cuttlefishd <spec> <block.wasm> <socket>")?;
+    let spec_path = PathBuf::from(
+        args.next().context("usage: cuttlefishd <spec> <block.wasm> <socket>")?,
+    );
     let wasm_path = args.next().context("usage: cuttlefishd <spec> <block.wasm> <socket>")?;
-    let sock_path = args.next().unwrap_or_else(|| "/tmp/cuttlefish.sock".into());
+    let sock_path = PathBuf::from(args.next().unwrap_or_else(|| "/tmp/cuttlefish.sock".into()));
 
-    let spec = cuttlefish_core::spec::parse_spec(&std::fs::read_to_string(&spec_path)?)?;
-    let module_bytes = std::fs::read(&wasm_path)?;
+    let mut spec = cuttlefish_core::spec::parse_spec(&std::fs::read_to_string(&spec_path)?)?;
+
+    // Capability roots are written relative to the spec file, not to wherever
+    // the daemon happens to be started from. Resolving them here is what keeps
+    // `Read "./examples/docs"` meaning the same thing regardless of cwd.
+    let spec_dir = spec_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    spec.read_roots = spec.read_roots.iter().map(|r| spec_dir.join(r)).collect();
 
     let state = api::AppState {
         engine: Arc::new(wasmtime::Engine::default()),
         backend: Arc::new(StubBackend::default()),
         jobs: state::JobStore::default(),
         spec: Arc::new(spec),
-        module_bytes: Arc::new(module_bytes),
+        module_bytes: Arc::new(std::fs::read(&wasm_path)?),
     };
 
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = tokio::net::UnixListener::bind(&sock_path)?;
-    eprintln!("cuttlefishd listening on {sock_path}");
-    axum::serve(listener, api::router(state)).await?;
-    Ok(())
+    serve::serve_unix(api::router(state), &sock_path).await
 }
 ```
 
 - [ ] **Step 5: Write the API integration test**
 
-`crates/cuttlefishd/tests/api.rs` — spawn the router on a unix socket, submit a job, poll `GET /jobs/:id` until terminal, assert the envelope. Polling rather than reading SSE is deliberate: it proves the durability path works independently of the stream.
+`crates/cuttlefishd/tests/api.rs`. Polling `GET /jobs/:id` rather than reading the SSE stream is deliberate: it proves results survive independently of the stream, which is the whole point of retaining envelopes.
+
+`reqwest`'s `ClientBuilder::unix_socket` (cfg(unix), no extra feature) handles the UDS dial; the `http://localhost` in each URL is a placeholder authority the socket path overrides.
 
 ```rust
-// Uses the same example-block build helper as the host tests.
-// Assert: POST /jobs -> 202 + job_id; GET /jobs/:id eventually reports
-// status "completed" with result.summary == "a stub summary";
-// GET /jobs/<unknown> -> 404; DELETE /jobs/:id -> 202.
+use cuttlefishd::{api, serve, state::JobStore};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Same fixture as the host tests. Duplicated rather than shared because a
+/// test-support crate for one helper is not worth a workspace member yet.
+fn example_block() -> Vec<u8> {
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "cf-block-echo-summarize", "--target", "wasm32-unknown-unknown"])
+        .status()
+        .expect("cargo build failed to start");
+    assert!(status.success(), "building the example block failed");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::fs::read(root.join("target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm"))
+        .expect("built wasm artifact not found")
+}
+
+struct Harness {
+    client: reqwest::Client,
+    _dir: tempfile::TempDir,
+    doc: std::path::PathBuf,
+}
+
+async fn start() -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("doc.txt");
+    std::fs::write(&doc, "some document text").unwrap();
+    let sock = dir.path().join("cf.sock");
+
+    let spec = cuttlefish_core::spec::Spec {
+        name: "summarize_docs".into(),
+        description: "Use when a local file needs summarizing.".into(),
+        model: cuttlefish_core::spec::ModelRef::Path("./stub.gguf".into()),
+        data_policy: cuttlefish_core::spec::DataPolicy::LocalOnly,
+        read_roots: vec![dir.path().to_path_buf()],
+        block: "./blocks/echo-summarize".into(),
+    };
+
+    let state = api::AppState {
+        engine: Arc::new(wasmtime::Engine::default()),
+        backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
+        jobs: JobStore::default(),
+        spec: Arc::new(spec),
+        module_bytes: Arc::new(example_block()),
+    };
+
+    let sock_for_server = sock.clone();
+    tokio::spawn(async move {
+        let _ = serve::serve_unix(api::router(state), &sock_for_server).await;
+    });
+
+    // Wait for the socket to appear rather than sleeping a fixed duration.
+    for _ in 0..100 {
+        if sock.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    Harness {
+        client: reqwest::Client::builder().unix_socket(&sock).build().unwrap(),
+        _dir: dir,
+        doc,
+    }
+}
+
+/// Poll until the job reaches a terminal status, or fail the test.
+async fn await_terminal(h: &Harness, id: &str) -> serde_json::Value {
+    for _ in 0..200 {
+        let body: serde_json::Value = h
+            .client
+            .get(format!("http://localhost/jobs/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        match body["status"].as_str().unwrap() {
+            "completed" | "failed" | "cancelled" => return body,
+            _ => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    panic!("job {id} never reached a terminal status");
+}
+
+#[tokio::test]
+async fn submits_and_completes_a_job() {
+    let h = start().await;
+    let submit = h
+        .client
+        .post("http://localhost/jobs")
+        .json(&serde_json::json!({
+            "spec": "summarize_docs",
+            "input": { "path": h.doc.to_str().unwrap() }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), 202);
+
+    let id = submit.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let body = await_terminal(&h, &id).await;
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["envelope"]["result"]["summary"], "a stub summary");
+}
+
+#[tokio::test]
+async fn unknown_job_is_not_found() {
+    let h = start().await;
+    let resp = h
+        .client
+        .get("http://localhost/jobs/does-not-exist")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn unknown_spec_is_rejected() {
+    let h = start().await;
+    let resp = h
+        .client
+        .post("http://localhost/jobs")
+        .json(&serde_json::json!({ "spec": "nope", "input": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn cancel_accepts_a_live_job() {
+    let h = start().await;
+    let id = h
+        .client
+        .post("http://localhost/jobs")
+        .json(&serde_json::json!({
+            "spec": "summarize_docs",
+            "input": { "path": h.doc.to_str().unwrap() }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = h
+        .client
+        .delete(format!("http://localhost/jobs/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    // The job may already have completed — cancellation is best-effort, so the
+    // assertion is that the endpoint accepts it, not that the job was caught.
+    await_terminal(&h, &id).await;
+}
 ```
 
-Write these four assertions out fully when implementing, following the pattern in `crates/cuttlefish-host/tests/runner.rs`.
+For the test to reach `api`, `serve`, and `state`, the crate needs a library target alongside its binary. Add `crates/cuttlefishd/src/lib.rs`:
+
+```rust
+pub mod api;
+pub mod serve;
+pub mod state;
+```
+
+and change `main.rs` to use the library (`use cuttlefishd::{api, serve, state};`) rather than declaring the modules itself. Add to `Cargo.toml`:
+
+```toml
+[lib]
+name = "cuttlefishd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cuttlefishd"
+path = "src/main.rs"
+```
 
 - [ ] **Step 6: Run the tests**
 
@@ -1649,32 +1995,112 @@ path = "src/main.rs"
 cuttlefish-abi = { path = "../cuttlefish-abi" }
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy"] }
-http-body-util = "0.1"
+# Same UDS client as the daemon's tests; do not pin below 0.12.20.
+reqwest = { version = "0.12.20", default-features = false, features = ["json"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 ```
 
 - [ ] **Step 2: Write `cuttlefish run`**
 
-`crates/cuttlefish-cli/src/main.rs`: a `run` subcommand taking `--socket`, `--spec`, and `--input` (JSON), which POSTs the job then polls `GET /jobs/:id` until terminal and prints the envelope as JSON to stdout. Exit code 0 on `completed`, 1 on `failed`, 2 on `cancelled` — so shell callers and agents can branch without parsing.
+`crates/cuttlefish-cli/src/main.rs`. It POSTs the job, polls `GET /jobs/:id` until terminal, prints the envelope as JSON, and exits 0/1/2 for completed/failed/cancelled so shell callers and agents can branch without parsing stdout.
+
+```rust
+use anyhow::{bail, Context};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(name = "cuttlefish", about = "Client for the cuttlefish daemon")]
+struct Cli {
+    #[command(subcommand)]
+    command: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Submit a job and wait for its result.
+    Run {
+        #[arg(long, default_value = "/tmp/cuttlefish.sock")]
+        socket: PathBuf,
+        #[arg(long)]
+        spec: String,
+        /// Job input as a JSON object.
+        #[arg(long)]
+        input: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let Cmd::Run { socket, spec, input } = Cli::parse().command;
+
+    let input: serde_json::Value =
+        serde_json::from_str(&input).context("--input must be valid JSON")?;
+    let client = reqwest::Client::builder()
+        .unix_socket(&socket)
+        .build()
+        .context("building the unix-socket client")?;
+
+    // The authority in these URLs is ignored; the socket path decides where
+    // the request actually goes.
+    let submit = client
+        .post("http://localhost/jobs")
+        .json(&serde_json::json!({ "spec": spec, "input": input }))
+        .send()
+        .await
+        .with_context(|| format!("connecting to daemon at {}", socket.display()))?;
+
+    if !submit.status().is_success() {
+        bail!("daemon rejected the job: {} {}", submit.status(), submit.text().await?);
+    }
+
+    let job_id = submit.json::<serde_json::Value>().await?["job_id"]
+        .as_str()
+        .context("daemon response had no job_id")?
+        .to_string();
+
+    loop {
+        let body: serde_json::Value = client
+            .get(format!("http://localhost/jobs/{job_id}"))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let status = body["status"].as_str().unwrap_or("running");
+        if matches!(status, "completed" | "failed" | "cancelled") {
+            println!("{}", serde_json::to_string_pretty(&body["envelope"])?);
+            std::process::exit(match status {
+                "completed" => 0,
+                "failed" => 1,
+                _ => 2,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+```
 
 - [ ] **Step 3: Verify against a live daemon**
 
 ```bash
 nix develop --command bash -c '
-  cargo build -p cf-block-echo-summarize --target wasm32-wasip1 &&
-  cargo build -p cuttlefishd -p cuttlefish-cli &&
-  mkdir -p examples/docs && echo "hello world" > examples/docs/a.txt &&
+  set -e
+  cargo build -p cf-block-echo-summarize --target wasm32-unknown-unknown
+  cargo build -p cuttlefishd -p cuttlefish-cli
+  mkdir -p examples/docs && echo "hello world" > examples/docs/a.txt
   ./target/debug/cuttlefishd examples/summarize.cuttlefish \
-    target/wasm32-wasip1/debug/cf_block_echo_summarize.wasm /tmp/cf.sock &
-  sleep 1
+    target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm /tmp/cf.sock &
+  daemon=$!
+  trap "kill $daemon" EXIT
+  until [ -S /tmp/cf.sock ]; do sleep 0.1; done
   ./target/debug/cuttlefish run --socket /tmp/cf.sock --spec summarize_docs \
     --input "{\"path\": \"examples/docs/a.txt\"}"
 '
 ```
-Expected: a JSON envelope with `"status":"completed"` and `"summary":"a stub summary"`.
+Expected: a JSON envelope with `"status":"completed"` and `"summary":"a stub summary"`, and exit status 0.
 
 - [ ] **Step 4: Commit**
 
