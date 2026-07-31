@@ -10,3 +10,4 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
