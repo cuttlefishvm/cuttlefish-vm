@@ -1,0 +1,125 @@
+# Cuttlefish — design spec
+
+Native tooling for agents: a local daemon that runs local models via llama.cpp, driven by a typed `Cuttlefish.spec`-equivalent DSL (successor in spirit to [f0rodo/rune](https://github.com/f0rodo/rune), itself a fork of the abandoned [hotg-ai/rune](https://github.com/hotg-ai/rune) TinyML/edge-ML wasm pipeline compiler — no LLM story existed there; this project supplies it from scratch).
+
+## Motivation
+
+From prior art review (this session):
+
+- **hotg-ai/rune**: proved the "declarative spec compiles to a single portable wasm binary" shape, with typed dataflow DAGs and versioned, addressable pipeline components ("proc-blocks"). Dead upstream 4+ years, no LLM/job-dispatch story, no runtime service — just a compile-then-run CLI.
+- **obra/superpowers**: proved that a coding-agent harness needs (a) trigger-only discovery metadata (a `description` that states *when* to use something, never *how* it works, or the agent skips the real logic), (b) a ledger/checkpoint file that survives context compaction, and (c) a hard split between what's *enforced* (deterministic code) and what's merely *suggested* (prose the model chooses to follow).
+- **claurst_bridge** (local Rust crate, `dnav-preact-integration/rust/claurst_bridge`): proved a concrete async pattern for native-runtime-calls-into-sandboxed-code — `tokio::spawn` + `tokio::select!` event-draining loop, `CancellationToken` threaded through job context, `[patch]`-whole-tree vendoring for a forked upstream dependency, rustls-over-native-tls to dodge TLS symbol clashes.
+- **Team chat (screenshot, this session)**: the core value proposition is privacy/cost — proprietary or personal data never has to leave the machine, and cheap/bulk subtasks don't burn frontier-model tokens. Explicitly acknowledged limit: local models can't match 1T+-parameter frontier models, so cuttlefish jobs are the subset of work that doesn't need frontier reasoning.
+
+## Goals
+
+Support three job shapes through one mechanism (spec → wasm → daemon):
+1. **Cost/token offload** — cheap, repetitive, or bulk subtasks (summarize, classify, extract) pushed to a local model.
+2. **Deterministic verified pipeline** — typed, reproducible, sandboxed steps (Rune's DAG shape), one or more of which happen to call a local LLM.
+3. **Autonomous background subagent** — a longer independent task loop (multi-turn, its own tool use) that reports back a final result.
+
+## Architecture
+
+Two binaries sharing a `cuttlefish-core` Rust crate:
+
+- **`cuttlefishd`** (daemon) — long-lived. Owns the wasm host (wasmtime), the pool of loaded llama.cpp model instances, the job queue/scheduler, and the local HTTP/socket API. This is what agents talk to at job-submission time.
+- **`cuttlefish`** (CLI) — short-lived, talks to `cuttlefishd` over the same local API. Owns `build` (compiles a spec + its referenced proc-blocks into a single wasm binary), `run` (submit-and-wait convenience wrapper), proc-block registry commands (`push`/`pull`/`search`), `inspect`/`graph` (introspect a compiled spec's typed IR).
+
+Rejected alternatives: a single multi-mode binary (Rune's own shape) couples the daemon's runtime dependency tree to build-time compiler deps; a daemon-only design with no CLI loses a coherent human-facing build/registry workflow. The split mirrors docker/dockerd — the daemon owns model residency and long-lived state, the CLI is disposable.
+
+**Wasm/native split**: wasm program owns orchestration (prompt construction, response parsing/validation, looping for multi-turn/tool-use, deciding when a job is done). Native runtime owns model inference **and** capability-gated IO the sandbox can't safely do itself (see Data policy below) — not "inference only" as originally scoped; file reads for `local_only` jobs are a deliberate, narrow exception so proprietary bytes never have to pass through the wasm sandbox via the calling agent.
+
+## Agent harness (superpowers-derived)
+
+Cuttlefish ships an agent-harness package alongside the daemon so a calling coding agent learns it exists and when to delegate:
+
+- **Skills plugin** (multi-platform adapter dirs, mirroring superpowers). Core skill `using-cuttlefish`, injected at session start: tells the agent when to delegate — bulk/repetitive subtasks, and any step touching data flagged local-only.
+- **Per-spec discovery**: `GET /specs` lists installed specs with their `description` field. That field is trigger-conditions-only ("Use when...") by convention — never a workflow summary, per superpowers' tested finding that summarizing lets the agent skip the real contract. (Worth a compile-time lint that flags a description matching workflow-summary patterns.)
+- **Data boundary**: a spec declares `data_policy: local_only`. The harness skill instructs the agent to pass file *paths*, not file contents, for such jobs — `cuttlefishd` reads the files itself. The privacy guarantee is that the frontier-model agent never reads the proprietary bytes into its own context, not merely "we also ran something locally."
+- **Enforcement boundary**: the wasm program + daemon are the *enforced* contract (deterministic, sandboxed, capability-checked). Spec/skill prose only governs the calling agent's *decision to delegate* — natural language never controls the runtime.
+- **Sandbox default-deny**: a proc-block gets no network/filesystem access by default. The daemon grants only the capabilities a spec declares (see below), visible via `cuttlefish inspect`.
+
+## Spec format — typed DSL
+
+`.cuttlefish` files, OCaml-flavored (ADTs, `let`-bound pipeline, real type inference over block signatures) — chosen over YAML+JSON-Schema after comparing three options lifted from OCaml-world practice:
+
+| Option | What it changes | Verdict |
+|---|---|---|
+| **A. Typed DSL** | Replaces the spec language itself; compiler unifies block I/O types, catches DAG mismatches at compile time | **Adopted for v1** |
+| B. Dune/opam-style workspace + lockfile | Build tooling/project layout only, spec language unchanged | Deferred — revisit once a project has more than a couple of local blocks |
+| C. Imandra-style formal verification | A `verify:` pass proving effect/capability properties, orthogonal to language choice | Deferred — needs an effect system on blocks first; A's compile-time effect check (below) covers the capability case for v1 |
+
+Compiler implementation: **Rust**, not OCaml — a chumsky-based parser plus custom unification over block signatures, living in `cuttlefish-core`. One toolchain end to end (parse → typecheck → link wasm); only the *language design* is OCaml-flavored, not the implementation.
+
+```ocaml
+spec summarize_docs = {
+  description = "Use when the agent needs summaries of local files or bulk
+                  text and content must not leave the machine.";
+  model = Hf "Qwen/Qwen2.5-7B-Instruct-GGUF#q4_k_m" ~ctx:8192;  (* or: Path "./models/foo.gguf" *)
+  data_policy = Local_only;
+  capabilities = [ Read "./docs" ];
+
+  pipeline =
+    let chunks = block Chunk_text ~max_tokens:2000 (Input files) in
+    let sums   = block (Map_infer ~prompt:"./prompts/summarize.txt") chunks in
+    block Merge_summaries sums
+  ;
+
+  input  : { files : string list };
+  output : { summary : string; per_file : (string * string) list };
+}
+```
+
+`model` is a variant type — `Hf of string` (resolved + hash-cached by the daemon on first use) or `Path of string` (pre-provisioned, no fetch logic). Both are first-class; a spec author picks whichever fits their deployment.
+
+Each proc-block ships a `.cfi` interface file (like an `.mli`): input/output types plus an effect signature (`reads: [...]`, `network: bool`). `cuttlefish build` unifies these across the pipeline's `let`-bindings — a block-ordering mismatch, or a block whose declared effects exceed the spec's `capabilities`, is a compile error before wasm linking runs. This is checked again at runtime by the daemon as defense-in-depth (see Host ABI below) — the compile-time check is not a substitute for the sandbox.
+
+Block refs resolve from a **versioned remote registry** (`org/repo@version#block`, fetched + cached + hash-verified, chosen from day one over local-only to support cross-project reuse) or a local path — both produce the same artifact format, so promoting local → published is just `cuttlefish push`.
+
+`cuttlefish build` output: one linked wasm module (blocks + generated DAG-walking driver) plus an embedded manifest (model ref, capabilities, schemas). `cuttlefishd` loads that artifact directly; `inspect`/`graph` read the manifest and typed IR back out.
+
+## Daemon internals
+
+**API** (unix socket by default, TCP optional):
+```
+POST   /jobs              {spec: name, input: {...}}         -> {job_id}
+GET    /jobs/:id/events    SSE stream: progress | tokens | result | error
+DELETE /jobs/:id          cancel
+GET    /specs             [{name, description, input_schema}]  (harness discovery)
+GET    /models            loaded models + memory budget status
+```
+
+**Result envelope** (fixed, spec-independent): `{status, result: <output-typed payload>, error?, usage: {tokens_in, tokens_out, duration_ms, model}}`.
+
+**Model pool** — keyed by resolved model ref (hash of gguf + quant). A configured memory budget (`--vram-budget`/`--ram-budget`) gates loading; exceeding it evicts the least-recently-used *idle* model (never one with an in-flight job). Multiple models load concurrently up to budget — jobs on different models run in true parallel; jobs on the same model share its context, queued at the inference-call level, not the job level.
+
+**Scheduler / job lifecycle** — direct lift from claurst_bridge's async pattern: each job is a `tokio::spawn`ed task running one wasmtime instance (no shared mutable state between jobs) plus a `CancellationToken`. Host ABI calls go through `tokio::select!` against that token, so cancel works mid-inference, not just between pipeline steps. States: `queued → running → completed | failed | cancelled`. A job queues on model-pool availability, not a global lock.
+
+**Host ABI** (wasm imports):
+```
+host_infer_stream(model, prompt, params, on_token: fn) -> InferHandle
+host_cancel(handle)
+host_read(path) -> bytes           # capability-gated, per spec's `capabilities`
+```
+Any call outside the spec's declared capabilities traps the wasm instance immediately — fail-closed, matching claurst_bridge's `OcamlPolicyHandler` posture.
+
+**Errors** — structured codes in the envelope's `error` field: `model_load_failed`, `capability_denied`, `schema_validation_failed`, `wasm_trap`, `timeout`, `cancelled`. No silent partial results — a trap or timeout always yields `status: failed`, never a truncated `result`.
+
+## Testing strategy
+
+- **Compiler**: golden-file tests — `.cuttlefish` fixtures paired with expected typed IR or expected error (signature mismatch, capability-exceeds-declared, unresolved registry ref). No wasm/network involved.
+- **Proc-blocks**: native unit tests against `.cfi` types, plus one wasmtime-harness integration test per block with a mocked `host_infer_stream` (canned responses) — proves sandbox/host-call correctness without a live model.
+- **Daemon**: integration tests with a stub model backend (scripted token streams, no real llama.cpp) covering queueing under budget pressure, eviction-never-kills-in-flight, cancel-mid-inference, capability-denial traps, malformed-input rejection.
+- **End-to-end**: a small quantized model (e.g. 0.5B GGUF) in CI for one or two full specs, asserting envelope shape and basic correctness — not output quality, which is a separate non-blocking eval suite.
+- **Harness/discovery**: a lint that flags a `description` matching workflow-summary patterns, plus one integration test that a real agent-shaped client can discover, submit, and stream a job end to end.
+
+## Explicitly deferred
+
+- Dune/opam-style workspace + lockfile tooling for multi-block projects (Option B above).
+- Imandra-style formal verification pass beyond the compile-time effect/capability check already in the typechecker (Option C above).
+- Multi-language proc-block authoring (WASI/WIT component model) — v1 is Rust-only via a `cuttlefish-sdk` crate.
+- Streaming/cancel was scoped into the host ABI from v1 (not deferred) per the "what does the wasm program need at minimum" decision — noted here only because it was one of several ABI-scope options considered.
+
+## Open question carried into implementation planning
+
+None blocking — the one internal inconsistency found in review (native runtime scope wrongly stated as "inference only" when it also needs capability-gated file IO) is resolved above.
