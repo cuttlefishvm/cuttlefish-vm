@@ -5,7 +5,8 @@ resolver = "2"
 # them — a missing member surfaces later as a confusing "package not found".
 # Add each new crate here as it lands.
 members = [
-    "crates/cuttlefish", # facade + `cuttlefish` binary; the published crate
+    "crates/cuttlefish",     # facade + `cuttlefish` binary; the published crate
+    "crates/cuttlefish-abi", # wire types shared by host and guest
 ]
 
 [workspace.package]
