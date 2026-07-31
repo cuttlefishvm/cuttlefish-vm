@@ -1,10 +1,14 @@
 # Cuttlefish Vertical Slice Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Comment the *why*, in the code.** This project makes a number of non-obvious choices — a host-driven reactor instead of blocking host calls, handle-based bulk data instead of passing contents, a descriptor struct instead of packing a pointer pair into an `i64`. Each exists to dodge a specific failure that is invisible from reading the code that resulted. When you implement a step, carry its rationale comment across verbatim and add one wherever you make a judgment call the next reader could plausibly "simplify" away. Do not comment what a line does; comment the constraint that made it look like that. These comments are the project's memory — the design spec will drift, the code will not.
 
 **Goal:** Build the thinnest end-to-end path — a `.cuttlefish` spec file configures a wasm job that the daemon runs under the reactor host ABI and streams a result back over a unix socket — with a stub inference backend instead of llama.cpp.
 
 **Architecture:** A Cargo workspace of four crates. `cuttlefish-abi` holds the wire types shared by host and guest. `cuttlefish-sdk` is the guest-side library a proc-block author writes against; it hides the reactor state machine behind ordinary Rust and emits the raw wasm exports. `cuttlefish-host` is the wasmtime driver that calls those exports, executes the commands the guest returns, and enforces capabilities. `cuttlefishd` is the daemon binary wrapping the host in an HTTP-over-UDS API, plus `cuttlefish`, the CLI client. Spec parsing in this slice is deliberately minimal: a single-block pipeline, `Path` model refs, local block paths, no registry.
+
+**Bulk data never enters guest memory.** A block does not receive file contents; it receives a *handle* and a length, then pulls bounded windows with `Slice`. The host seeks and reads each window straight off disk, so neither side ever holds a whole corpus. This keeps guest memory flat no matter how large the input grows, which is what lets the slice stay on 32-bit wasm without a 4 GiB input ceiling hanging over every block author. See "The 4 GiB question" below.
 
 **Tech Stack:** Rust (workspace), wasmtime (host), `wasm32-unknown-unknown` (guest target), axum routing served over a hand-rolled hyper accept loop on a `UnixListener` (daemon API), tokio (async runtime + `CancellationToken`), serde/serde_json (wire format), a hand-written scanner for the spec subset.
 
@@ -13,6 +17,15 @@
 **Explicitly out of scope for this slice** (each is later-plan material, do not build): real llama.cpp inference, the type unifier and `.cfi` interface files, block registry, model pool with memory budgets and eviction, the agent-harness skills plugin, `Network` capability, DAG-level loops, and the whole `cuttlefish build` compile-and-link step — in this slice the daemon takes an already-built `.wasm` path as an argument, and `cuttlefish inspect`/`graph`/`push` do not exist.
 
 **Environment rule:** every build/test command in this plan runs through `nix develop --command ...`. The toolchain is pinned by `flake.nix`; a bare `cargo` picks up whatever Homebrew or rustup has on `PATH`.
+
+**The 4 GiB question (why not `wasm64` now):** a wasm32 guest tops out at 4 GiB of linear memory, and the obvious worry is a job whose input exceeds it. Two independent levers relieve that: raise the ceiling (`wasm64-unknown-unknown`), or stop putting bulk data in guest memory at all. This slice takes the second — `Open`/`Slice` handles, above — because it keeps guest memory flat rather than merely larger, and because it works on the stable toolchain today.
+
+`wasm64` stays open as a later, additive choice, and two decisions here exist to keep it cheap:
+
+1. **No pointer packing.** The guest returns a pointer to a `Desc { ptr, len }` struct rather than packing both into one `i64`. That packing trick only works while pointers are 32 bits; abandoning it now means the export signatures don't change when a 64-bit guest arrives.
+2. **The host reads pointer width from the module, not from an assumption.** `Abi::detect` inspects `MemoryType::is_64()` and every pointer read goes through it. This slice implements only the 32-bit path and rejects 64-bit modules with a clear error — but the branch point exists, so adding the other path is an addition rather than a refactor.
+
+The remaining costs of wasm64, for whenever it's worth paying: `wasm64-unknown-unknown` is Tier 3 with no prebuilt std, so guest builds need nightly plus `-Z build-std`; and 64-bit memories give up wasmtime's guard-page bounds-check elision, costing perhaps 10–20% on guest execution. That second cost matters unusually little here — the guest orchestrates while the host does inference, so the guest is not the hot loop. Note also that a single wasmtime engine with `wasm_memory64(true)` still runs 32-bit modules, so the eventual choice can be per-block rather than project-wide.
 
 **Why `wasm32-unknown-unknown` and not `wasm32-wasip1`:** a Rust cdylib built for wasip1 links wasi-libc, so even the panic path imports `wasi_snapshot_preview1::fd_write` and `proc_exit`. Those imports must be satisfied at instantiation or `Linker::instantiate` fails with `unknown import`. Guest blocks in this slice do all their IO through host commands and need no WASI at all, so the unknown-unknown target keeps the host's `Store<()>`/`Linker<()>` genuinely empty. When a later plan needs WASI in guests, add `wasmtime-wasi`, switch the store type to `WasiP1Ctx`, call `add_to_linker_sync`, and invoke the module's `_initialize` export before `cf_alloc`.
 
@@ -48,6 +61,23 @@ Replace the `inputs` block and the `pkgs` binding in `flake.nix`:
         };
         # Guest proc-blocks compile to wasm32-unknown-unknown; the host is
         # native. One toolchain pinned here so both come from the same rustc.
+        #
+        # On wasm64: guests are capped at 4 GiB of linear memory here, which is
+        # deliberate rather than accidental. Bulk data never enters guest memory
+        # (blocks pull bounded windows through Open/Slice handles), so the cap
+        # binds on nothing we actually do. If a future block genuinely needs a
+        # >4 GiB resident working set, switch THAT block to
+        # wasm64-unknown-unknown rather than the whole project: one wasmtime
+        # engine with wasm_memory64(true) runs 32- and 64-bit modules side by
+        # side, and cuttlefish-host already detects width via MemoryType::is_64.
+        # The cost is real, so weigh it: wasm64 is Tier 3 with no prebuilt std,
+        # so it needs
+        #   pkgs.rust-bin.nightly.latest.default.override {
+        #     targets = [ "wasm32-unknown-unknown" ];
+        #     extensions = [ "rust-src" ];   # required by -Z build-std
+        #   }
+        # plus `-Z build-std=std,panic_abort` on the guest build, and 64-bit
+        # memories lose wasmtime's guard-page bounds-check elision.
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           targets = [ "wasm32-unknown-unknown" ];
         };
@@ -147,12 +177,24 @@ serde_json = { workspace = true }
 
 use serde::{Deserialize, Serialize};
 
+/// Opaque, job-scoped reference to something the host holds open on the
+/// guest's behalf. Job-scoped is the security property: a handle from one job
+/// is meaningless in another, so handles need no capability check of their own
+/// — the check happened once, at `Open`.
+pub type Handle = u32;
+
 /// What a guest asks the host to do, returned from `init`/`step`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
     Infer { prompt: String, max_tokens: u32 },
-    Read { path: String },
+    /// Ask the host to open a file. Capability-checked. Returns a handle and a
+    /// byte length — deliberately *not* the contents, so guest memory stays
+    /// flat regardless of file size.
+    Open { path: String },
+    /// Pull one bounded window of an open file into guest memory. The guest
+    /// chooses the window size, so it decides its own memory ceiling.
+    Slice { handle: Handle, offset: u64, len: u64 },
     Emit { progress: serde_json::Value },
     Done { result: serde_json::Value },
     Fail { code: String, message: String },
@@ -163,7 +205,13 @@ pub enum Command {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     InferDone { text: String, tokens_out: u32 },
-    ReadDone { contents: String },
+    Opened { handle: Handle, len: u64 },
+    /// `next_offset` is where the returned text actually ended, which is not
+    /// always `offset + len`: the host truncates the window down to a UTF-8
+    /// character boundary. A guest that walks a file must resume from this
+    /// value rather than advancing by its requested length, or it will corrupt
+    /// multi-byte characters at every window seam.
+    Sliced { text: String, next_offset: u64 },
     Emitted,
 }
 
@@ -259,6 +307,13 @@ mod tests {
     }
 
     #[test]
+    fn slice_command_round_trips_through_json() {
+        let cmd = Command::Slice { handle: 7, offset: 4096, len: 1024 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+    }
+
+    #[test]
     fn envelope_omits_absent_optional_fields() {
         let env = Envelope {
             status: JobStatus::Completed,
@@ -299,7 +354,7 @@ Crate names and stub contents — note the block's package name is **not** its d
 - [ ] **Step 7: Run the tests**
 
 Run: `nix develop --command cargo test -p cuttlefish-abi`
-Expected: 3 tests pass.
+Expected: 4 tests pass.
 
 - [ ] **Step 8: Commit**
 
@@ -333,21 +388,25 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ```
 
-- [ ] **Step 2: Write the failing test for pointer packing**
+- [ ] **Step 2: Write the result descriptor**
 
 `crates/cuttlefish-sdk/src/lib.rs`:
 
 ```rust
 //! Guest-side library for writing cuttlefish proc-blocks.
 
-/// Pack a (ptr, len) pair into the single i64 a wasm export can return.
-/// High 32 bits are the pointer, low 32 the length.
-pub fn pack(ptr: u32, len: u32) -> i64 {
-    ((ptr as i64) << 32) | (len as i64)
-}
-
-pub fn unpack(packed: i64) -> (u32, u32) {
-    (((packed >> 32) & 0xffff_ffff) as u32, (packed & 0xffff_ffff) as u32)
+/// How a guest hands a (pointer, length) pair back to the host.
+///
+/// The obvious alternative — pack both into the single `i64` a wasm export can
+/// return — works only while pointers are 32 bits. Returning a pointer to this
+/// struct instead costs one extra memory read per call and keeps every export
+/// signature identical under a 64-bit guest, where `usize` simply widens. Do
+/// not "simplify" this back into bit-packing; that is the thing it exists to
+/// avoid. See "The 4 GiB question" in the plan.
+#[repr(C)]
+pub struct Desc {
+    pub ptr: usize,
+    pub len: usize,
 }
 
 #[cfg(test)]
@@ -355,9 +414,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pack_unpack_round_trips() {
-        assert_eq!(unpack(pack(0xdead_beef, 4096)), (0xdead_beef, 4096));
-        assert_eq!(unpack(pack(0, 0)), (0, 0));
+    fn desc_layout_is_two_pointer_sized_fields() {
+        // The host reads exactly this many bytes at the returned address, so
+        // the layout is load-bearing, not incidental.
+        assert_eq!(
+            std::mem::size_of::<Desc>(),
+            2 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(std::mem::align_of::<Desc>(), std::mem::align_of::<usize>());
     }
 }
 ```
@@ -393,26 +457,29 @@ pub trait Block: Default {
 /// Guest-side allocation the host writes into. Leaks deliberately: the host
 /// owns the buffer's lifetime and the instance is torn down after one job.
 #[doc(hidden)]
-pub fn __alloc(len: u32) -> u32 {
-    let mut buf = Vec::<u8>::with_capacity(len as usize);
-    let ptr = buf.as_mut_ptr() as u32;
+pub fn __alloc(len: usize) -> usize {
+    let mut buf = Vec::<u8>::with_capacity(len);
+    let ptr = buf.as_mut_ptr() as usize;
     std::mem::forget(buf);
     ptr
 }
 
 #[doc(hidden)]
-pub unsafe fn __read_json<T: serde::de::DeserializeOwned>(ptr: u32, len: u32) -> T {
-    let slice = std::slice::from_raw_parts(ptr as *const u8, len as usize);
+pub unsafe fn __read_json<T: serde::de::DeserializeOwned>(ptr: usize, len: usize) -> T {
+    let slice = std::slice::from_raw_parts(ptr as *const u8, len);
     serde_json::from_slice(slice).expect("host sent malformed JSON")
 }
 
+/// Serialize `value` into guest memory and return the address of a `Desc`
+/// describing it. Both the payload and the descriptor are leaked — the host
+/// reads them immediately after the call returns, and the instance is torn
+/// down after one job, so there is nothing to reclaim.
 #[doc(hidden)]
-pub fn __write_json<T: serde::Serialize>(value: &T) -> i64 {
+pub fn __write_json<T: serde::Serialize>(value: &T) -> usize {
     let bytes = serde_json::to_vec(value).expect("guest produced unserializable value");
-    let len = bytes.len() as u32;
-    let boxed = bytes.into_boxed_slice();
-    let ptr = Box::into_raw(boxed) as *mut u8 as u32;
-    pack(ptr, len)
+    let len = bytes.len();
+    let ptr = Box::into_raw(bytes.into_boxed_slice()) as *mut u8 as usize;
+    Box::into_raw(Box::new(Desc { ptr, len })) as usize
 }
 
 /// Emit the wasm exports for a `Block` implementation.
@@ -427,29 +494,32 @@ macro_rules! export_block {
                 ::std::cell::RefCell::new(<$ty as ::core::default::Default>::default());
         }
 
+        // Every export takes and returns `usize`, never a packed `i64`. On
+        // wasm32 that lowers to i32 params/results; on a 64-bit guest the same
+        // source compiles to i64 with no signature change here.
         #[no_mangle]
-        pub extern "C" fn cf_alloc(len: u32) -> u32 {
+        pub extern "C" fn cf_alloc(len: usize) -> usize {
             $crate::__alloc(len)
         }
 
         #[no_mangle]
-        pub extern "C" fn cf_init(ptr: u32, len: u32) -> i64 {
+        pub extern "C" fn cf_init(ptr: usize, len: usize) -> usize {
             let input: ::serde_json::Value = unsafe { $crate::__read_json(ptr, len) };
             let cmd = __CF_STATE.with(|s| $crate::Block::start(&mut *s.borrow_mut(), input));
             $crate::__write_json(&cmd)
         }
 
         #[no_mangle]
-        pub extern "C" fn cf_step(ptr: u32, len: u32) -> i64 {
+        pub extern "C" fn cf_step(ptr: usize, len: usize) -> usize {
             let event: ::cuttlefish_abi::Event = unsafe { $crate::__read_json(ptr, len) };
             let cmd = __CF_STATE.with(|s| $crate::Block::step(&mut *s.borrow_mut(), event));
             $crate::__write_json(&cmd)
         }
 
         #[no_mangle]
-        pub extern "C" fn cf_on_token(ptr: u32, len: u32) -> i32 {
+        pub extern "C" fn cf_on_token(ptr: usize, len: usize) -> i32 {
             let token: ::std::string::String = unsafe {
-                let slice = ::std::slice::from_raw_parts(ptr as *const u8, len as usize);
+                let slice = ::std::slice::from_raw_parts(ptr as *const u8, len);
                 ::std::string::String::from_utf8_lossy(slice).into_owned()
             };
             __CF_STATE
@@ -508,7 +578,12 @@ serde_json = { workspace = true }
 use cuttlefish_abi::{Command, Event, TokenAction};
 use cuttlefish_sdk::{export_block, Block};
 
-/// Reads one file, summarizes it, returns the summary.
+/// Summarizes one file: opens it, pulls a bounded window, summarizes that.
+///
+/// Note what this block never does: hold the file. It sees a handle and a
+/// length, and it decides how much to bring into its own memory. A block that
+/// wanted the whole file would loop on `Slice` from `next_offset` — its memory
+/// ceiling would still be `WINDOW`, not the file size.
 ///
 /// The `stop_after_first` input flag exists so the host's early-stop path has
 /// a block that actually exercises it; a real block would decide from content.
@@ -519,6 +594,9 @@ struct EchoSummarize {
     seen_tokens: u32,
 }
 
+/// How much of a file this block is willing to hold at once.
+const WINDOW: u64 = 64 * 1024;
+
 impl Block for EchoSummarize {
     fn start(&mut self, input: serde_json::Value) -> Command {
         self.stop_after_first = input
@@ -528,7 +606,7 @@ impl Block for EchoSummarize {
         match input.get("path").and_then(|v| v.as_str()) {
             Some(path) => {
                 self.path = path.to_string();
-                Command::Read { path: path.to_string() }
+                Command::Open { path: path.to_string() }
             }
             None => Command::Fail {
                 code: cuttlefish_abi::error_codes::SCHEMA_VALIDATION_FAILED.into(),
@@ -539,8 +617,13 @@ impl Block for EchoSummarize {
 
     fn step(&mut self, event: Event) -> Command {
         match event {
-            Event::ReadDone { contents } => Command::Infer {
-                prompt: format!("Summarize the following:\n\n{contents}"),
+            Event::Opened { handle, len } => Command::Slice {
+                handle,
+                offset: 0,
+                len: len.min(WINDOW),
+            },
+            Event::Sliced { text, .. } => Command::Infer {
+                prompt: format!("Summarize the following:\n\n{text}"),
                 max_tokens: 128,
             },
             Event::InferDone { text, .. } => Command::Done {
@@ -586,8 +669,8 @@ The core of the slice. The host owns the loop: call `cf_init`, get a command, ex
 
 **Files:**
 - Create: `crates/cuttlefish-host/Cargo.toml`
-- Create: `crates/cuttlefish-host/src/lib.rs`, `src/infer.rs`, `src/caps.rs`, `src/runner.rs`
-- Test: `crates/cuttlefish-host/tests/caps.rs`, `crates/cuttlefish-host/tests/runner.rs`
+- Create: `crates/cuttlefish-host/src/lib.rs`, `src/infer.rs`, `src/caps.rs`, `src/handles.rs`, `src/runner.rs`
+- Test: `crates/cuttlefish-host/tests/caps.rs`, `crates/cuttlefish-host/tests/handles.rs`, `crates/cuttlefish-host/tests/runner.rs`
 
 - [ ] **Step 1: Write the manifest**
 
@@ -703,7 +786,182 @@ tempfile = "3"
 Run: `nix develop --command cargo test -p cuttlefish-host --test caps`
 Expected: 4 pass.
 
-- [ ] **Step 4: Write the inference backend trait and stub**
+- [ ] **Step 4: Write the file handle table**
+
+`crates/cuttlefish-host/src/handles.rs`. This is the host side of Lever B: the guest gets a handle, the host keeps the file open and serves bounded windows straight off disk. Neither side ever holds the whole file.
+
+```rust
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+/// One file the host holds open for a job.
+struct OpenFile {
+    file: File,
+    len: u64,
+}
+
+/// Job-scoped table of open files.
+///
+/// Scoping matters for more than tidiness: because a table lives and dies with
+/// one job, a handle from another job cannot name anything here. That is what
+/// lets `Slice` skip a capability check — the check happened once, at `open`,
+/// and a handle is unforgeable across jobs by construction.
+#[derive(Default)]
+pub struct Handles {
+    next: u32,
+    open: HashMap<u32, OpenFile>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HandleError {
+    #[error("no such handle: {0}")]
+    BadHandle(u32),
+    #[error("offset {offset} is past end of file ({len} bytes)")]
+    OffsetPastEnd { offset: u64, len: u64 },
+    #[error("window of {0} bytes is too small to hold one character")]
+    WindowTooSmall(u64),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+pub struct Window {
+    pub text: String,
+    /// Where the returned text actually ended. Not necessarily
+    /// `offset + requested_len` — see `slice`.
+    pub next_offset: u64,
+}
+
+impl Handles {
+    /// Open a file and return its handle and length. The caller is responsible
+    /// for having capability-checked `path` first.
+    pub fn open(&mut self, path: &Path) -> Result<(u32, u64), HandleError> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        let handle = self.next;
+        self.next += 1;
+        self.open.insert(handle, OpenFile { file, len });
+        Ok((handle, len))
+    }
+
+    /// Read one window, truncated to a UTF-8 character boundary.
+    ///
+    /// The truncation is the subtle part. A caller walking a file picks window
+    /// sizes with no idea where characters begin, so a naive read splits a
+    /// multi-byte character at nearly every seam and produces mojibake. Instead
+    /// the window is cut back to the last complete character and `next_offset`
+    /// reports where that landed — so a caller that resumes from `next_offset`
+    /// (rather than advancing by its own requested length) never sees a split.
+    pub fn slice(&mut self, handle: u32, offset: u64, len: u64) -> Result<Window, HandleError> {
+        let f = self.open.get_mut(&handle).ok_or(HandleError::BadHandle(handle))?;
+        if offset > f.len {
+            return Err(HandleError::OffsetPastEnd { offset, len: f.len });
+        }
+
+        let want = len.min(f.len - offset) as usize;
+        let mut buf = vec![0u8; want];
+        f.file.seek(SeekFrom::Start(offset))?;
+        f.file.read_exact(&mut buf)?;
+
+        let valid = match std::str::from_utf8(&buf) {
+            Ok(_) => buf.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        // A window landing entirely inside one character would otherwise return
+        // empty forever and hang a caller that loops until it reaches the end.
+        if valid == 0 && !buf.is_empty() {
+            return Err(HandleError::WindowTooSmall(len));
+        }
+        buf.truncate(valid);
+
+        Ok(Window {
+            text: String::from_utf8(buf).expect("truncated at a validated boundary"),
+            next_offset: offset + valid as u64,
+        })
+    }
+}
+```
+
+`crates/cuttlefish-host/tests/handles.rs`:
+
+```rust
+use cuttlefish_host::handles::Handles;
+use std::io::Write;
+
+fn temp_with(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.txt");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(contents.as_bytes()).unwrap();
+    (dir, path)
+}
+
+#[test]
+fn open_reports_length_without_reading_contents() {
+    let (_d, path) = temp_with("hello world");
+    let mut h = Handles::default();
+    let (handle, len) = h.open(&path).unwrap();
+    assert_eq!(len, 11);
+    assert_eq!(handle, 0);
+}
+
+#[test]
+fn slice_returns_the_requested_window() {
+    let (_d, path) = temp_with("hello world");
+    let mut h = Handles::default();
+    let (handle, _) = h.open(&path).unwrap();
+    let w = h.slice(handle, 0, 5).unwrap();
+    assert_eq!(w.text, "hello");
+    assert_eq!(w.next_offset, 5);
+}
+
+#[test]
+fn slice_is_clamped_to_end_of_file() {
+    let (_d, path) = temp_with("hi");
+    let mut h = Handles::default();
+    let (handle, _) = h.open(&path).unwrap();
+    let w = h.slice(handle, 0, 4096).unwrap();
+    assert_eq!(w.text, "hi");
+    assert_eq!(w.next_offset, 2);
+}
+
+#[test]
+fn slice_truncates_to_a_character_boundary() {
+    // "é" is two bytes, so a 3-byte window over "aéb" would split it.
+    let (_d, path) = temp_with("aéb");
+    let mut h = Handles::default();
+    let (handle, _) = h.open(&path).unwrap();
+    let w = h.slice(handle, 0, 2).unwrap();
+    assert_eq!(w.text, "a", "must not return half a character");
+    assert_eq!(w.next_offset, 1, "caller resumes before the split character");
+
+    // Resuming from next_offset yields the character intact.
+    let w2 = h.slice(handle, w.next_offset, 2).unwrap();
+    assert_eq!(w2.text, "é");
+}
+
+#[test]
+fn window_too_small_for_one_character_is_an_error_not_an_empty_read() {
+    let (_d, path) = temp_with("é");
+    let mut h = Handles::default();
+    let (handle, _) = h.open(&path).unwrap();
+    assert!(h.slice(handle, 0, 1).is_err(), "must not loop forever returning nothing");
+}
+
+#[test]
+fn unknown_handle_is_rejected() {
+    let mut h = Handles::default();
+    assert!(h.slice(99, 0, 10).is_err());
+}
+```
+
+- [ ] **Step 5: Run the handle tests**
+
+Run: `nix develop --command cargo test -p cuttlefish-host --test handles`
+Expected: 6 pass.
+
+- [ ] **Step 6: Write the inference backend trait and stub**
 
 `crates/cuttlefish-host/src/infer.rs`:
 
@@ -788,12 +1046,13 @@ impl InferBackend for StubBackend {
 }
 ```
 
-- [ ] **Step 5: Write the runner**
+- [ ] **Step 7: Write the runner**
 
 `crates/cuttlefish-host/src/runner.rs`. This is the reactor loop from the spec. Note the two things it deliberately does *not* do: it never blocks the guest on the host, and it never lets the guest cancel itself — cancellation is the host declining to step.
 
 ```rust
 use crate::caps::Capabilities;
+use crate::handles::Handles;
 use crate::infer::InferBackend;
 use cuttlefish_abi::{error_codes, Command, Envelope, Event, JobError, JobStatus, Usage};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -816,12 +1075,36 @@ pub struct JobSpec {
     pub caps: Capabilities,
 }
 
+/// Pointer width of a guest module, read from the module itself rather than
+/// assumed.
+///
+/// This slice implements only `W32` and rejects 64-bit modules outright. The
+/// enum exists anyway so that supporting wasm64 later is an added arm plus a
+/// second set of `TypedFunc` signatures — not a hunt through the file for
+/// every place a pointer was assumed to be 32 bits. See "The 4 GiB question".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abi {
+    W32,
+    W64,
+}
+
+impl Abi {
+    /// Size of one pointer-sized field, and therefore half a `Desc`.
+    fn ptr_size(self) -> usize {
+        match self {
+            Abi::W32 => 4,
+            Abi::W64 => 8,
+        }
+    }
+}
+
 struct Guest {
     store: Store<()>,
     memory: Memory,
+    abi: Abi,
     alloc: TypedFunc<u32, u32>,
-    init: TypedFunc<(u32, u32), i64>,
-    step: TypedFunc<(u32, u32), i64>,
+    init: TypedFunc<(u32, u32), u32>,
+    step: TypedFunc<(u32, u32), u32>,
     on_token: Option<TypedFunc<(u32, u32), i32>>,
 }
 
@@ -834,12 +1117,25 @@ impl Guest {
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| anyhow::anyhow!("guest exports no memory"))?;
+
+        // Width comes from the module's own memory type. A 64-bit guest would
+        // export cf_init as (i64, i64) -> i64, so the get_typed_func calls
+        // below would fail with a confusing signature-mismatch error; failing
+        // here instead says what is actually wrong.
+        let abi = if memory.ty(&store).is_64() { Abi::W64 } else { Abi::W32 };
+        if abi == Abi::W64 {
+            anyhow::bail!(
+                "guest uses 64-bit memory; only 32-bit guests are supported in this build"
+            );
+        }
+
         Ok(Self {
             alloc: instance.get_typed_func(&mut store, "cf_alloc")?,
             init: instance.get_typed_func(&mut store, "cf_init")?,
             step: instance.get_typed_func(&mut store, "cf_step")?,
             on_token: instance.get_typed_func(&mut store, "cf_on_token").ok(),
             memory,
+            abi,
             store,
         })
     }
@@ -851,9 +1147,23 @@ impl Guest {
         Ok((ptr, len))
     }
 
-    fn read_packed(&mut self, packed: i64) -> anyhow::Result<Vec<u8>> {
-        let ptr = ((packed >> 32) & 0xffff_ffff) as usize;
-        let len = (packed & 0xffff_ffff) as usize;
+    /// Read the `Desc { ptr, len }` the guest returned, then the payload it
+    /// points at. Two reads instead of unpacking one integer — the cost of
+    /// keeping these signatures identical across pointer widths.
+    fn read_desc(&mut self, desc_ptr: u32) -> anyhow::Result<Vec<u8>> {
+        let w = self.abi.ptr_size();
+        let mut desc = vec![0u8; 2 * w];
+        self.memory.read(&mut self.store, desc_ptr as usize, &mut desc)?;
+
+        let field = |bytes: &[u8]| -> u64 {
+            match w {
+                4 => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
+                _ => u64::from_le_bytes(bytes.try_into().unwrap()),
+            }
+        };
+        let ptr = field(&desc[..w]) as usize;
+        let len = field(&desc[w..]) as usize;
+
         let mut buf = vec![0u8; len];
         self.memory.read(&mut self.store, ptr, &mut buf)?;
         Ok(buf)
@@ -862,15 +1172,15 @@ impl Guest {
     fn call_init(&mut self, input: &serde_json::Value) -> anyhow::Result<Command> {
         let bytes = serde_json::to_vec(input)?;
         let (ptr, len) = self.write(&bytes)?;
-        let packed = self.init.call(&mut self.store, (ptr, len))?;
-        Ok(serde_json::from_slice(&self.read_packed(packed)?)?)
+        let desc = self.init.call(&mut self.store, (ptr, len))?;
+        Ok(serde_json::from_slice(&self.read_desc(desc)?)?)
     }
 
     fn call_step(&mut self, event: &Event) -> anyhow::Result<Command> {
         let bytes = serde_json::to_vec(event)?;
         let (ptr, len) = self.write(&bytes)?;
-        let packed = self.step.call(&mut self.store, (ptr, len))?;
-        Ok(serde_json::from_slice(&self.read_packed(packed)?)?)
+        let desc = self.step.call(&mut self.store, (ptr, len))?;
+        Ok(serde_json::from_slice(&self.read_desc(desc)?)?)
     }
 
     /// Returns whether generation should continue.
@@ -905,6 +1215,9 @@ pub async fn run_job(
 ) -> Envelope {
     let started = Instant::now();
     let mut usage = Usage { model: backend.model_name(), ..Usage::default() };
+    // Dropped with this function, closing every file the job opened. Job-scoped
+    // lifetime is what makes handles unforgeable across jobs.
+    let mut handles = Handles::default();
 
     let mut guest = match Guest::new(&engine, &job.module_bytes) {
         Ok(g) => g,
@@ -943,7 +1256,10 @@ pub async fn run_job(
                 let _ = events.send(JobEvent::Progress(progress)).await;
                 Event::Emitted
             }
-            Command::Read { path } => {
+            // The capability check lives here, at Open, and nowhere else. Slice
+            // takes a handle rather than a path, and handles are job-scoped, so
+            // there is no second place a path could enter.
+            Command::Open { path } => {
                 let p = std::path::PathBuf::from(&path);
                 if !job.caps.allows_read(&p) {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
@@ -953,8 +1269,17 @@ pub async fn run_job(
                         usage,
                     );
                 }
-                match std::fs::read_to_string(&p) {
-                    Ok(contents) => Event::ReadDone { contents },
+                match handles.open(&p) {
+                    Ok((handle, len)) => Event::Opened { handle, len },
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
+                    }
+                }
+            }
+            Command::Slice { handle, offset, len } => {
+                match handles.slice(handle, offset, len) {
+                    Ok(w) => Event::Sliced { text: w.text, next_offset: w.next_offset },
                     Err(e) => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
                         return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
@@ -1050,11 +1375,12 @@ pub async fn run_job(
 
 ```rust
 pub mod caps;
+pub mod handles;
 pub mod infer;
 pub mod runner;
 ```
 
-- [ ] **Step 6: Write the end-to-end runner test**
+- [ ] **Step 8: Write the end-to-end runner test**
 
 `crates/cuttlefish-host/tests/runner.rs`. It builds the example block first so the test exercises real wasm, not a mock.
 
@@ -1208,12 +1534,12 @@ async fn cancelled_before_start_yields_cancelled() {
 }
 ```
 
-- [ ] **Step 7: Run the tests**
+- [ ] **Step 9: Run the tests**
 
 Run: `nix develop --command cargo test -p cuttlefish-host`
-Expected: 8 pass (4 caps + 4 runner).
+Expected: 14 pass (4 caps + 6 handles + 4 runner).
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add crates/cuttlefish-host Cargo.lock
