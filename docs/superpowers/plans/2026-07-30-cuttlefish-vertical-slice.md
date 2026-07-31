@@ -274,7 +274,7 @@ mod tests {
 
 - [ ] **Step 6: Create stub crates for every other workspace member**
 
-Cargo refuses to build a workspace whose members don't exist, so create all of them now rather than leaving the build knowingly broken between tasks. For each of `crates/cuttlefish-core`, `crates/cuttlefish-sdk`, `crates/cuttlefish-host`, `crates/cuttlefishd`, `crates/cuttlefish-cli`, `blocks/echo-summarize`, create a `Cargo.toml` with just the package stanza and an empty `src/lib.rs` (or `src/main.rs` for the two binaries):
+Cargo refuses to build a workspace whose members don't exist, so create all of them now rather than leaving the build knowingly broken between tasks. Each stub gets a `Cargo.toml` with just the package stanza:
 
 ```toml
 [package]
@@ -283,7 +283,18 @@ version.workspace = true
 edition.workspace = true
 ```
 
-Later tasks fill in dependencies and code. `cuttlefish-cli`'s stub needs the `[[bin]] name = "cuttlefish"` stanza from Task 8 so the binary name is right from the start; a `fn main() {}` body is fine for now.
+Crate names and stub contents — note the block's package name is **not** its directory name, and both binary crates need a real `fn main() {}` body or the build fails with E0601:
+
+| Path | `name` | Stub file |
+|---|---|---|
+| `crates/cuttlefish-core` | `cuttlefish-core` | empty `src/lib.rs` |
+| `crates/cuttlefish-sdk` | `cuttlefish-sdk` | empty `src/lib.rs` |
+| `crates/cuttlefish-host` | `cuttlefish-host` | empty `src/lib.rs` |
+| `crates/cuttlefishd` | `cuttlefishd` | `src/main.rs` with `fn main() {}` |
+| `crates/cuttlefish-cli` | `cuttlefish-cli` | `src/main.rs` with `fn main() {}` |
+| `blocks/echo-summarize` | `cf-block-echo-summarize` | empty `src/lib.rs` |
+
+`cuttlefish-cli`'s stub also needs the `[[bin]] name = "cuttlefish"` stanza from Task 8 so the binary name is right from the start. Later tasks fill in dependencies and code.
 
 - [ ] **Step 7: Run the tests**
 
@@ -711,11 +722,16 @@ pub struct InferResult {
 pub trait InferBackend: Send + Sync {
     /// `on_token` is invoked per token; returning `false` stops generation
     /// early, which is how the guest's `cf_on_token` verdict is honored.
+    ///
+    /// The `for<'t>` is load-bearing: `#[async_trait]` rewrites elided
+    /// lifetimes into named ones, which would make this closure non-generic
+    /// over the token's lifetime and leave implementations unable to pass a
+    /// local `&str` to it (E0597).
     async fn infer(
         &self,
         prompt: &str,
         max_tokens: u32,
-        on_token: &mut (dyn FnMut(&str) -> bool + Send),
+        on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
     ) -> anyhow::Result<InferResult>;
 
     fn model_name(&self) -> String;
@@ -745,7 +761,7 @@ impl InferBackend for StubBackend {
         &self,
         prompt: &str,
         max_tokens: u32,
-        on_token: &mut (dyn FnMut(&str) -> bool + Send),
+        on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
     ) -> anyhow::Result<InferResult> {
         let mut out = String::new();
         let mut tokens_out = 0u32;
@@ -859,7 +875,10 @@ impl Guest {
 
     /// Returns whether generation should continue.
     fn call_on_token(&mut self, token: &str) -> anyhow::Result<bool> {
-        let Some(f) = self.on_token else { return Ok(true) };
+        // Cloned, not moved: wasmtime's TypedFunc is not Copy, so `let
+        // Some(f) = self.on_token` behind `&mut self` is E0507. Cloning also
+        // ends the borrow of `self` before `write` needs it mutably.
+        let Some(f) = self.on_token.clone() else { return Ok(true) };
         let (ptr, len) = self.write(token.as_bytes())?;
         Ok(f.call(&mut self.store, (ptr, len))? == 0)
     }
@@ -1449,7 +1468,8 @@ git commit -m "feat(core): parse the minimal .cuttlefish spec subset"
 ### Task 7: Daemon — job store and HTTP API over a unix socket
 
 **Files:**
-- Create: `crates/cuttlefishd/Cargo.toml`, `src/main.rs`, `src/state.rs`, `src/api.rs`
+- Create: `crates/cuttlefishd/src/lib.rs`, `src/main.rs`, `src/state.rs`, `src/api.rs`, `src/serve.rs`
+- Modify: `crates/cuttlefishd/Cargo.toml` (stub from Task 2)
 - Test: `crates/cuttlefishd/tests/api.rs`
 
 - [ ] **Step 1: Write the manifest**
@@ -1475,8 +1495,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
-tower = "0.5"
+# `service` gates TowerToHyperService, `tokio` gates TokioIo.
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
@@ -1686,7 +1706,7 @@ async fn job_events(
 
 - [ ] **Step 4: Write `main.rs` binding a unix socket**
 
-`axum::serve` in 0.7 takes a concrete `tokio::net::TcpListener` — the generic listener trait only arrives in axum 0.8 — so a unix socket needs a hand-rolled accept loop. That is why the manifest carries `hyper`, `hyper-util`, and `tower`. (Bumping to axum 0.8 instead is not a free swap: its path syntax changes, so every `/jobs/:id` route would become `/jobs/{id}`.)
+`axum::serve` in 0.7 takes a concrete `tokio::net::TcpListener` — the generic listener trait only arrives in axum 0.8 — so a unix socket needs a hand-rolled accept loop. That is why the manifest carries `hyper` and `hyper-util`. (Bumping to axum 0.8 instead is not a free swap: its path syntax changes, so every `/jobs/:id` route would become `/jobs/{id}`.)
 
 `crates/cuttlefishd/src/serve.rs`:
 
@@ -1772,11 +1792,15 @@ async fn main() -> anyhow::Result<()> {
 
 ```rust
 use cuttlefishd::{api, serve, state::JobStore};
+use futures_util::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Same fixture as the host tests. Duplicated rather than shared because a
 /// test-support crate for one helper is not worth a workspace member yet.
+///
+/// Assumes the default target directory; a custom `CARGO_TARGET_DIR` would
+/// need reading here too.
 fn example_block() -> Vec<u8> {
     let status = std::process::Command::new(env!("CARGO"))
         .args(["build", "-p", "cf-block-echo-summarize", "--target", "wasm32-unknown-unknown"])
@@ -1831,7 +1855,10 @@ async fn start() -> Harness {
     }
 
     Harness {
-        client: reqwest::Client::builder().unix_socket(&sock).build().unwrap(),
+        // `as_path()`, not `&sock`: the sealed UnixSocketProvider trait covers
+        // `&Path` and `PathBuf` but not `&PathBuf`, and no deref coercion
+        // happens at an `impl Trait` parameter.
+        client: reqwest::Client::builder().unix_socket(sock.as_path()).build().unwrap(),
         _dir: dir,
         doc,
     }
@@ -1880,6 +1907,55 @@ async fn submits_and_completes_a_job() {
     let body = await_terminal(&h, &id).await;
     assert_eq!(body["status"], "completed");
     assert_eq!(body["envelope"]["result"]["summary"], "a stub summary");
+}
+
+#[tokio::test]
+async fn streams_tokens_over_sse() {
+    let h = start().await;
+    let id = h
+        .client
+        .post("http://localhost/jobs")
+        .json(&serde_json::json!({
+            "spec": "summarize_docs",
+            "input": { "path": h.doc.to_str().unwrap() }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The stream never closes on its own — the JobStore keeps a broadcast
+    // sender alive — so read chunks until both markers appear, under one
+    // overall timeout. This is a smoke test that streaming works at all, not
+    // an SSE conformance test, so the raw bytes are matched rather than parsed.
+    let resp = h
+        .client
+        .get(format!("http://localhost/jobs/{id}/events"))
+        .send()
+        .await
+        .unwrap();
+
+    let body = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = resp.bytes_stream();
+        let mut seen = String::new();
+        while let Some(chunk) = stream.next().await {
+            seen.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if seen.contains(r#""type":"token""#) && seen.contains(r#""type":"result""#) {
+                break;
+            }
+        }
+        seen
+    })
+    .await
+    .expect("timed out waiting for token and result events");
+
+    assert!(body.contains(r#""type":"token""#), "no token events in stream: {body}");
+    assert!(body.contains(r#""type":"result""#), "no result event in stream: {body}");
 }
 
 #[tokio::test]
@@ -1963,7 +2039,7 @@ path = "src/main.rs"
 - [ ] **Step 6: Run the tests**
 
 Run: `nix develop --command cargo test -p cuttlefishd`
-Expected: PASS.
+Expected: 5 pass (submit/complete, SSE streaming, unknown job, unknown spec, cancel).
 
 - [ ] **Step 7: Commit**
 
@@ -2038,8 +2114,10 @@ async fn main() -> anyhow::Result<()> {
 
     let input: serde_json::Value =
         serde_json::from_str(&input).context("--input must be valid JSON")?;
+    // `as_path()`, not `&socket`: the sealed UnixSocketProvider trait covers
+    // `&Path` and `PathBuf` but not `&PathBuf`.
     let client = reqwest::Client::builder()
-        .unix_socket(&socket)
+        .unix_socket(socket.as_path())
         .build()
         .context("building the unix-socket client")?;
 
