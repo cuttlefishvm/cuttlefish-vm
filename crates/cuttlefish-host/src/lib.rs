@@ -1,11 +1,27 @@
 //! The wasmtime host: drives proc-blocks and enforces what they may reach.
 //!
-//! Stub: the runner, capability checks, and file-handle table land here next.
+//! This crate is where the project's security boundary actually lives. The
+//! compile-time capability check in `cuttlefish-core` exists to give spec
+//! authors good error messages; the checks in [`caps`] are what a malicious or
+//! malfunctioning block actually runs into, and they fail closed.
 //!
-//! This is the crate where the project's security boundary actually lives. The
-//! compile-time capability check in [`cuttlefish_core`] produces good error
-//! messages; the checks *here* are what a malicious or malfunctioning block
-//! actually runs into, and they fail closed.
+//! Three pieces, in the order a job meets them:
+//!
+//! - [`caps`] — what a job may reach. Deny-by-default, and canonicalizing to
+//!   defeat traversal and symlink escapes.
+//! - [`handles`] — files held open on the guest's behalf, served as bounded
+//!   windows so that bulk data never enters guest memory.
+//! - [`runner`] — the reactor loop: the host drives the guest one command at a
+//!   time, which is what makes cancellation free and every iteration
+//!   observable.
+//!
+//! Inference reaches the runner only through [`infer::InferBackend`], so the
+//! whole loop is testable with no model present.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod caps;
+pub mod handles;
+pub mod infer;
+pub mod runner;
