@@ -1,0 +1,74 @@
+name: API Docs
+
+# Documentation for this project lives in the code as rustdoc (see AGENTS.md),
+# so this workflow *is* the documentation build — there is no separate docs
+# source tree to render.
+#
+# Output goes to this repo's `gh-pages` branch, which GitHub serves at
+# https://cuttlefishvm.github.io/cuttlefish-vm — the URL the README and the
+# crate's `homepage` already point at. Project pages for `cuttlefish-vm` in the
+# `cuttlefishvm` org land under that path automatically, so this needs no
+# cross-repo push and no personal access token; the default GITHUB_TOKEN is
+# enough.
+#
+# Requires Pages to be enabled once, serving from branch `gh-pages`, root:
+#   gh api -X POST repos/cuttlefishvm/cuttlefish-vm/pages \
+#     -f 'source[branch]=gh-pages' -f 'source[path]=/'
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  # rustdoc emits the lib target's name with hyphens replaced by underscores.
+  DEFAULT_CRATE_NAME: cuttlefish
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nightly for `--cfg docsrs` feature annotations; the rest of CI is stable.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # Runs on pull requests too, so a broken intra-doc link fails review
+      # rather than silently shipping a dead reference. This is what makes the
+      # "docs live in code" rule enforceable instead of aspirational.
+      - name: Build docs
+        run: cargo doc --workspace --no-deps --locked --verbose
+        env:
+          RUSTDOCFLAGS: -D warnings --cfg docsrs
+
+      - name: Add landing redirect
+        run: |
+          echo '<meta http-equiv="refresh" content="0; url=${{ env.DEFAULT_CRATE_NAME }}/index.html" />' > target/doc/index.html
+        shell: bash
+
+      # rustdoc emits `static.files/`; without this Jekyll would try to process
+      # the output and drop paths it treats as special.
+      - name: Disable Jekyll processing
+        run: touch target/doc/.nojekyll
+
+      - name: Publish to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          branch: gh-pages
+          folder: target/doc
+          single-commit: true

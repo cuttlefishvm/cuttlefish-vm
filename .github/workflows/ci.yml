@@ -6,11 +6,7 @@ on:
     branches:
       - main
 
-# The published crate is `cuttlefish`, and rustdoc emits it as `cuttlefish/`.
-# (This was `cuttlefish_vm`, which no crate in the workspace produces, so the
-# Pages redirect below pointed at a 404.)
 env:
-  DEFAULT_CRATE_NAME: cuttlefish
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
@@ -100,29 +96,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
 
-  api-docs:
-    name: Publish API Docs to GitHub Pages
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: wasm32-unknown-unknown
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-      # PRs build the docs too, so broken intra-doc links fail before merge
-      # rather than silently shipping; only main actually deploys.
-      - name: Build docs
-        run: cargo doc --workspace --no-deps --locked --verbose
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - name: Redirect top-level GitHub Pages
-        run: 'echo ''<meta http-equiv="refresh" content="0; url=${{ env.DEFAULT_CRATE_NAME }}/index.html" />'' > target/doc/index.html'
-        shell: bash
-      - name: Upload API Docs
-        uses: JamesIves/github-pages-deploy-action@v4
-        if: github.ref == 'refs/heads/main'
-        with:
-          branch: gh-pages
-          folder: target/doc
-          single-commit: true
+# API docs are built and published by .github/workflows/docs.yml. Since this
+# project keeps its documentation in the code, that workflow is the docs build
+# — it is deliberately separate so a docs failure is legible as such.

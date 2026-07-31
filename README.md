@@ -49,7 +49,13 @@ Three design decisions shape everything else:
 
 ## Status
 
-Early. The architecture is settled and specified; implementation is in progress. See [`docs/superpowers/specs/`](./docs/superpowers/specs/) for the design and [`docs/superpowers/plans/`](./docs/superpowers/plans/) for what's being built now.
+Early. The architecture is settled; implementation is in progress.
+
+Design rationale lives in the code, not in a separate design document — each
+crate's module docs explain what it is responsible for and why it looks the way
+it does. Start at the [API docs][api-docs], or read `lib.rs` of
+`crates/cuttlefish-host` for the core of the system. See
+[AGENTS.md](./AGENTS.md) for why the project is organized that way.
 
 ## Development
 
@@ -76,10 +82,15 @@ how the project is built and tested, and
 participants. Security issues should follow [SECURITY.md](./SECURITY.md) rather
 than being filed as public issues.
 
-The codebase is deliberately heavy on comments explaining *why* a piece of code
-looks the way it does — several of its choices exist to avoid failures that are
-invisible from reading the result. Please preserve and extend those rather than
-tidying them away.
+Two conventions worth knowing before you start, both covered in
+[AGENTS.md](./AGENTS.md):
+
+- **Documentation lives in the code**, as rustdoc. There is no `docs/` tree —
+  it is gitignored. Explanations belong next to what they explain, where review
+  catches them going stale.
+- **Comments explain *why*, never *what*.** Several of this codebase's choices
+  exist to avoid failures that are invisible from reading the result. Preserve
+  and extend those rather than tidying them away.
 
 ## Prior art and acknowledgements
 

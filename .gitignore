@@ -1,1 +1,13 @@
 target/
+result
+.venv/
+lcov.info
+
+# Working documents — design specs, implementation plans, scratch notes.
+#
+# These are deliberately NOT tracked. Documentation that describes the system
+# lives in the code as rustdoc (`//!` module docs and `///` item docs), so that
+# it sits next to what it describes and goes stale loudly instead of quietly.
+# See AGENTS.md. Anything in here that turns out to be worth keeping should be
+# moved into module docs rather than committed as a separate file.
+/docs/

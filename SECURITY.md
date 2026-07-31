@@ -4,12 +4,9 @@
 
 Please do not open a public issue for security vulnerabilities.
 
-Email <kartik@thakore.ai> instead.
-
-(Once this repository is public we intend to enable GitHub's private
-vulnerability reporting and accept reports through Security → Report a
-vulnerability. That feature is only available on public repositories, so for
-now email is the route.)
+Report through GitHub's private vulnerability reporting
+([Security → Report a vulnerability](https://github.com/cuttlefishvm/cuttlefish-vm/security/advisories/new)),
+or by email to <kartik@thakore.ai> if you'd rather not use GitHub.
 
 Please include the affected version or commit, what an attacker gains, and a
 reproduction if you have one. We'll acknowledge within a few days and keep you
