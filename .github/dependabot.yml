@@ -15,3 +15,12 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # `dtolnay/rust-toolchain@1.94.0` in the msrv job is not a dependency
+      # version — it IS the minimum supported Rust version, deliberately pinned
+      # to `rust-version` in the workspace Cargo.toml. Auto-bumping it would
+      # leave the job green while testing the wrong compiler, which is precisely
+      # the breakage the job exists to catch. Raise it by hand, together with
+      # Cargo.toml, or not at all. (Dependabot proposed exactly this bump on the
+      # repo's first day.)
+      - dependency-name: dtolnay/rust-toolchain

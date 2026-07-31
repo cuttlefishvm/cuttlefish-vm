@@ -37,7 +37,7 @@ jobs:
     name: Build and Publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Stable, same as the rest of CI. This was nightly to enable
       # `doc_auto_cfg`, which Rust 1.92 removed — there is now nothing here that
