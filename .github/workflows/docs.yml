@@ -20,6 +20,9 @@ on:
   push:
     branches:
       - main
+  # Lets a docs redeploy be triggered by hand, without an empty commit — useful
+  # when Pages settings change and the site needs a fresh build to pick them up.
+  workflow_dispatch:
 
 env:
   # rustdoc emits the lib target's name with hyphens replaced by underscores.
