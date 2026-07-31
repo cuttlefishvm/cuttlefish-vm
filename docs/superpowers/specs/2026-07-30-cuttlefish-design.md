@@ -16,7 +16,7 @@ From prior art review (this session):
 Support three job shapes through one mechanism (spec → wasm → daemon):
 1. **Cost/token offload** — cheap, repetitive, or bulk subtasks (summarize, classify, extract) pushed to a local model.
 2. **Deterministic verified pipeline** — typed, reproducible, sandboxed steps (Rune's DAG shape), one or more of which happen to call a local LLM.
-3. **Autonomous background subagent** — a longer independent task loop (multi-turn, its own tool use) that reports back a final result.
+3. **Autonomous background subagent** — a longer independent task loop (multi-turn, its own tool use) that reports back a final result. *v1 scoping*: the DSL's pipeline layer is a static DAG with no loop construct, so in v1 an agent loop lives *inside* a single proc-block. This is less opaque than it sounds — under the reactor-model host ABI (see Daemon internals) every inference iteration surfaces to the host as a discrete command, so the loop remains observable, cancelable, and token-metered even though the DAG can't see its structure. A DAG-level loop/conditional construct, and the tool-invocation ABI "own tool use" needs, are follow-on spec material.
 
 ## Architecture
 
@@ -57,7 +57,7 @@ spec summarize_docs = {
                   text and content must not leave the machine.";
   model = Hf "Qwen/Qwen2.5-7B-Instruct-GGUF#q4_k_m" ~ctx:8192;  (* or: Path "./models/foo.gguf" *)
   data_policy = Local_only;
-  capabilities = [ Read "./docs" ];  (* capabilities : (Read of string | Network) list *)
+  capabilities = [ Read "./docs" ];  (* v1: capability = Read of string; Network deferred *)
 
   pipeline =
     let chunks = block Chunk_text ~max_tokens:2000 (Input files) in
@@ -72,7 +72,9 @@ spec summarize_docs = {
 
 `model` is a variant type — `Hf of string` (resolved + hash-cached by the daemon on first use) or `Path of string` (pre-provisioned, no fetch logic). Both are first-class; a spec author picks whichever fits their deployment.
 
-Each proc-block ships a `.cfi` interface file (like an `.mli`): input/output types plus an effect signature (`reads: [...]`, `network: bool`). `cuttlefish build` unifies these across the pipeline's `let`-bindings — a block-ordering mismatch, or a block whose declared effects exceed the spec's `capabilities`, is a compile error before wasm linking runs. This is checked again at runtime by the daemon as defense-in-depth (see Host ABI below) — the compile-time check is not a substitute for the sandbox.
+Each proc-block ships a `.cfi` interface file (like an `.mli`): input/output types plus an effect signature (`reads: [...]`; more effect kinds as future capability kinds land). **`.cfi` signatures are parametric** — a block may be generic over element types (e.g. `Map_infer : ('a -> prompt) * 'a list -> summary list` style, HM type variables), because mapping blocks are inherently polymorphic and a monomorphic-only unifier could not type any `Map_*` block at all. The typechecker does first-order unification with type variables across the pipeline's `let`-bindings — a block-ordering mismatch, or a block whose declared effects exceed the spec's `capabilities`, is a compile error before wasm linking runs. This is checked again at runtime by the daemon as defense-in-depth (see Host ABI below) — the compile-time check is not a substitute for the sandbox.
+
+**Build-time assets**: file arguments to blocks (e.g. `~prompt:"./prompts/summarize.txt"`) are resolved and **embedded into the wasm artifact at build time** — they are compile-time inputs, not runtime reads, so they need no `Read` capability and the sample above does not violate its own `Read "./docs"` grant. Runtime reads are exclusively the job-input paths flowing through the `Read` capability.
 
 Block refs resolve from a **versioned remote registry** (`org/repo@version#block`, fetched + cached + hash-verified, chosen from day one over local-only to support cross-project reuse) or a local path — both produce the same artifact format, so promoting local → published is just `cuttlefish push`.
 
@@ -83,32 +85,61 @@ Block refs resolve from a **versioned remote registry** (`org/repo@version#block
 **API** (unix socket by default, TCP optional):
 ```
 POST   /jobs              {spec: name, input: {...}}         -> {job_id}
+GET    /jobs/:id          current status + result envelope if finished (poll/recovery path)
 GET    /jobs/:id/events    SSE stream: progress | tokens | result | error
 DELETE /jobs/:id          cancel
 GET    /specs             [{name, description, input_schema}]  (harness discovery)
 GET    /models            loaded models + memory budget status
 ```
 
+Results are **not** delivered exclusively over SSE: a finished job's envelope is retained by the daemon (until acknowledged or TTL-expired) and fetchable via `GET /jobs/:id`, and the SSE endpoint honors `Last-Event-ID` for replay — a dropped connection right after the `result` event can never lose the result permanently.
+
 **Result envelope** (fixed, spec-independent): `{status, result: <output-typed payload>, error?, usage: {tokens_in, tokens_out, duration_ms, model}}`.
 
-**Model pool** — keyed by resolved model ref (hash of gguf + quant). A configured memory budget (`--vram-budget`/`--ram-budget`) gates loading; exceeding it evicts the least-recently-used *idle* model (never one with an in-flight job). Multiple models load concurrently up to budget — jobs on different models run in true parallel; jobs on the same model are serialized against that one loaded instance, queued at the inference-call level (not the job level) so throughput isn't blocked on a whole job finishing — but no prompt/conversation state is ever shared or visible between jobs, each job's wasm instance holds its own context independently.
+**Model pool** — keyed by resolved model ref (hash of gguf + quant). llama.cpp separates immutable **model weights** (`llama_model`, shareable) from per-conversation **contexts** (`llama_context`, which own the KV cache). The pool exploits that split:
+
+- Weights load once per model, shared read-only across jobs.
+- Each job gets its **own `llama_context`** — KV cache is never shared, so no prompt/conversation state can leak between jobs, and a multi-turn job keeps its KV cache warm across its own `Infer` commands (no quadratic re-prefill).
+- The memory budget (`--vram-budget`/`--ram-budget`) counts **weights + each job's KV allocation** (KV at ctx 8192 can run to GBs — it is not free relative to weights and must be admission-checked). A job is admitted only if its model's weights (if not yet loaded) *plus* its context's KV fit the remaining budget; otherwise it queues.
+- Eviction targets least-recently-used *idle* weights (no live contexts); a model with any in-flight job is never evicted.
+- Jobs on different models run in true parallel. Multiple jobs on the same weights also run in parallel (separate contexts); the daemon serializes only the actual decode calls per device as needed. Batched multi-sequence decoding (llama.cpp seq-ids, one context multiplexing jobs) is an explicit **non-goal for v1** — it shares context state across jobs and would compromise the isolation story for a throughput win we don't need yet.
 
 **Scheduler / job lifecycle** — direct lift from claurst_bridge's async pattern: each job is a `tokio::spawn`ed task running one wasmtime instance (no shared mutable state between jobs) plus a `CancellationToken`. Host ABI calls go through `tokio::select!` against that token, so cancel works mid-inference, not just between pipeline steps. States: `queued → running → completed | failed | cancelled`. A job queues on model-pool availability, not a global lock.
 
-**Host ABI** (wasm imports):
+**Host ABI — reactor model, not blocking calls.** A naive `host_infer_stream(..., on_token: fn)` import is incoherent for single-threaded core wasm: if the call returns a handle immediately there is no execution context in which the host can invoke `on_token` (the guest isn't running); if it blocks, the handle and any cancel import are dead API. Wasmtime `Store`s are also `!Sync` while llama.cpp inference must run on a blocking thread, and core wasm can't pass `fn` across the boundary at all.
+
+So control is inverted (the wasmCloud/Spin actor pattern): the guest is a **state machine with multiple exports, driven by the host**. The guest never blocks on the host; it returns *commands*, the host executes them and re-invokes the guest:
+
 ```
-host_infer_stream(model, prompt, params, on_token: fn) -> InferHandle
-host_cancel(handle)
-host_read(path) -> bytes           # capability-gated, per spec's `capabilities`
+; guest exports (called BY the daemon)
+init(input_json) -> state
+step(state, event) -> command
+on_token(state, token) -> TokenAction    # optional export: streaming decisions (Continue | Stop)
+
+; command = the guest's request to the host, returned from step():
+;   Infer  { model, prompt, params }     -> host runs inference, feeds tokens to on_token
+;                                            (if exported), then calls step(state, InferDone{text, usage})
+;   Read   { path }                      -> capability-checked, then step(state, ReadDone{bytes})
+;   Emit   { progress_json }             -> forwarded to the job's SSE stream, then step(state, Emitted)
+;   Done   { result_json }               -> job completes with this payload
 ```
-Any call outside the spec's declared capabilities traps the wasm instance immediately — fail-closed, matching claurst_bridge's `OcamlPolicyHandler` posture.
+
+Consequences, all of which fall out for free:
+- **Streaming**: tokens cross a channel from the llama.cpp thread to the store-owning task, which invokes the `on_token` export per token — host-driven, no callback-into-blocked-guest problem.
+- **Cancel**: the daemon simply stops stepping the instance and aborts any in-flight inference via its `CancellationToken` — no guest-side cancel ABI needed at all.
+- **Loops are natural**: a guest returning `Infer` commands repeatedly *is* a multi-turn loop, and every iteration passes through the host — observable, cancelable, token-countable. (See Goals note below on job shape 3.)
+- The `cuttlefish-sdk` crate hides the state machine behind ordinary-looking Rust (an async-style API compiled to the step/command form), so block authors don't hand-write state transitions.
+
+Capability checks happen at command-execution time: a `Read` outside the spec's declared capabilities, or any command with no corresponding grant, fails the job immediately — fail-closed, matching claurst_bridge's `OcamlPolicyHandler` posture.
+
+**Scoping note on capabilities**: v1's capability type is `Read of string` only. `Network` was considered but is cut — the v1 command set has no network command, so a declarable-but-unexercisable capability would be dead surface. Network commands and a tool-invocation command (needed for job shape 3's "own tool use") land together in a follow-on spec.
 
 **Errors** — structured codes in the envelope's `error` field: `model_load_failed`, `capability_denied`, `schema_validation_failed`, `wasm_trap`, `timeout`, `cancelled`. No silent partial results — a trap or timeout always yields `status: failed`, never a truncated `result`.
 
 ## Testing strategy
 
 - **Compiler**: golden-file tests — `.cuttlefish` fixtures paired with expected typed IR or expected error (signature mismatch, capability-exceeds-declared, unresolved registry ref). No wasm/network involved.
-- **Proc-blocks**: native unit tests against `.cfi` types, plus one wasmtime-harness integration test per block with a mocked `host_infer_stream` (canned responses) — proves sandbox/host-call correctness without a live model.
+- **Proc-blocks**: native unit tests against `.cfi` types, plus one wasmtime-harness integration test per block driving the reactor exports (`init`/`step`/`on_token`) with canned command results — proves state-machine/sandbox correctness without a live model.
 - **Daemon**: integration tests with a stub model backend (scripted token streams, no real llama.cpp) covering queueing under budget pressure, eviction-never-kills-in-flight, cancel-mid-inference, capability-denial traps, malformed-input rejection.
 - **End-to-end**: a small quantized model (e.g. 0.5B GGUF) in CI for one or two full specs, asserting envelope shape and basic correctness — not output quality, which is a separate non-blocking eval suite.
 - **Harness/discovery**: a lint that flags a `description` matching workflow-summary patterns, plus one integration test that a real agent-shaped client can discover, submit, and stream a job end to end.
@@ -118,8 +149,11 @@ Any call outside the spec's declared capabilities traps the wasm instance immedi
 - Dune/opam-style workspace + lockfile tooling for multi-block projects (Option B above).
 - Imandra-style formal verification pass beyond the compile-time effect/capability check already in the typechecker (Option C above).
 - Multi-language proc-block authoring (WASI/WIT component model) — v1 is Rust-only via a `cuttlefish-sdk` crate.
+- `Network` capability + network commands, and a tool-invocation command for job shape 3's "own tool use" — land together in a follow-on spec.
+- DAG-level loop/conditional constructs in the DSL (v1: loops live inside a proc-block via the reactor command loop).
+- Distributed/orchestrated wasm execution (wasmCloud/Spin-style "wasm kubernetes" — many daemon nodes, actor placement, lattice networking). v1 deliberately adopts only the *invocation pattern* from that world (host-driven multi-export reactor, which is what makes the host ABI sound); the distribution layer itself is a separate concern the reactor model leaves the door open to, since a stepped state machine with explicit commands is exactly what a distributed scheduler can checkpoint and migrate.
 
-Note: streaming + cancel are **in v1**, not deferred — see Host ABI above (`host_infer_stream`/`host_cancel`) and the recommended first plan below, which ends at a streamed result.
+Note: streaming + cancel are **in v1**, not deferred — see the reactor-model Host ABI above (`on_token` export + host-side cancellation) and the recommended first plan below, which ends at a streamed result.
 
 ## Implementation planning scope
 
