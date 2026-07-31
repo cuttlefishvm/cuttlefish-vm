@@ -27,7 +27,7 @@ Two binaries sharing a `cuttlefish-core` Rust crate:
 
 Rejected alternatives: a single multi-mode binary (Rune's own shape) couples the daemon's runtime dependency tree to build-time compiler deps; a daemon-only design with no CLI loses a coherent human-facing build/registry workflow. The split mirrors docker/dockerd — the daemon owns model residency and long-lived state, the CLI is disposable.
 
-**Wasm/native split**: wasm program owns orchestration (prompt construction, response parsing/validation, looping for multi-turn/tool-use, deciding when a job is done). Native runtime owns model inference **and** capability-gated IO the sandbox can't safely do itself (see Data policy below) — not "inference only" as originally scoped; file reads for `local_only` jobs are a deliberate, narrow exception so proprietary bytes never have to pass through the wasm sandbox via the calling agent.
+**Wasm/native split**: wasm program owns orchestration (prompt construction, response parsing/validation, looping for multi-turn/tool-use, deciding when a job is done). Native runtime owns model inference **and** capability-gated IO the sandbox can't safely do itself (see Data boundary below) — not "inference only" as originally scoped; file reads for `local_only` jobs are a deliberate, narrow exception so proprietary bytes never have to pass through the wasm sandbox via the calling agent.
 
 ## Agent harness (superpowers-derived)
 
@@ -118,7 +118,8 @@ Any call outside the spec's declared capabilities traps the wasm instance immedi
 - Dune/opam-style workspace + lockfile tooling for multi-block projects (Option B above).
 - Imandra-style formal verification pass beyond the compile-time effect/capability check already in the typechecker (Option C above).
 - Multi-language proc-block authoring (WASI/WIT component model) — v1 is Rust-only via a `cuttlefish-sdk` crate.
-- Streaming/cancel was scoped into the host ABI from v1 (not deferred) per the "what does the wasm program need at minimum" decision — noted here only because it was one of several ABI-scope options considered.
+
+Note: streaming + cancel are **in v1**, not deferred — see Host ABI above (`host_infer_stream`/`host_cancel`) and the recommended first plan below, which ends at a streamed result.
 
 ## Implementation planning scope
 
