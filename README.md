@@ -49,7 +49,23 @@ Three design decisions shape everything else:
 
 ## Status
 
-Early. The architecture is settled; implementation is in progress.
+Early, but it runs end to end. A `.cuttlefish` spec drives a sandboxed wasm
+block through the daemon and returns a structured result, with capabilities
+enforced and output streamed:
+
+```console
+$ cuttlefish run --spec summarize_docs --input '{"path": "examples/docs/a.txt"}'
+{
+  "result": { "path": "examples/docs/a.txt", "summary": "a stub summary" },
+  "status": "completed",
+  "usage": { "duration_ms": 196, "model": "stub", "tokens_in": 12, "tokens_out": 3 }
+}
+```
+
+Inference is still a deterministic stub rather than llama.cpp — everything
+around it is real. Also still to come: the typed DSL with block signatures,
+multi-block pipelines, the model pool, the block registry, and the agent
+harness.
 
 Design rationale lives in the code, not in a separate design document — each
 crate's module docs explain what it is responsible for and why it looks the way
@@ -65,6 +81,23 @@ The toolchain is pinned with Nix, which supplies the exact Rust (host and `wasm3
 $ nix develop                              # drops you into a shell with everything
 $ nix develop --command cargo test --workspace
 ```
+
+To run the example job end to end:
+
+```console
+$ nix develop --command bash -c '
+    cargo build -p cf-block-echo-summarize --target wasm32-unknown-unknown &&
+    cargo build -p cuttlefishd -p cuttlefish &&
+    ./target/debug/cuttlefishd examples/summarize.cuttlefish \
+      target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm /tmp/cf.sock &
+    until [ -S /tmp/cf.sock ]; do sleep 0.1; done
+    ./target/debug/cuttlefish run --socket /tmp/cf.sock --spec summarize_docs \
+      --input "{\"path\": \"examples/docs/a.txt\"}"
+  '
+```
+
+The daemon serves over a unix domain socket, so it is unix-only for now; the
+library crates are cross-platform and tested on Windows too.
 
 Running `cargo` outside that shell will pick up whatever toolchain happens to be on your `PATH`, which is a reliable source of confusing errors. If you'd rather not use Nix, check `flake.nix` for the pinned versions and match them yourself.
 

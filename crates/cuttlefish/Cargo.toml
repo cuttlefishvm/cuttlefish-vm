@@ -17,9 +17,22 @@ homepage.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "cuttlefish"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cuttlefish"
+path = "src/main.rs"
 
 [dependencies]
+cuttlefish-abi = { workspace = true }
+cuttlefish-core = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
 
 [package.metadata.docs.rs]
 # Match the `--cfg docsrs` used by .github/workflows/docs.yml, so docs.rs and
