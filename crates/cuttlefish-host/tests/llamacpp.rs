@@ -278,9 +278,16 @@ async fn mtmd_can_initialise_from_an_embedded_projector() {
     )
     .expect("the vision model should load as a text model");
 
+    // A separate mmproj when one is named, otherwise the model file itself —
+    // some GGUFs embed the projector.
+    let mmproj = std::env::var("CUTTLEFISH_TEST_MMPROJ")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| path.clone());
+
     let params = MtmdContextParams::default();
-    match MtmdContext::init_from_file(&path, &model, &params) {
-        Ok(_) => eprintln!("VERIFIED: mtmd initialised from the embedded projector"),
-        Err(e) => panic!("mtmd could not use the embedded projector: {e}"),
+    match MtmdContext::init_from_file(&mmproj, &model, &params) {
+        Ok(_) => eprintln!("VERIFIED: mtmd initialised (mmproj={mmproj})"),
+        Err(e) => panic!("mtmd could not initialise from {mmproj}: {e}"),
     }
 }
