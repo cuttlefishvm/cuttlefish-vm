@@ -107,7 +107,7 @@ build, not of the language:
 | Provider | Target | Status |
 |---|---|---|
 | `Ollama` | model tag, e.g. `llama3.2:1b` | available |
-| `LlamaCpp` | path to a `.gguf` file | available behind the `llamacpp` feature |
+| `LlamaCpp` | path to a `.gguf` file | available behind the `llamacpp` feature; vision too, given an `mmproj-*.gguf` beside the weights |
 | `Stub` | the canned reply to return | available — deterministic, for testing pipelines without a model |
 | OpenAI-compatible HTTP | endpoint URL | planned; covers llama.cpp's server, vLLM, LM Studio, hosted providers |
 

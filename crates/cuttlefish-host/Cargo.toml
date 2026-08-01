@@ -15,7 +15,7 @@ default = []
 # source, which needs cmake, a C++ toolchain, and libclang for bindgen. Nothing
 # else in the workspace changes when it is absent — the backend registry simply
 # does not offer the `llamacpp` provider.
-llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
+llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:image"]
 # Rasterizing PDF pages for vision models. Off by default: pdfium is a large
 # native dependency, and text extraction (always available) covers documents
 # that have a text layer.

@@ -18,6 +18,20 @@
 //! The cost is the build, and that it pins this project to llama.cpp's own
 //! release cadence and API.
 //!
+//! # Model compatibility, learned the hard way
+//!
+//! A GGUF pulled by Ollama is **not** necessarily loadable here. Ollama ships
+//! its own llama.cpp fork carrying architectures upstream does not have, so a
+//! standard architecture works (`llama3.2` loads fine) and anything Ollama added
+//! does not:
+//!
+//! - `glm-ocr` — `unknown model architecture: 'glmocr'`
+//! - `gemma4:e2b` — `wrong number of tensors; expected 2012, got 601`
+//!
+//! Models built for upstream llama.cpp — SmolVLM, Qwen2-VL, LLaVA — load
+//! normally. Worth knowing before pointing this provider at an Ollama blob and
+//! concluding the backend is broken.
+//!
 //! # Threading
 //!
 //! llama.cpp is synchronous and CPU-bound, while [`InferBackend::infer`] is
@@ -37,6 +51,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::sampling::LlamaSampler;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -52,10 +67,16 @@ const DEFAULT_CONTEXT: u32 = 4096;
 
 /// llama.cpp's global backend, initialised at most once per process.
 ///
-/// `LlamaBackend::init` sets up process-wide state and must not run twice, but
-/// several jobs may load models concurrently. A `OnceLock` makes the first
-/// caller win and the rest wait, without callers having to coordinate.
-fn backend() -> anyhow::Result<&'static LlamaBackend> {
+/// `LlamaBackend::init` sets up process-wide state and returns
+/// `BackendAlreadyInitialized` if it runs twice, but several jobs may load
+/// models concurrently. A `OnceLock` makes the first caller win and the rest
+/// wait, without callers having to coordinate.
+///
+/// Public because it is the *only* correct way to obtain one in this process:
+/// anything calling `LlamaBackend::init` itself — a test, an embedder — will
+/// fail as soon as a model has already been loaded. Handing out the shared one
+/// removes that footgun rather than documenting it.
+pub fn shared_backend() -> anyhow::Result<&'static LlamaBackend> {
     static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
     BACKEND
         .get_or_init(|| LlamaBackend::init().map_err(|e| e.to_string()))
@@ -65,6 +86,12 @@ fn backend() -> anyhow::Result<&'static LlamaBackend> {
 
 /// Serves inference from a model loaded into this process.
 pub struct LlamaCppBackend {
+    /// The multimodal projector, when this model has one.
+    ///
+    /// Held as a path rather than an open [`MtmdContext`] because that context
+    /// borrows the model and is not `Sync`; it is built per request, alongside
+    /// the per-job llama context it has to share a lifetime with.
+    mmproj: Option<std::path::PathBuf>,
     /// Shared across jobs. The model is immutable once loaded and is `Sync`, so
     /// jobs share weights while each takes its own context — the same split the
     /// design calls for, and the reason a second job does not pay to load again.
@@ -86,10 +113,21 @@ impl LlamaCppBackend {
             anyhow::bail!("no model file at {}", path.display());
         }
 
-        let model = LlamaModel::load_from_file(backend()?, path, &LlamaModelParams::default())
-            .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))?;
+        let model =
+            LlamaModel::load_from_file(shared_backend()?, path, &LlamaModelParams::default())
+                .map_err(|e| anyhow::anyhow!("loading {}: {e}", path.display()))?;
+
+        // A projector sitting next to the weights is the convention llama.cpp
+        // and the GGUF publishers both use — `mmproj-<name>.gguf` beside
+        // `<name>.gguf`. Finding it automatically means a spec names one path
+        // for a vision model exactly as it does for a text one.
+        let mmproj = find_mmproj(path);
+        if let Some(found) = &mmproj {
+            eprintln!("llamacpp: using multimodal projector {}", found.display());
+        }
 
         Ok(Self {
+            mmproj,
             model: Arc::new(model),
             // The file stem reads better in usage accounting than a full path.
             name: path
@@ -105,23 +143,71 @@ impl LlamaCppBackend {
         self.context_size = tokens;
         self
     }
+
+    /// Point at a projector explicitly, rather than relying on the sibling
+    /// convention.
+    pub fn with_mmproj(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.mmproj = Some(path.into());
+        self
+    }
+
+    /// Whether this model was loaded with a projector.
+    pub fn has_projector(&self) -> bool {
+        self.mmproj.is_some()
+    }
+}
+
+/// Look for a multimodal projector beside a model file.
+///
+/// Matches `mmproj*.gguf` in the same directory, which is what both llama.cpp's
+/// own tooling and the GGUF publishers produce. Returns the first match in
+/// sorted order so the choice is stable rather than filesystem-dependent — an
+/// unstable pick would make a job non-reproducible for reasons nobody could see.
+fn find_mmproj(model: &Path) -> Option<std::path::PathBuf> {
+    let dir = model.parent()?;
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            name.starts_with("mmproj") && name.ends_with(".gguf")
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// Decode encoded image bytes into the flat RGB24 buffer mtmd expects.
+///
+/// mtmd takes raw pixels, not a PNG or a JPEG, so this is where an image
+/// actually gets decoded. Failing here is deliberate rather than substituting a
+/// blank image: a blank image produces a confident description of nothing.
+fn decode_rgb(bytes: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|e| anyhow::anyhow!("decoding an image for the vision model: {e}"))?;
+    let rgb = decoded.to_rgb8();
+    Ok((rgb.width(), rgb.height(), rgb.into_raw()))
 }
 
 /// Run generation to completion on the calling (blocking) thread.
 ///
 /// Split out so the async wrapper stays about plumbing. `emit` returns whether
 /// to keep going, which is how the guest's stop verdict arrives here.
+#[allow(clippy::too_many_arguments)]
 fn generate(
     model: &LlamaModel,
+    mmproj: Option<&Path>,
     context_size: u32,
     prompt: &str,
+    images: &[Vec<u8>],
     max_tokens: u32,
     mut emit: impl FnMut(&str) -> bool,
 ) -> anyhow::Result<InferResult> {
     let ctx_size = NonZeroU32::new(context_size.max(1)).expect("max(1) is non-zero");
     let mut ctx = model
         .new_context(
-            backend()?,
+            shared_backend()?,
             LlamaContextParams::default().with_n_ctx(Some(ctx_size)),
         )
         .map_err(|e| anyhow::anyhow!("creating llama.cpp context: {e}"))?;
@@ -152,27 +238,86 @@ fn generate(
         Err(_) => prompt.to_string(),
     };
 
-    let tokens = model
-        .str_to_token(&prompt, AddBos::Always)
-        .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?;
-    let tokens_in = tokens.len() as u32;
+    // Two ways to fill the context: mtmd when there are images, plain
+    // tokenization otherwise. Both leave `pos` at the first position to generate
+    // from, and `tokens_in` counting what the prompt cost.
+    let mut batch = LlamaBatch::new(context_size as usize, 1);
+    let (tokens_in, mut pos) = if images.is_empty() {
+        let tokens = model
+            .str_to_token(&prompt, AddBos::Always)
+            .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?;
+        let tokens_in = tokens.len() as u32;
 
-    if tokens_in >= context_size {
-        anyhow::bail!(
-            "prompt is {tokens_in} tokens but the context window is {context_size}; \
-             raise the context size or shorten the prompt"
-        );
-    }
+        if tokens_in >= context_size {
+            anyhow::bail!(
+                "prompt is {tokens_in} tokens but the context window is {context_size}; \
+                 raise the context size or shorten the prompt"
+            );
+        }
 
-    // Feed the whole prompt, asking for logits only on the final token — the
-    // earlier positions exist to build the KV cache, not to be sampled from.
-    let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
-    let last = tokens.len().saturating_sub(1);
-    for (i, token) in tokens.into_iter().enumerate() {
-        batch.add(token, i as i32, &[0], i == last)?;
-    }
-    ctx.decode(&mut batch)
-        .map_err(|e| anyhow::anyhow!("decoding prompt: {e}"))?;
+        // Feed the whole prompt, asking for logits only on the final token — the
+        // earlier positions exist to build the KV cache, not to be sampled from.
+        let last = tokens.len().saturating_sub(1);
+        for (i, token) in tokens.iter().enumerate() {
+            batch.add(*token, i as i32, &[0], i == last)?;
+        }
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow::anyhow!("decoding prompt: {e}"))?;
+
+        (tokens_in, last as i32 + 1)
+    } else {
+        let mmproj = mmproj.ok_or_else(|| {
+            anyhow::anyhow!(
+                "this job supplied images, but no multimodal projector was found \
+                 beside the model. A vision model needs an `mmproj-*.gguf` in the \
+                 same directory as its weights."
+            )
+        })?;
+
+        let mtmd = MtmdContext::init_from_file(
+            &mmproj.to_string_lossy(),
+            model,
+            &MtmdContextParams::default(),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("loading the multimodal projector {}: {e}", mmproj.display())
+        })?;
+
+        // mtmd splices images in wherever its marker appears, so the marker has
+        // to be in the text — one per image, prepended, because a caller's
+        // prompt has no reason to know about mtmd's marker syntax.
+        let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+        let mut bitmaps = Vec::with_capacity(images.len());
+        for bytes in images {
+            let (w, h, rgb) = decode_rgb(bytes)?;
+            bitmaps.push(
+                MtmdBitmap::from_image_data(w, h, &rgb)
+                    .map_err(|e| anyhow::anyhow!("preparing an image for the model: {e}"))?,
+            );
+        }
+        let refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+
+        let text = format!("{}{prompt}", marker.repeat(images.len()));
+        let chunks = mtmd
+            .tokenize(
+                MtmdInputText {
+                    text,
+                    add_special: true,
+                    parse_special: true,
+                },
+                &refs,
+            )
+            .map_err(|e| anyhow::anyhow!("tokenizing the prompt with images: {e}"))?;
+
+        // eval_chunks encodes each image through the projector and decodes the
+        // text around it, leaving the context primed. It returns the position to
+        // continue generating from.
+        let n_past = chunks
+            .eval_chunks(&mtmd, &ctx, 0, 0, context_size as i32, true)
+            .map_err(|e| anyhow::anyhow!("evaluating the prompt with images: {e}"))?;
+
+        (n_past as u32, n_past)
+    };
 
     // Greedy sampling keeps a job reproducible, which is what makes its failures
     // investigable — but greedy alone gets stuck in loops, repeating a sentence
@@ -188,7 +333,6 @@ fn generate(
 
     let mut text = String::new();
     let mut tokens_out = 0u32;
-    let mut pos = last as i32 + 1;
 
     // A stateful decoder, not a per-token conversion: a single token can carry
     // part of a multi-byte character, so decoding each one independently would
@@ -239,14 +383,14 @@ impl InferBackend for LlamaCppBackend {
         req: InferRequest<'_>,
         on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
     ) -> anyhow::Result<InferResult> {
-        // llama.cpp does support multimodal (mtmd), but wiring it needs a
-        // projector model alongside the weights and a different decode path.
-        // Refusing is the honest answer until that exists: silently dropping the
-        // images would answer a question about nothing.
-        if !req.images.is_empty() {
+        // Fail early with a message naming the fix, rather than letting mtmd
+        // report a missing projector from deep inside a worker thread.
+        if !req.images.is_empty() && self.mmproj.is_none() {
             anyhow::bail!(
-                "the embedded llama.cpp backend does not accept images yet; \
-                 use the `ollama` provider with a vision model"
+                "this job supplied images, but no multimodal projector was found \
+                 beside {}. A vision model needs an `mmproj-*.gguf` in the same \
+                 directory as its weights.",
+                self.name
             );
         }
         // Tokens travel out over a channel and the stop verdict travels back via
@@ -258,10 +402,18 @@ impl InferBackend for LlamaCppBackend {
         let handle = {
             let (model, stop, prompt) = (self.model.clone(), stop.clone(), req.prompt.to_string());
             let (context_size, max_tokens) = (self.context_size, req.max_tokens);
+            let mmproj = self.mmproj.clone();
+            let images: Vec<Vec<u8>> = req.images.to_vec();
             tokio::task::spawn_blocking(move || {
-                generate(&model, context_size, &prompt, max_tokens, |piece| {
-                    tx.send(piece.to_string()).is_ok() && !stop.load(Ordering::Relaxed)
-                })
+                generate(
+                    &model,
+                    mmproj.as_deref(),
+                    context_size,
+                    &prompt,
+                    &images,
+                    max_tokens,
+                    |piece| tx.send(piece.to_string()).is_ok() && !stop.load(Ordering::Relaxed),
+                )
             })
         };
 
@@ -289,6 +441,13 @@ impl InferBackend for LlamaCppBackend {
 
     fn model_name(&self) -> String {
         self.name.clone()
+    }
+
+    /// Only when a projector was found. Without one the model has no vision
+    /// tower to route images through, and claiming otherwise would let the
+    /// runner hand over images this backend must then refuse deeper in.
+    fn supports_images(&self) -> bool {
+        self.mmproj.is_some()
     }
 }
 

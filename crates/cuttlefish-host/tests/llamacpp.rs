@@ -229,37 +229,9 @@ async fn jobs_do_not_share_context() {
     );
 }
 
-/// Probe: can mtmd initialise from a GGUF whose projector is embedded?
-///
-/// Some multimodal GGUFs (glm-ocr among them) carry the vision tower and the
-/// `mm.*` projector tensors in the same file as the text weights, rather than in
-/// a separate mmproj. `mtmd_init_from_file` takes a projector path *and* a text
-/// model, so the question is whether passing the same path for both works.
-///
-/// This exists to answer that before any backend code is written against it —
-/// building multimodal support that cannot be verified would be exactly the
-/// thing AGENTS.md says not to do.
-///
-/// # Result so far: not yet verifiable with locally available models
-///
-/// Neither vision model installed through Ollama loads in the llama.cpp that
-/// `llama-cpp-sys-2` vendors:
-///
-/// - `glm-ocr` — `unknown model architecture: 'glmocr'`
-/// - `gemma4:e2b` — `wrong number of tensors; expected 2012, got 601`
-///
-/// The lesson generalises beyond multimodal: **an Ollama blob is not
-/// necessarily loadable by an arbitrary llama.cpp build.** Ollama ships its own
-/// fork carrying architectures upstream does not have, so "point the llamacpp
-/// provider at an Ollama blob" works for a standard architecture (llama3.2
-/// does) and fails for anything Ollama added.
-///
-/// Verifying mtmd therefore needs a model built for upstream llama.cpp — a
-/// Qwen2-VL, LLaVA, or SmolVLM GGUF with its mmproj — rather than whatever
-/// Ollama happens to have pulled.
 #[tokio::test]
-#[ignore = "requires CUTTLEFISH_TEST_VISION_GGUF pointing at a multimodal .gguf"]
-async fn mtmd_can_initialise_from_an_embedded_projector() {
+#[ignore = "requires CUTTLEFISH_TEST_VISION_GGUF with an mmproj beside it"]
+async fn describes_an_image_through_the_embedded_projector() {
     let Some(path) = std::env::var("CUTTLEFISH_TEST_VISION_GGUF")
         .ok()
         .filter(|p| !p.is_empty())
@@ -268,26 +240,92 @@ async fn mtmd_can_initialise_from_an_embedded_projector() {
         return;
     };
 
-    use llama_cpp_2::mtmd::{MtmdContext, MtmdContextParams};
+    let backend = LlamaCppBackend::load(&path).expect("the vision model should load");
+    assert!(
+        backend.has_projector(),
+        "no mmproj-*.gguf found beside {path}; the sibling convention is what \
+         makes a vision model usable from a spec naming one path"
+    );
+    assert!(backend.supports_images());
 
-    let backend = llama_cpp_2::llama_backend::LlamaBackend::init().expect("backend");
-    let model = llama_cpp_2::model::LlamaModel::load_from_file(
-        &backend,
-        &path,
-        &llama_cpp_2::model::params::LlamaModelParams::default(),
-    )
-    .expect("the vision model should load as a text model");
+    // A 64x64 image with a solid black bar. Asserting on *shape* rather than
+    // wording: a model is not a deterministic function, and a test expecting
+    // particular words fails for reasons unrelated to this code.
+    let png = {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut img = image::RgbImage::new(64, 64);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = if (10..54).contains(&x) && (28..36).contains(&y) {
+                image::Rgb([0, 0, 0])
+            } else {
+                image::Rgb([255, 255, 255])
+            };
+        }
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    };
 
-    // A separate mmproj when one is named, otherwise the model file itself —
-    // some GGUFs embed the projector.
-    let mmproj = std::env::var("CUTTLEFISH_TEST_MMPROJ")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| path.clone());
+    let images = vec![png];
+    let mut streamed = Vec::new();
+    let mut sink = |piece: &str| {
+        streamed.push(piece.to_string());
+        true
+    };
 
-    let params = MtmdContextParams::default();
-    match MtmdContext::init_from_file(&mmproj, &model, &params) {
-        Ok(_) => eprintln!("VERIFIED: mtmd initialised (mmproj={mmproj})"),
-        Err(e) => panic!("mtmd could not initialise from {mmproj}: {e}"),
+    let result = backend
+        .infer(
+            cuttlefish_host::infer::InferRequest {
+                prompt: "Describe this image in one sentence.",
+                max_tokens: 40,
+                images: &images,
+            },
+            &mut sink,
+        )
+        .await
+        .expect("vision inference should succeed");
+
+    eprintln!("VISION OUTPUT: {}", result.text);
+
+    assert!(!result.text.is_empty(), "the model produced no text");
+    assert!(!streamed.is_empty(), "tokens must stream");
+    assert_eq!(streamed.concat(), result.text, "streamed text must match");
+    assert!(
+        result.tokens_in > 10,
+        "an image should cost many prompt tokens, got {}",
+        result.tokens_in
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires CUTTLEFISH_TEST_GGUF pointing at a text-only .gguf"]
+async fn a_text_only_model_refuses_images_by_name() {
+    let path = model_or_skip!();
+    let backend = LlamaCppBackend::load(&path).expect("model should load");
+    if backend.has_projector() {
+        eprintln!("skipping: this model has a projector, so it accepts images");
+        return;
     }
+
+    assert!(
+        !backend.supports_images(),
+        "without a projector the backend must not claim image support"
+    );
+
+    let images = vec![vec![0u8; 8]];
+    let mut noop = |_: &str| true;
+    let err = backend
+        .infer(
+            cuttlefish_host::infer::InferRequest {
+                prompt: "what is this",
+                max_tokens: 8,
+                images: &images,
+            },
+            &mut noop,
+        )
+        .await
+        .expect_err("a model without a projector must refuse images");
+
+    assert!(err.to_string().contains("mmproj"), "{err}");
 }
