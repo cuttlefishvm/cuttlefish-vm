@@ -53,7 +53,10 @@
 //!
 //! This is the facade. It ships the `cuttlefish` command-line client and
 //! re-exports the workspace's pieces, so that one page documents the whole
-//! system. The implementation lives in sibling crates.
+//! system. The implementation lives in sibling crates:
+//!
+//! - [`abi`] — the contract between host and guest.
+//! - [`core`] — parsing `Cuttlefish.spec` files.
 //!
 //! # Project conventions
 //!
@@ -74,3 +77,6 @@
 // later and their docs need "available on feature X" labels, reach for the
 // then-current `doc_cfg` spelling and verify it against the pinned toolchain
 // before committing — this exact line already broke CI once.
+
+pub use cuttlefish_abi as abi;
+pub use cuttlefish_core as core;
