@@ -343,3 +343,27 @@ async fn images_reach_a_backend_that_accepts_them() {
         "the image must actually reach the backend, got: {summary:?}"
     );
 }
+
+#[test]
+fn a_block_declares_its_signature_through_the_module() {
+    // The declaration comes from the artifact that will actually run, so it
+    // cannot describe a different version of the block than the one checked.
+    let sig = cuttlefish_host::runner::read_signature(&Engine::default(), &example_block())
+        .expect("the example block should report a signature");
+
+    assert_eq!(sig.input.to_string(), "{path: text}");
+    assert_eq!(sig.output.to_string(), "{path: text, summary: text}");
+}
+
+#[test]
+fn a_module_without_a_signature_reports_the_permissive_default() {
+    // Blocks ship independently of the host. One built before signatures
+    // existed must still compose — unchecked, but working.
+    let wat = r#"(module (memory (export "memory") 1))"#;
+    let bytes = wat::parse_str(wat).expect("valid wat");
+
+    let sig = cuttlefish_host::runner::read_signature(&Engine::default(), &bytes)
+        .expect("a module without cf_signature is not an error");
+    assert_eq!(sig.input, cuttlefish_abi::Ty::Json);
+    assert_eq!(sig.output, cuttlefish_abi::Ty::Json);
+}

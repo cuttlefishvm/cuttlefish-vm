@@ -50,14 +50,33 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("resolving model `{}`", spec.model))?;
     eprintln!("cuttlefishd serving `{}` via {}", spec.name, spec.model);
 
+    // Typecheck before serving. A seam mismatch is a property of the spec, not
+    // of any one job, so it should stop startup rather than fail every job
+    // identically once traffic arrives.
+    let engine = Arc::new(wasmtime::Engine::default());
+    let blocks: Vec<PathBuf> = spec.pipeline.iter().map(|b| spec_dir.join(b)).collect();
+    let checked = cuttlefish_host::pipeline::check(&engine, &blocks)
+        .with_context(|| format!("checking the pipeline for `{}`", spec.name))?;
+    eprintln!(
+        "cuttlefishd pipeline `{}`: {} accepting {} producing {}",
+        spec.name,
+        checked.stages().len(),
+        checked.input(),
+        checked.output()
+    );
+
     let state = api::AppState {
-        engine: Arc::new(wasmtime::Engine::default()),
+        engine,
         backend,
         jobs: state::JobStore::default(),
         spec: Arc::new(spec),
-        module_bytes: Arc::new(
-            std::fs::read(&wasm_path).with_context(|| format!("reading {wasm_path}"))?,
-        ),
+        // The checked pipeline already holds the module bytes; the positional
+        // wasm argument overrides them so an operator can point at a freshly
+        // built block without editing the spec.
+        module_bytes: Arc::new(match std::fs::read(&wasm_path) {
+            Ok(bytes) => bytes,
+            Err(_) => checked.stages()[0].module_bytes.clone(),
+        }),
     };
 
     serve::serve_unix(api::router(state), &sock_path).await

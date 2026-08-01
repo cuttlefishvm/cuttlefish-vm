@@ -184,6 +184,53 @@ impl Guest {
     }
 }
 
+/// Read a block's declared signature out of a compiled module.
+///
+/// Instantiates the module and calls its `cf_signature` export. That is heavier
+/// than parsing a sidecar file, and it is the point: the answer comes from the
+/// artifact that will actually run, so it cannot describe a different version of
+/// the block than the one being checked.
+///
+/// A block built before signatures existed has no such export. That is not an
+/// error — it reports the permissive default, so an older block still composes,
+/// just without the seam being checked.
+pub fn read_signature(
+    engine: &Engine,
+    module_bytes: &[u8],
+) -> anyhow::Result<cuttlefish_abi::Signature> {
+    let permissive = cuttlefish_abi::Signature {
+        input: cuttlefish_abi::Ty::Json,
+        output: cuttlefish_abi::Ty::Json,
+    };
+
+    // Deliberately does not go through `Guest`, which requires the whole reactor
+    // — alloc, init, step. Reading a declaration should not demand that a module
+    // be runnable: a block missing an export has a real problem, but it is one
+    // worth reporting when the job runs, with the job's error handling, rather
+    // than as a confusing failure during a typecheck.
+    let module = Module::new(engine, module_bytes)?;
+    let linker: Linker<()> = Linker::new(engine);
+    let mut store = Store::new(engine, ());
+    let instance = linker.instantiate(&mut store, &module)?;
+
+    let Ok(signature) = instance.get_typed_func::<(), u32>(&mut store, "cf_signature") else {
+        return Ok(permissive);
+    };
+    let Some(memory) = instance.get_memory(&mut store, "memory") else {
+        return Ok(permissive);
+    };
+
+    let desc_ptr = signature.call(&mut store, ())? as usize;
+    let mut desc = [0u8; 8];
+    memory.read(&mut store, desc_ptr, &mut desc)?;
+    let ptr = u32::from_le_bytes(desc[..4].try_into().expect("4 bytes")) as usize;
+    let len = u32::from_le_bytes(desc[4..].try_into().expect("4 bytes")) as usize;
+
+    let mut buf = vec![0u8; len];
+    memory.read(&mut store, ptr, &mut buf)?;
+    Ok(serde_json::from_slice(&buf)?)
+}
+
 fn fail(code: &str, message: impl Into<String>, usage: Usage) -> Envelope {
     Envelope {
         status: JobStatus::Failed,

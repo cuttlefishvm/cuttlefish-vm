@@ -52,6 +52,184 @@ use serde::{Deserialize, Serialize};
 /// cannot be forged into a reference to another job's data.
 pub type Handle = u32;
 
+/// The shape of a value flowing through a pipeline.
+///
+/// Deliberately small. This exists to catch the mistake that actually happens
+/// when blocks are composed — one block emitting a summary string into another
+/// expecting a list of chunks — not to be a general-purpose type system. A
+/// richer one would need inference, and inference over a language with no
+/// expressions is machinery without a use.
+/// Written and read as a compact string — `text`, `[text]`, `{path: text}` —
+/// rather than as a nested tagged object.
+///
+/// Two reasons, and the second is the one that forced it. It reads well in an
+/// error message and in a spec, so one syntax serves the wire, the diagnostics,
+/// and the DSL. And a recursive enum serialized structurally makes serde's
+/// generic serializer recurse deeply enough to blow rustc's recursion limit in
+/// the *guest* crate — which would have meant every block author adding
+/// `#![recursion_limit]` to work around a detail of this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ty {
+    /// A UTF-8 string.
+    Text,
+    /// Opaque bytes, base64-encoded on the wire.
+    Bytes,
+    /// A handle naming an image the host holds.
+    Image,
+    /// A handle naming a paged document.
+    Document,
+    /// Any JSON value. The top type: everything is assignable to it.
+    ///
+    /// An escape hatch, and one worth using sparingly — a pipeline of `Json`
+    /// seams typechecks unconditionally, which is the same as not checking.
+    Json,
+    /// An ordered sequence.
+    List(Box<Ty>),
+    /// A fixed set of named fields.
+    ///
+    /// A `BTreeMap` so that two records written in different field orders are
+    /// the same type, and so error messages list fields the same way twice.
+    Record(std::collections::BTreeMap<String, Ty>),
+}
+
+impl Ty {
+    /// Whether a value of this type can be fed where `expected` is required.
+    ///
+    /// Not equality: [`Ty::Json`] accepts anything, and a record with *extra*
+    /// fields satisfies one that needs fewer. Both directions of that matter —
+    /// a block that adds a field should not break its consumer, and a block
+    /// that requires a field its producer never emits should fail loudly.
+    pub fn assignable_to(&self, expected: &Ty) -> bool {
+        match (self, expected) {
+            (_, Ty::Json) => true,
+            (Ty::List(a), Ty::List(b)) => a.assignable_to(b),
+            (Ty::Record(have), Ty::Record(need)) => need
+                .iter()
+                .all(|(name, want)| have.get(name).is_some_and(|got| got.assignable_to(want))),
+            (a, b) => a == b,
+        }
+    }
+
+    /// A short human-readable rendering, for error messages.
+    pub fn describe(&self) -> String {
+        match self {
+            Ty::Text => "text".into(),
+            Ty::Bytes => "bytes".into(),
+            Ty::Image => "image".into(),
+            Ty::Document => "document".into(),
+            Ty::Json => "json".into(),
+            Ty::List(inner) => format!("[{}]", inner.describe()),
+            Ty::Record(fields) => {
+                let body = fields
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {}", v.describe()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{{body}}}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Ty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+impl std::str::FromStr for Ty {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_ty(s.trim())
+    }
+}
+
+impl Serialize for Ty {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.describe())
+    }
+}
+
+impl<'de> Deserialize<'de> for Ty {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parse the type syntax [`Ty::describe`] produces.
+fn parse_ty(s: &str) -> Result<Ty, String> {
+    let s = s.trim();
+    match s {
+        "text" => return Ok(Ty::Text),
+        "bytes" => return Ok(Ty::Bytes),
+        "image" => return Ok(Ty::Image),
+        "document" => return Ok(Ty::Document),
+        "json" => return Ok(Ty::Json),
+        _ => {}
+    }
+
+    if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return Ok(Ty::List(Box::new(parse_ty(inner)?)));
+    }
+
+    if let Some(body) = s.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+        let mut fields = std::collections::BTreeMap::new();
+        if !body.trim().is_empty() {
+            for part in split_fields(body) {
+                let (name, ty) = part
+                    .split_once(':')
+                    .ok_or_else(|| format!("expected `name: type` in `{part}`"))?;
+                fields.insert(name.trim().to_string(), parse_ty(ty)?);
+            }
+        }
+        return Ok(Ty::Record(fields));
+    }
+
+    Err(format!("`{s}` is not a type"))
+}
+
+/// Split record fields on commas that are not inside a nested `[]` or `{}`.
+///
+/// A plain `split(',')` would cut `{a: [x, y]}` in the wrong place.
+fn split_fields(body: &str) -> Vec<String> {
+    let (mut out, mut depth, mut current) = (Vec::new(), 0i32, String::new());
+    for c in body.chars() {
+        match c {
+            '[' | '{' => {
+                depth += 1;
+                current.push(c);
+            }
+            ']' | '}' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// What a block accepts and produces.
+///
+/// Declared by the block itself, through a `cf_signature` export, rather than in
+/// a sidecar file beside it. A sidecar can disagree with the code it describes
+/// and nothing forces anyone to notice; a declaration compiled into the module
+/// travels with it, cannot go stale, and leaves one artifact to ship rather than
+/// two to keep in step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signature {
+    /// What the block needs as input.
+    pub input: Ty,
+    /// What it produces.
+    pub output: Ty,
+}
+
 /// What kind of thing a handle refers to, reported by [`Event::Opened`].
 ///
 /// A block needs this to know which commands are worth issuing: [`Command::Slice`]

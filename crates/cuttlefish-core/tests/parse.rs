@@ -24,7 +24,7 @@ fn parses_every_field_of_the_sample() {
     assert_eq!(spec.model, ModelRef::new("path", "./models/stub.gguf"));
     assert_eq!(spec.data_policy, DataPolicy::LocalOnly);
     assert_eq!(spec.read_roots, vec![PathBuf::from("./docs")]);
-    assert_eq!(spec.block, PathBuf::from("../blocks/echo-summarize"));
+    assert_eq!(spec.block(), PathBuf::from("../blocks/echo-summarize"));
 }
 
 #[test]
@@ -205,4 +205,38 @@ fn the_repository_example_spec_parses() {
     let spec = parse_spec(&src).expect("the shipped example must parse");
     assert_eq!(spec.name, "summarize_docs");
     assert_eq!(spec.data_policy, DataPolicy::LocalOnly);
+}
+
+#[test]
+fn a_pipeline_of_several_blocks_parses_in_order() {
+    // Order is the whole meaning of a pipeline; reversing it would typecheck
+    // differently and run differently.
+    let src = SAMPLE.replace(
+        r#"block = "../blocks/echo-summarize";"#,
+        r#"pipeline = [ "../blocks/chunk", "../blocks/summarize" ];"#,
+    );
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(
+        spec.pipeline,
+        vec![
+            PathBuf::from("../blocks/chunk"),
+            PathBuf::from("../blocks/summarize")
+        ]
+    );
+}
+
+#[test]
+fn block_is_sugar_for_a_one_element_pipeline() {
+    // Both spellings must produce the same thing, so nothing downstream has to
+    // handle two cases.
+    let spec = parse_spec(SAMPLE).unwrap();
+    assert_eq!(spec.pipeline.len(), 1);
+    assert_eq!(spec.block(), spec.pipeline[0]);
+}
+
+#[test]
+fn an_empty_pipeline_is_rejected() {
+    // A pipeline that runs nothing and returns nothing is never what was meant.
+    let src = SAMPLE.replace(r#"block = "../blocks/echo-summarize";"#, "pipeline = [ ];");
+    assert!(parse_spec(&src).is_err());
 }

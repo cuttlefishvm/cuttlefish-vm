@@ -62,7 +62,7 @@ async fn start() -> Harness {
         model: ModelRef::new("stub", ""),
         data_policy: DataPolicy::LocalOnly,
         read_roots: vec![dir.path().to_path_buf()],
-        block: "../blocks/echo-summarize".into(),
+        pipeline: vec!["../blocks/echo-summarize".into()],
     };
 
     let state = api::AppState {
