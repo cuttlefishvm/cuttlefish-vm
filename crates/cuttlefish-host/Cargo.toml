@@ -21,6 +21,12 @@ llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # that have a text layer.
 pdf-render = ["dep:pdfium-render", "dep:image"]
 
+# Only built with the feature that needs it; see render_worker.
+[[bin]]
+name = "cuttlefish-render-worker"
+path = "src/bin/cuttlefish-render-worker.rs"
+required-features = ["pdf-render"]
+
 [dependencies]
 cuttlefish-abi = { workspace = true }
 cuttlefish-core = { workspace = true }
@@ -30,7 +36,7 @@ tokio-util = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-llama-cpp-2 = { version = "0.1.153", optional = true }
+llama-cpp-2 = { version = "0.1.153", optional = true, features = ["mtmd"] }
 # Only for llama.cpp's stateful token decoder; see llamacpp.rs.
 encoding_rs = { version = "0.8", optional = true }
 async-trait = "0.1"
@@ -42,7 +48,16 @@ base64 = "0.22"
 # works with any text model.
 lopdf = "0.44"
 pdf-extract = "0.12"
-pdfium-render = { version = "0.9", optional = true }
+# Pinned to a pdfium API version rather than `latest`. pdfium is loaded at
+# runtime, so the crate's expected symbol set has to be no newer than the
+# library actually present — nixpkgs ships 7749, and `latest` looks for symbols
+# that build does not export, failing with a bare "symbol not found" at the
+# first render. 7543 is the newest option at or below it.
+pdfium-render = { version = "0.9", optional = true, default-features = false, features = [
+    "pdfium_7543",
+    "image_latest",
+    "thread_safe",
+] }
 image = { version = "0.25", optional = true }
 
 [dev-dependencies]

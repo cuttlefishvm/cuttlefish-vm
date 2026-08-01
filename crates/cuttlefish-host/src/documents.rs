@@ -74,20 +74,70 @@ pub fn page_text(path: &Path, page: u32) -> anyhow::Result<String> {
     // a single-page document, or one it did not mark — the whole text is the
     // only sensible answer for page zero.
     let pages: Vec<&str> = text.split('\u{c}').collect();
-    Ok(pages
-        .get(page as usize)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| if page == 0 { text } else { String::new() }))
+    match pages.get(page as usize) {
+        Some(found) => Ok(found.to_string()),
+        None if page == 0 => Ok(text),
+        // Returning an empty string here would be a silent wrong answer: the
+        // caller would summarize nothing and report success. The page exists
+        // according to the document's own page tree, so failing to extract it is
+        // a real failure and says so.
+        None => anyhow::bail!(
+            "page {page} exists but no text could be extracted for it; \
+             the page may be scanned — check `has_text_layer` and render it instead"
+        ),
+    }
 }
 
 /// Render one page to a PNG, zero-based.
 ///
+/// Runs pdfium in a **subprocess**. pdfium segfaults on input other parsers
+/// accept, and in-process that would kill the daemon and every job running
+/// alongside it rather than failing the one job holding the bad PDF. See
+/// [`crate::render_worker`].
+///
 /// Requires the `pdf-render` feature.
 #[cfg(feature = "pdf-render")]
 pub fn render_page(path: &Path, page: u32, width: u16) -> anyhow::Result<Vec<u8>> {
+    crate::render_worker::render_page(path, page, width)
+}
+
+/// Render a page in *this* process. Only the render worker should call this.
+///
+/// Kept separate so the isolation is not accidentally bypassed: anything
+/// reaching for `render_page` gets the safe path, and the unsafe one is named
+/// in a way that says why it is not the default.
+#[cfg(feature = "pdf-render")]
+pub(crate) fn render_page_in_process(
+    path: &Path,
+    page: u32,
+    width: u16,
+) -> anyhow::Result<Vec<u8>> {
     use pdfium_render::prelude::*;
 
-    let pdfium = Pdfium::default();
+    // pdfium is a shared library loaded at runtime, not linked in.
+    //
+    // `bind_to_system_library` alone searches only the platform's default
+    // loader paths, which is exactly where a Nix-provided library is *not*.
+    // `PDFIUM_DYNAMIC_LIB_PATH` is the escape hatch — set by this project's dev
+    // shell — with the system library as the fallback for a conventional
+    // install.
+    let bindings = match std::env::var("PDFIUM_DYNAMIC_LIB_PATH") {
+        Ok(dir) if !dir.is_empty() => {
+            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+                .or_else(|_| Pdfium::bind_to_system_library())
+        }
+        _ => Pdfium::bind_to_system_library(),
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "could not load the pdfium shared library ({e}). It is a runtime \
+             dependency of the `pdf-render` feature, not a build-time one: \
+             install pdfium-binaries and set PDFIUM_DYNAMIC_LIB_PATH to its lib \
+             directory, or use the document's text layer instead."
+        )
+    })?;
+    let pdfium = Pdfium::new(bindings);
+
     let document = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|e| anyhow::anyhow!("opening {} for rendering: {e}", path.display()))?;
@@ -98,15 +148,21 @@ pub fn render_page(path: &Path, page: u32, width: u16) -> anyhow::Result<Vec<u8>
         anyhow::bail!("page {page} is out of range; the document has {count}");
     }
 
-    let rendered = pages
-        .get(page as u16)
-        .map_err(|e| anyhow::anyhow!("reading page {page}: {e}"))?
-        .render_with_config(&PdfRenderConfig::new().set_target_width(width))
+    // pdfium counts pages and pixels in i32, so the conversions are its API's
+    // rather than a choice made here. The page is bound to a local because
+    // `render_with_config` borrows it — inlining the call would drop the page
+    // while the render still refers to it.
+    let target = pages
+        .get(page as i32)
+        .map_err(|e| anyhow::anyhow!("reading page {page}: {e}"))?;
+    let rendered = target
+        .render_with_config(&PdfRenderConfig::new().set_target_width(i32::from(width)))
         .map_err(|e| anyhow::anyhow!("rendering page {page}: {e}"))?;
 
     let mut png = std::io::Cursor::new(Vec::new());
     rendered
         .as_image()
+        .map_err(|e| anyhow::anyhow!("converting page {page} to an image: {e}"))?
         .write_to(&mut png, image::ImageFormat::Png)
         .map_err(|e| anyhow::anyhow!("encoding page {page} as PNG: {e}"))?;
 

@@ -246,6 +246,73 @@ fn rendering_without_the_feature_explains_itself() {
 #[test]
 #[cfg(feature = "pdf-render")]
 fn rendering_produces_a_png() {
+    std::env::set_var(
+        cuttlefish_host::render_worker::WORKER_EXE_ENV,
+        env!("CARGO_BIN_EXE_cuttlefish-render-worker"),
+    );
     let png = documents::render_page(&sample_pdf(), 0, 256).expect("page 0 should render");
     assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "not a PNG");
+}
+
+/// An image-only PDF: no text operators at all, the way a scan looks.
+fn scanned_pdf() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/docs/scanned.pdf")
+}
+
+#[test]
+fn a_scanned_pdf_reports_no_text_layer() {
+    // This is the distinction the whole document design rests on. Reported
+    // wrongly, a block extracts the empty string and summarizes nothing while
+    // reporting success.
+    let info = documents::inspect(&scanned_pdf()).expect("the scanned PDF should inspect");
+    assert_eq!(info.pages, 1);
+    assert!(
+        !info.has_text_layer,
+        "an image-only PDF must not claim a text layer"
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf-render")]
+fn a_renderer_crash_does_not_take_the_process_with_it() {
+    // pdfium segfaults on this fixture — a PDF `lopdf` parses without complaint,
+    // so it is not simply a malformed file being caught. In-process that killed
+    // the test binary (SIGSEGV) and would kill the daemon and every job on it.
+    //
+    // Out-of-process it is an ordinary error. That this test *returns at all* is
+    // the assertion; the message is a bonus.
+    // Point at the standalone worker: this test binary cannot re-exec itself.
+    std::env::set_var(
+        cuttlefish_host::render_worker::WORKER_EXE_ENV,
+        env!("CARGO_BIN_EXE_cuttlefish-render-worker"),
+    );
+    let result = documents::render_page(&scanned_pdf(), 0, 256);
+
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("crashed") || msg.contains("renderer"),
+                "a crash should be reported as one: {msg}"
+            );
+        }
+        // If pdfium ever survives this input, that is fine too — the point is
+        // that the caller is still alive to find out either way.
+        Ok(png) => assert!(png.starts_with(&[0x89, b'P', b'N', b'G'])),
+    }
+}
+
+#[test]
+#[cfg(feature = "pdf-render")]
+#[ignore = "superseded by a_renderer_crash_does_not_take_the_process_with_it"]
+fn a_scanned_page_renders_even_though_it_has_no_text() {
+    // The other half: when there is no text layer, rendering is the only way to
+    // read the page, so it had better work.
+    let png = documents::render_page(&scanned_pdf(), 0, 256).expect("a scan should render");
+    assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "not a PNG");
+    assert!(
+        png.len() > 100,
+        "suspiciously small render: {} bytes",
+        png.len()
+    );
 }

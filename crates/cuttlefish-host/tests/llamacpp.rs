@@ -228,3 +228,66 @@ async fn jobs_do_not_share_context() {
         after.text
     );
 }
+
+/// Probe: can mtmd initialise from a GGUF whose projector is embedded?
+///
+/// Some multimodal GGUFs (glm-ocr among them) carry the vision tower and the
+/// `mm.*` projector tensors in the same file as the text weights, rather than in
+/// a separate mmproj. `mtmd_init_from_file` takes a projector path *and* a text
+/// model, so the question is whether passing the same path for both works.
+///
+/// This exists to answer that before any backend code is written against it —
+/// building multimodal support that cannot be verified would be exactly the
+/// thing AGENTS.md says not to do.
+///
+/// # Result so far: not yet verifiable with locally available models
+///
+/// Neither vision model installed through Ollama loads in the llama.cpp that
+/// `llama-cpp-sys-2` vendors:
+///
+/// - `glm-ocr` — `unknown model architecture: 'glmocr'`
+/// - `gemma4:e2b` — `wrong number of tensors; expected 2012, got 601`
+///
+/// The lesson generalises beyond multimodal: **an Ollama blob is not
+/// necessarily loadable by an arbitrary llama.cpp build.** Ollama ships its own
+/// fork carrying architectures upstream does not have, so "point the llamacpp
+/// provider at an Ollama blob" works for a standard architecture (llama3.2
+/// does) and fails for anything Ollama added.
+///
+/// Verifying mtmd therefore needs a model built for upstream llama.cpp — a
+/// Qwen2-VL, LLaVA, or SmolVLM GGUF with its mmproj — rather than whatever
+/// Ollama happens to have pulled.
+#[tokio::test]
+#[ignore = "requires CUTTLEFISH_TEST_VISION_GGUF pointing at a multimodal .gguf"]
+async fn mtmd_can_initialise_from_an_embedded_projector() {
+    let Some(path) = std::env::var("CUTTLEFISH_TEST_VISION_GGUF")
+        .ok()
+        .filter(|p| !p.is_empty())
+    else {
+        eprintln!("skipping: set CUTTLEFISH_TEST_VISION_GGUF");
+        return;
+    };
+
+    use llama_cpp_2::mtmd::{MtmdContext, MtmdContextParams};
+
+    let backend = llama_cpp_2::llama_backend::LlamaBackend::init().expect("backend");
+    let model = llama_cpp_2::model::LlamaModel::load_from_file(
+        &backend,
+        &path,
+        &llama_cpp_2::model::params::LlamaModelParams::default(),
+    )
+    .expect("the vision model should load as a text model");
+
+    // A separate mmproj when one is named, otherwise the model file itself —
+    // some GGUFs embed the projector.
+    let mmproj = std::env::var("CUTTLEFISH_TEST_MMPROJ")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| path.clone());
+
+    let params = MtmdContextParams::default();
+    match MtmdContext::init_from_file(&mmproj, &model, &params) {
+        Ok(_) => eprintln!("VERIFIED: mtmd initialised (mmproj={mmproj})"),
+        Err(e) => panic!("mtmd could not initialise from {mmproj}: {e}"),
+    }
+}

@@ -17,6 +17,12 @@ async fn main() -> anyhow::Result<()> {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    // First, before argument parsing or anything else: this process may be a
+    // render worker that the daemon spawned, in which case it renders one page
+    // and exits. Doing this later would have a worker try to start a daemon.
+    #[cfg(feature = "pdf-render")]
+    cuttlefish_host::render_worker::run_if_worker();
+
     let usage = "usage: cuttlefishd <spec> <block.wasm> [socket]";
     let mut args = std::env::args().skip(1);
     let spec_path = PathBuf::from(args.next().context(usage)?);

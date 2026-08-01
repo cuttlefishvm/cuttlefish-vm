@@ -94,6 +94,11 @@ the same rule that governs file contents.
 Rendering PDF pages to images needs the `pdf-render` feature (pdfium is a large
 native dependency); text extraction is always available.
 
+**Rendering runs in a subprocess.** pdfium segfaults on input that pure-Rust
+parsers accept, and in-process a crash would kill the daemon and every job
+running alongside it — not just the job holding the bad PDF. Out-of-process it
+is an ordinary error that one job reports and everything else survives.
+
 ### Inference providers
 
 A spec names a provider and a target; which backends exist is a property of the

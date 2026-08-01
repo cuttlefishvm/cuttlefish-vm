@@ -119,6 +119,33 @@ jobs:
       - name: Test
         run: cargo test -p cuttlefish-host --features llamacpp --locked
 
+  # `pdf-render` is off by default, so nothing above compiles it. It shipped
+  # with three type errors for exactly that reason — a feature-gated path that
+  # no build enables is a path that has never been compiled.
+  pdf-render:
+    name: Optional PDF Rendering Feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Install pdfium
+        # pdfium is loaded at runtime, not linked, so it has to be on disk and
+        # findable via PDFIUM_DYNAMIC_LIB_PATH.
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/pdfium"
+          curl -fsSL https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7543/pdfium-linux-x64.tgz \
+            | tar -xz -C "$HOME/pdfium"
+          echo "PDFIUM_DYNAMIC_LIB_PATH=$HOME/pdfium/lib" >> "$GITHUB_ENV"
+      - name: Clippy
+        run: cargo clippy -p cuttlefish-host --features pdf-render --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test -p cuttlefish-host --features pdf-render --locked
+
   msrv:
     name: Minimum Supported Rust Version
     runs-on: ubuntu-latest

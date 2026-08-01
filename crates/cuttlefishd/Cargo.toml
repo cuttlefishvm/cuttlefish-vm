@@ -22,6 +22,9 @@ default = []
 # Pass-through so `cargo build -p cuttlefishd --features llamacpp` works without
 # the caller having to know which crate actually owns the feature.
 llamacpp = ["cuttlefish-host/llamacpp"]
+# Pass-through; see cuttlefish-host. Rendering runs out-of-process, so the
+# daemon binary doubles as the render worker.
+pdf-render = ["cuttlefish-host/pdf-render"]
 
 [dependencies]
 cuttlefish-abi = { workspace = true }

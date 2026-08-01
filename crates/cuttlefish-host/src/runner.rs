@@ -399,12 +399,18 @@ pub async fn run_job(
             } => {
                 // Images are named by handle; the host loads the bytes, so they
                 // never pass through guest memory.
+                // Refuse rather than drop. Sending images to a backend that
+                // cannot use them produces a confident answer about nothing,
+                // which reads as a bad model rather than a misconfigured job —
+                // and the caller has no way to tell the difference.
                 if !images.is_empty() && !backend.supports_images() {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
                     return fail(
                         error_codes::UNSUPPORTED,
                         format!(
-                            "this job asked for {} image(s) but the `{}` model does not accept them",
+                            "this job supplied {} image(s), but the backend serving `{}` cannot \
+                             accept them. Use a vision-capable model through the `ollama` \
+                             provider, or change the block to send text only.",
                             images.len(),
                             backend.model_name()
                         ),
