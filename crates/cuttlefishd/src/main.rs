@@ -1,15 +1,22 @@
 //! Entry point for the cuttlefish daemon.
 //!
 //! See the library docs for the transport design and job lifecycle.
+//!
+//! The daemon serves over a unix domain socket, so it runs on unix only for now.
+//! The rest of the workspace is cross-platform; a Windows build produces a
+//! binary that explains itself and exits, rather than one that silently does
+//! nothing. Adding a TCP listener would lift this — see the transport notes in
+//! the library docs.
 
-use anyhow::Context;
-use cuttlefish_host::infer::StubBackend;
-use cuttlefishd::{api, serve, state};
-use std::path::PathBuf;
-use std::sync::Arc;
-
+#[cfg(unix)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use cuttlefish_host::infer::StubBackend;
+    use cuttlefishd::{api, serve, state};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
     let usage = "usage: cuttlefishd <spec> <block.wasm> [socket]";
     let mut args = std::env::args().skip(1);
     let spec_path = PathBuf::from(args.next().context(usage)?);
@@ -41,4 +48,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     serve::serve_unix(api::router(state), &sock_path).await
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "cuttlefishd serves over a unix domain socket and does not run on this \
+         platform yet. The library crates are cross-platform; only the transport \
+         is unix-only."
+    );
+    std::process::exit(1);
 }

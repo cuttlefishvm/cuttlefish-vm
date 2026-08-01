@@ -4,6 +4,11 @@
 //! an actual wasm guest. That matters most for the SSE test, which only passes
 //! because of the replay log — a broadcast-only implementation fails it every
 //! time, and would have shipped looking correct.
+//!
+//! Unix-only: the daemon serves over a unix domain socket, so there is nothing
+//! to exercise on Windows. The portable crates are still tested there.
+
+#![cfg(unix)]
 
 use cuttlefish_core::spec::{DataPolicy, ModelRef, Spec};
 use cuttlefishd::{api, serve, state::JobStore};
