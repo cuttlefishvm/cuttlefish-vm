@@ -21,7 +21,7 @@ fn parses_every_field_of_the_sample() {
 
     assert_eq!(spec.name, "summarize_docs");
     assert!(spec.description.starts_with("Use when"));
-    assert_eq!(spec.model, ModelRef::Path("./models/stub.gguf".into()));
+    assert_eq!(spec.model, ModelRef::new("path", "./models/stub.gguf"));
     assert_eq!(spec.data_policy, DataPolicy::LocalOnly);
     assert_eq!(spec.read_roots, vec![PathBuf::from("./docs")]);
     assert_eq!(spec.block, PathBuf::from("../blocks/echo-summarize"));
@@ -82,14 +82,63 @@ fn rejects_a_misspelled_capability_kind() {
 }
 
 #[test]
-fn rejects_an_unsupported_model_kind() {
-    // `Hf` is a planned model source, not a supported one. Accepting it and
-    // ignoring the difference would silently resolve the wrong model.
-    let src = SAMPLE.replace(r#"Path "./models/stub.gguf""#, r#"Hf "org/model#q4""#);
-    let err = parse_spec(&src).unwrap_err();
-    assert!(
-        matches!(&err, SpecError::UnsupportedModel(k) if k == "Hf"),
-        "got: {err}"
+fn any_provider_name_parses() {
+    // The parser deliberately does not know which providers exist — inference
+    // can come from Ollama, an HTTP endpoint, an embedded runtime, or something
+    // not written yet. Whether a provider is available is the host's question,
+    // answered when the model is resolved, so a spec naming an unknown one is
+    // syntactically fine and fails later with a list of what *is* registered.
+    let src = SAMPLE.replace(r#"Path "./models/stub.gguf""#, r#"SomethingNew "whatever""#);
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(spec.model, ModelRef::new("somethingnew", "whatever"));
+}
+
+#[test]
+fn provider_names_are_case_insensitive() {
+    // `Ollama`, `ollama`, and `OLLAMA` must name the same provider; a spec
+    // should not fail over capitalisation.
+    for spelling in ["Ollama", "ollama", "OLLAMA"] {
+        let src = SAMPLE.replace(
+            r#"Path "./models/stub.gguf""#,
+            &format!(r#"{spelling} "llama3.2:1b""#),
+        );
+        let spec = parse_spec(&src).unwrap();
+        assert_eq!(spec.model.provider, "ollama", "for spelling {spelling}");
+    }
+}
+
+#[test]
+fn rejects_a_provider_name_that_is_not_an_identifier() {
+    let src = SAMPLE.replace(r#"Path "./models/stub.gguf""#, r#""quoted" "target""#);
+    assert!(parse_spec(&src).is_err());
+}
+
+#[test]
+fn rejects_a_model_with_no_target() {
+    let src = SAMPLE.replace(r#"model = Path "./models/stub.gguf""#, "model = Ollama");
+    assert!(parse_spec(&src).is_err());
+}
+
+#[test]
+fn parses_an_ollama_model_reference() {
+    let src = SAMPLE.replace(r#"Path "./models/stub.gguf""#, r#"Ollama "llama3.2:1b""#);
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(spec.model, ModelRef::new("ollama", "llama3.2:1b"));
+}
+
+#[test]
+fn an_ollama_tag_keeps_its_colon() {
+    // Ollama model names carry a `:tag` suffix. If the parser ever splits on
+    // punctuation, `llama3.2:1b` silently becomes `llama3.2` — a different
+    // model that may well exist locally, so nothing would visibly break.
+    let src = SAMPLE.replace(
+        r#"Path "./models/stub.gguf""#,
+        r#"Ollama "qwen2.5:7b-instruct-q4_K_M""#,
+    );
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(
+        spec.model,
+        ModelRef::new("ollama", "qwen2.5:7b-instruct-q4_K_M")
     );
 }
 

@@ -1,6 +1,6 @@
 spec summarize_docs = {
   description = "Use when the agent needs a summary of a local file and the content must not leave the machine.";
-  model = Path "../models/stub.gguf";
+  model = Ollama "llama3.2:1b";
   data_policy = Local_only;
   capabilities = [ Read "./docs" ];
   block = "../blocks/echo-summarize";

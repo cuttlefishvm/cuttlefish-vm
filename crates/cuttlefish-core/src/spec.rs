@@ -31,10 +31,53 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 /// Where a job's model comes from.
+///
+/// Deliberately *not* an enum of known providers. Inference can come from a
+/// local Ollama, an OpenAI-compatible HTTP endpoint, an embedded llama.cpp, or
+/// something not thought of yet, and this crate has no business knowing which
+/// of those exist — it parses job descriptions.
+///
+/// So a model reference is a provider name and a target, and resolving one into
+/// something that can actually generate is the host's job, via its backend
+/// registry. Adding a provider therefore touches neither this type nor the
+/// parser: an unknown provider is a resolution error naming what *is*
+/// available, not a syntax error.
+///
+/// In a spec this is written `model = Provider "target"`:
+///
+/// ```text
+/// model = Ollama "llama3.2:1b";          // a local Ollama
+/// model = OpenAi "http://host/v1#gpt-4"; // an OpenAI-compatible endpoint
+/// model = Path "./models/qwen.gguf";     // a local file, for embedded runtimes
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelRef {
-    /// A path on this machine, pre-provisioned by the operator.
-    Path(String),
+pub struct ModelRef {
+    /// Which backend should serve this, lowercased — `ollama`, `path`, `stub`.
+    ///
+    /// Lowercased at parse time so that `Ollama` and `OLLAMA` name the same
+    /// provider; a spec should not fail over capitalisation.
+    pub provider: String,
+    /// What to ask that backend for. Its meaning belongs entirely to the
+    /// provider: a model tag for Ollama, a filesystem path for an embedded
+    /// runtime, a URL for an HTTP endpoint.
+    pub target: String,
+}
+
+impl ModelRef {
+    /// Construct a reference directly, mostly for tests and for callers
+    /// building a spec without parsing one.
+    pub fn new(provider: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into().to_lowercase(),
+            target: target.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ModelRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.provider, self.target)
+    }
 }
 
 /// How a job's data may be handled.
@@ -83,9 +126,6 @@ pub enum SpecError {
     /// Structurally malformed input.
     #[error("malformed spec: {0}")]
     Malformed(String),
-    /// A model kind that exists in the design but not in this build.
-    #[error("unsupported model kind `{0}` (this build supports only `Path`)")]
-    UnsupportedModel(String),
     /// A capability kind that exists in the design but not in this build.
     #[error("unsupported capability `{0}` (this build supports only `Read`)")]
     UnsupportedCapability(String),
@@ -166,13 +206,21 @@ pub fn parse_spec(src: &str) -> Result<Spec, SpecError> {
             "block" => block = Some(PathBuf::from(quoted(value, "block")?)),
             "capabilities" => read_roots = Some(capabilities(value)?),
             "model" => {
-                let (kind, rest) = value
-                    .split_once(char::is_whitespace)
-                    .ok_or_else(|| SpecError::Malformed("model needs a kind and a value".into()))?;
-                match kind {
-                    "Path" => model = Some(ModelRef::Path(quoted(rest, "model")?)),
-                    other => return Err(SpecError::UnsupportedModel(other.to_string())),
+                // Any `Provider "target"` parses. Whether that provider exists
+                // is the host's question, not this parser's — see `ModelRef`.
+                let (provider, rest) = value.split_once(char::is_whitespace).ok_or_else(|| {
+                    SpecError::Malformed(
+                        r#"model needs a provider and a target, as in `Ollama "llama3.2:1b"`"#
+                            .into(),
+                    )
+                })?;
+                if provider.is_empty() || !provider.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    return Err(SpecError::Malformed(format!(
+                        "`{provider}` is not a valid model provider name"
+                    )));
                 }
+                model = Some(ModelRef::new(provider, quoted(rest, "model")?));
             }
             "data_policy" => {
                 data_policy = Some(match value {

@@ -16,12 +16,18 @@
 //!   observable.
 //!
 //! Inference reaches the runner only through [`infer::InferBackend`], so the
-//! whole loop is testable with no model present.
+//! whole loop is testable with no model present. Which implementation a job gets
+//! is decided by [`backend::Registry`], so adding a provider — an
+//! OpenAI-compatible endpoint, an embedded llama.cpp — is additive rather than a
+//! change to the runner, the parser, or the daemon. [`ollama`] is the first real
+//! one.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod backend;
 pub mod caps;
 pub mod handles;
 pub mod infer;
+pub mod ollama;
 pub mod runner;

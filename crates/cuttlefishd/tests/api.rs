@@ -59,7 +59,7 @@ async fn start() -> Harness {
     let spec = Spec {
         name: "summarize_docs".into(),
         description: "Use when a local file needs summarizing.".into(),
-        model: ModelRef::Path("./stub.gguf".into()),
+        model: ModelRef::new("stub", ""),
         data_policy: DataPolicy::LocalOnly,
         read_roots: vec![dir.path().to_path_buf()],
         block: "../blocks/echo-summarize".into(),
