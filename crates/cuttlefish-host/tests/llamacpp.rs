@@ -22,7 +22,7 @@
 use cuttlefish_core::spec::ModelRef;
 use cuttlefish_host::{
     backend::Registry,
-    infer::InferBackend,
+    infer::{InferBackend, InferRequest},
     llamacpp::{LlamaCppBackend, LlamaCppFactory},
 };
 
@@ -99,7 +99,7 @@ async fn generates_text_from_a_real_model() {
     };
 
     let result = backend
-        .infer("Count: one two three", 24, &mut sink)
+        .infer(InferRequest::new("Count: one two three", 24), &mut sink)
         .await
         .expect("generation should succeed");
 
@@ -136,7 +136,10 @@ async fn a_stop_verdict_ends_generation_early() {
     };
 
     let result = backend
-        .infer("Write a long paragraph about the sea.", 200, &mut sink)
+        .infer(
+            InferRequest::new("Write a long paragraph about the sea.", 200),
+            &mut sink,
+        )
         .await
         .expect("generation should succeed");
 
@@ -162,11 +165,11 @@ async fn greedy_sampling_makes_a_job_reproducible() {
 
     let mut noop = |_: &str| true;
     let first = backend
-        .infer("The capital of France is", 8, &mut noop)
+        .infer(InferRequest::new("The capital of France is", 8), &mut noop)
         .await
         .unwrap();
     let second = backend
-        .infer("The capital of France is", 8, &mut noop)
+        .infer(InferRequest::new("The capital of France is", 8), &mut noop)
         .await
         .unwrap();
 
@@ -188,7 +191,7 @@ async fn a_prompt_larger_than_the_context_is_refused_clearly() {
 
     let mut noop = |_: &str| true;
     let err = backend
-        .infer(&"word ".repeat(200), 8, &mut noop)
+        .infer(InferRequest::new(&"word ".repeat(200), 8), &mut noop)
         .await
         .expect_err("an oversized prompt must be refused");
 
@@ -207,11 +210,14 @@ async fn jobs_do_not_share_context() {
 
     let mut noop = |_: &str| true;
     let primed = backend
-        .infer("Remember the secret word: platypus.", 16, &mut noop)
+        .infer(
+            InferRequest::new("Remember the secret word: platypus.", 16),
+            &mut noop,
+        )
         .await
         .unwrap();
     let after = backend
-        .infer("The capital of France is", 8, &mut noop)
+        .infer(InferRequest::new("The capital of France is", 8), &mut noop)
         .await
         .unwrap();
 

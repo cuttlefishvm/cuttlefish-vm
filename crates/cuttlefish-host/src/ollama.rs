@@ -23,7 +23,7 @@
 //! meaningful: the host can act on it while generation is still running rather
 //! than after the fact.
 
-use crate::infer::{InferBackend, InferResult};
+use crate::infer::{InferBackend, InferRequest, InferResult};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -87,18 +87,31 @@ impl OllamaBackend {
 impl InferBackend for OllamaBackend {
     async fn infer(
         &self,
-        prompt: &str,
-        max_tokens: u32,
+        req: InferRequest<'_>,
         on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
     ) -> anyhow::Result<InferResult> {
+        // Ollama takes images as base64 strings alongside the prompt. Whether
+        // the *model* can use them is Ollama's business — asking a text-only
+        // model produces a clear error from it, which is more useful than a
+        // guess made here from a model name.
+        let images: Vec<String> = req
+            .images
+            .iter()
+            .map(|bytes| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            })
+            .collect();
+
         let response = self
             .client
             .post(format!("{}/api/generate", self.host))
             .json(&serde_json::json!({
                 "model": self.model,
-                "prompt": prompt,
+                "prompt": req.prompt,
                 "stream": true,
-                "options": { "num_predict": max_tokens },
+                "images": images,
+                "options": { "num_predict": req.max_tokens },
             }))
             .send()
             .await
@@ -180,6 +193,12 @@ impl InferBackend for OllamaBackend {
 
     fn model_name(&self) -> String {
         self.model.clone()
+    }
+
+    /// Ollama accepts images for any model; it reports the mismatch itself if
+    /// the model cannot use them.
+    fn supports_images(&self) -> bool {
+        true
     }
 }
 

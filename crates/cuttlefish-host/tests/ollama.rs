@@ -13,7 +13,10 @@
 //! $ cargo test -p cuttlefish-host --test ollama -- --ignored
 //! ```
 
-use cuttlefish_host::{infer::InferBackend, ollama::OllamaBackend};
+use cuttlefish_host::{
+    infer::{InferBackend, InferRequest},
+    ollama::OllamaBackend,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -82,7 +85,10 @@ async fn streams_tokens_and_reports_counts() {
         true
     };
 
-    let result = backend.infer("hi", 16, &mut sink).await.unwrap();
+    let result = backend
+        .infer(InferRequest::new("hi", 16), &mut sink)
+        .await
+        .unwrap();
 
     assert_eq!(result.text, "Hello there.");
     assert_eq!(seen, vec!["Hello", " there", "."]);
@@ -99,7 +105,10 @@ async fn a_json_line_split_across_chunk_boundaries_is_reassembled() {
     let backend = OllamaBackend::new(host, "m");
 
     let mut sink = |_: &str| true;
-    let result = backend.infer("hi", 16, &mut sink).await.unwrap();
+    let result = backend
+        .infer(InferRequest::new("hi", 16), &mut sink)
+        .await
+        .unwrap();
 
     assert_eq!(result.text, "Hello there.");
     assert_eq!(result.tokens_out, 3);
@@ -117,7 +126,10 @@ async fn several_json_lines_in_one_chunk_are_all_handled() {
         true
     };
 
-    let result = backend.infer("hi", 16, &mut sink).await.unwrap();
+    let result = backend
+        .infer(InferRequest::new("hi", 16), &mut sink)
+        .await
+        .unwrap();
     assert_eq!(seen.len(), 3, "all three tokens must surface");
     assert_eq!(result.text, "Hello there.");
 }
@@ -134,7 +146,10 @@ async fn a_stop_verdict_ends_generation_early() {
         false
     };
 
-    let result = backend.infer("hi", 16, &mut sink).await.unwrap();
+    let result = backend
+        .infer(InferRequest::new("hi", 16), &mut sink)
+        .await
+        .unwrap();
 
     assert_eq!(seen, vec!["Hello"], "must not keep consuming after Stop");
     assert_eq!(result.text, "Hello");
@@ -149,7 +164,10 @@ async fn an_http_error_is_reported_with_its_body() {
     let backend = OllamaBackend::new(host, "nope");
 
     let mut sink = |_: &str| true;
-    let err = backend.infer("hi", 16, &mut sink).await.unwrap_err();
+    let err = backend
+        .infer(InferRequest::new("hi", 16), &mut sink)
+        .await
+        .unwrap_err();
     let msg = err.to_string();
 
     assert!(msg.contains("404"), "status must be reported: {msg}");
@@ -167,7 +185,10 @@ async fn an_error_inside_the_stream_is_surfaced() {
     let backend = OllamaBackend::new(host, "m");
 
     let mut sink = |_: &str| true;
-    let err = backend.infer("hi", 16, &mut sink).await.unwrap_err();
+    let err = backend
+        .infer(InferRequest::new("hi", 16), &mut sink)
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("something went wrong"), "{err}");
 }
 
@@ -177,7 +198,10 @@ async fn an_unreachable_host_explains_itself() {
     let backend = OllamaBackend::new("http://127.0.0.1:1", "m");
 
     let mut sink = |_: &str| true;
-    let err = backend.infer("hi", 16, &mut sink).await.unwrap_err();
+    let err = backend
+        .infer(InferRequest::new("hi", 16), &mut sink)
+        .await
+        .unwrap_err();
     let msg = err.to_string();
 
     assert!(
@@ -198,7 +222,10 @@ async fn a_trailing_slash_on_the_host_does_not_produce_a_double_slash() {
     let backend = OllamaBackend::new(format!("{host}/"), "m");
 
     let mut sink = |_: &str| true;
-    assert!(backend.infer("hi", 16, &mut sink).await.is_ok());
+    assert!(backend
+        .infer(InferRequest::new("hi", 16), &mut sink)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -224,7 +251,10 @@ async fn talks_to_a_real_ollama() {
     };
 
     let result = backend
-        .infer("Reply with exactly the word: ok", 16, &mut sink)
+        .infer(
+            InferRequest::new("Reply with exactly the word: ok", 16),
+            &mut sink,
+        )
         .await
         .expect("is ollama running with llama3.2:1b pulled?");
 

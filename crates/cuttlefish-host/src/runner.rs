@@ -18,7 +18,7 @@
 
 use crate::caps::Capabilities;
 use crate::handles::Handles;
-use crate::infer::{InferBackend, InferResult};
+use crate::infer::{InferBackend, InferRequest, InferResult};
 use cuttlefish_abi::{error_codes, Command, Envelope, Event, JobError, JobStatus, Usage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,6 +26,12 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wasmtime::{Engine, Instance, Linker, Memory, Module, Store, TypedFunc};
+
+/// Width, in pixels, that document pages render to.
+///
+/// Vision models work from a fixed-size input anyway, and a larger raster costs
+/// encode time and tokens without adding detail the model can use.
+const RENDER_WIDTH: u16 = 1024;
 
 /// Something worth telling a watcher about while a job runs.
 #[derive(Debug, Clone)]
@@ -222,6 +228,11 @@ pub async fn run_job(
     // Dropped when this function returns, closing every file the job opened.
     // That job-scoped lifetime is what makes handles unforgeable across jobs.
     let mut handles = Handles::default();
+    // Documents are read from their path rather than their descriptor — both
+    // extraction and rendering want a file. Kept beside the handle table so the
+    // two are dropped together at the end of the job.
+    let mut doc_paths: std::collections::HashMap<u32, std::path::PathBuf> =
+        std::collections::HashMap::new();
 
     let mut guest = match Guest::new(&engine, &job.module_bytes) {
         Ok(g) => g,
@@ -272,7 +283,29 @@ pub async fn run_job(
                     );
                 }
                 match handles.open(&p) {
-                    Ok((handle, len)) => Event::Opened { handle, len },
+                    Ok((handle, len, kind)) => {
+                        // A PDF's page count and text layer need the whole file,
+                        // which the handle layer deliberately does not read. Ask
+                        // the document layer, and fall back to the plain kind if
+                        // it cannot answer — a malformed PDF is still a file a
+                        // block may want to read bytes from.
+                        let kind = match kind {
+                            cuttlefish_abi::MediaKind::Document { .. } => {
+                                match crate::documents::inspect(&p) {
+                                    Ok(info) => cuttlefish_abi::MediaKind::Document {
+                                        pages: info.pages,
+                                        has_text_layer: info.has_text_layer,
+                                    },
+                                    Err(_) => cuttlefish_abi::MediaKind::Binary,
+                                }
+                            }
+                            other => other,
+                        };
+                        // Remember the path: rendering and text extraction work
+                        // from a file, not from the open descriptor.
+                        doc_paths.insert(handle, p.clone());
+                        Event::Opened { handle, len, kind }
+                    }
                     Err(e) => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
                         return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
@@ -295,7 +328,100 @@ pub async fn run_job(
                 }
             },
 
-            Command::Infer { prompt, max_tokens } => {
+            Command::SliceBytes {
+                handle,
+                offset,
+                len,
+            } => match handles.slice_bytes(handle, offset, len) {
+                Ok((bytes, next_offset)) => {
+                    use base64::Engine;
+                    Event::SlicedBytes {
+                        bytes_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        next_offset,
+                    }
+                }
+                Err(e) => {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
+                }
+            },
+
+            Command::PageText { handle, page } => {
+                let Some(path) = doc_paths.get(&handle).cloned() else {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return fail(
+                        error_codes::CAPABILITY_DENIED,
+                        format!("no such handle: {handle}"),
+                        usage,
+                    );
+                };
+                match crate::documents::page_text(&path, page) {
+                    Ok(text) => Event::PageTexted { text },
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return fail(error_codes::UNSUPPORTED, e.to_string(), usage);
+                    }
+                }
+            }
+
+            Command::PageImage { handle, page } => {
+                let Some(path) = doc_paths.get(&handle).cloned() else {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return fail(
+                        error_codes::CAPABILITY_DENIED,
+                        format!("no such handle: {handle}"),
+                        usage,
+                    );
+                };
+                // A rendered page becomes a handle like any other, so it can be
+                // named in Infer exactly as a file-backed image would be.
+                match crate::documents::render_page(&path, page, RENDER_WIDTH) {
+                    Ok(png) => {
+                        let (handle, len) = handles.insert_bytes(
+                            png,
+                            cuttlefish_abi::MediaKind::Image {
+                                format: "png".into(),
+                            },
+                        );
+                        Event::PageImaged { handle, len }
+                    }
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return fail(error_codes::UNSUPPORTED, e.to_string(), usage);
+                    }
+                }
+            }
+
+            Command::Infer {
+                prompt,
+                max_tokens,
+                images,
+            } => {
+                // Images are named by handle; the host loads the bytes, so they
+                // never pass through guest memory.
+                if !images.is_empty() && !backend.supports_images() {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return fail(
+                        error_codes::UNSUPPORTED,
+                        format!(
+                            "this job asked for {} image(s) but the `{}` model does not accept them",
+                            images.len(),
+                            backend.model_name()
+                        ),
+                        usage,
+                    );
+                }
+                let mut image_bytes = Vec::with_capacity(images.len());
+                for handle in &images {
+                    match handles.read_all(*handle) {
+                        Ok(bytes) => image_bytes.push(bytes),
+                        Err(e) => {
+                            usage.duration_ms = started.elapsed().as_millis() as u64;
+                            return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
+                        }
+                    }
+                }
+
                 // Tokens must reach the guest *while* generation runs, because
                 // the guest's Stop verdict is what ends it early. The wasmtime
                 // Store is !Sync and cannot be touched from inside the backend's
@@ -310,7 +436,12 @@ pub async fn run_job(
 
                 let mut trap: Option<String> = None;
                 let outcome: Option<anyhow::Result<InferResult>> = {
-                    let infer = backend.infer(&prompt, max_tokens, &mut sink);
+                    let request = InferRequest {
+                        prompt: &prompt,
+                        max_tokens,
+                        images: &image_bytes,
+                    };
+                    let infer = backend.infer(request, &mut sink);
                     tokio::pin!(infer);
                     loop {
                         tokio::select! {

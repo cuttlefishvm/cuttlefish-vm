@@ -17,10 +17,42 @@ pub struct InferResult {
     pub tokens_out: u32,
 }
 
+/// One inference request.
+///
+/// A struct rather than a growing parameter list. `images` was added after the
+/// fact and would have broken every implementation had it been positional;
+/// temperature, grammars, and stop sequences are all coming, and each would do
+/// the same. Adding a field here with a sensible default does not.
+#[derive(Debug, Default)]
+pub struct InferRequest<'a> {
+    /// What to generate from.
+    pub prompt: &'a str,
+    /// Upper bound on generated tokens.
+    pub max_tokens: u32,
+    /// Images accompanying the prompt, already loaded by the host.
+    ///
+    /// Empty for ordinary text inference. A backend whose model has no vision
+    /// capability should fail loudly rather than ignore these — silently
+    /// dropping an image produces an answer about nothing, which is worse than
+    /// an error because it looks like a bad model.
+    pub images: &'a [Vec<u8>],
+}
+
+impl<'a> InferRequest<'a> {
+    /// A text-only request.
+    pub fn new(prompt: &'a str, max_tokens: u32) -> Self {
+        Self {
+            prompt,
+            max_tokens,
+            images: &[],
+        }
+    }
+}
+
 /// Anything that can serve an inference request.
 #[async_trait]
 pub trait InferBackend: Send + Sync {
-    /// Generate from `prompt`, invoking `on_token` once per token.
+    /// Generate from `req.prompt`, invoking `on_token` once per token.
     ///
     /// `on_token` returns whether to keep going; returning `false` ends
     /// generation early, which is how a guest's `Stop` verdict is honoured.
@@ -32,13 +64,20 @@ pub trait InferBackend: Send + Sync {
     /// that does not obviously point back here.
     async fn infer(
         &self,
-        prompt: &str,
-        max_tokens: u32,
+        req: InferRequest<'_>,
         on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
     ) -> anyhow::Result<InferResult>;
 
     /// Identifier recorded in the job's usage accounting.
     fn model_name(&self) -> String;
+
+    /// Whether this backend can accept images.
+    ///
+    /// Defaults to false, so a backend added without thinking about vision
+    /// refuses images rather than quietly discarding them.
+    fn supports_images(&self) -> bool {
+        false
+    }
 }
 
 /// A deterministic fake that streams a fixed reply word by word.
@@ -64,14 +103,13 @@ impl Default for StubBackend {
 impl InferBackend for StubBackend {
     async fn infer(
         &self,
-        prompt: &str,
-        max_tokens: u32,
+        req: InferRequest<'_>,
         on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
     ) -> anyhow::Result<InferResult> {
         let mut out = String::new();
         let mut tokens_out = 0u32;
 
-        for word in self.reply.split_whitespace().take(max_tokens as usize) {
+        for word in self.reply.split_whitespace().take(req.max_tokens as usize) {
             let piece = if out.is_empty() {
                 word.to_string()
             } else {
@@ -96,13 +134,19 @@ impl InferBackend for StubBackend {
 
         Ok(InferResult {
             text: out,
-            tokens_in: prompt.split_whitespace().count() as u32,
+            tokens_in: req.prompt.split_whitespace().count() as u32,
             tokens_out,
         })
     }
 
     fn model_name(&self) -> String {
         "stub".into()
+    }
+
+    /// The stub accepts images and ignores them, so a multimodal pipeline can be
+    /// tested without a vision model.
+    fn supports_images(&self) -> bool {
+        true
     }
 }
 

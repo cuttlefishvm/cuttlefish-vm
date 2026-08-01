@@ -30,7 +30,7 @@
 //! guest's early-stop meaningful rather than something noticed after the fact.
 
 use crate::backend::BackendFactory;
-use crate::infer::{InferBackend, InferResult};
+use crate::infer::{InferBackend, InferRequest, InferResult};
 use async_trait::async_trait;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -226,10 +226,19 @@ fn generate(
 impl InferBackend for LlamaCppBackend {
     async fn infer(
         &self,
-        prompt: &str,
-        max_tokens: u32,
+        req: InferRequest<'_>,
         on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
     ) -> anyhow::Result<InferResult> {
+        // llama.cpp does support multimodal (mtmd), but wiring it needs a
+        // projector model alongside the weights and a different decode path.
+        // Refusing is the honest answer until that exists: silently dropping the
+        // images would answer a question about nothing.
+        if !req.images.is_empty() {
+            anyhow::bail!(
+                "the embedded llama.cpp backend does not accept images yet; \
+                 use the `ollama` provider with a vision model"
+            );
+        }
         // Tokens travel out over a channel and the stop verdict travels back via
         // a flag, because the generation loop runs on a blocking thread and
         // cannot hold a borrow of `on_token`.
@@ -237,8 +246,8 @@ impl InferBackend for LlamaCppBackend {
         let stop = Arc::new(AtomicBool::new(false));
 
         let handle = {
-            let (model, stop, prompt) = (self.model.clone(), stop.clone(), prompt.to_string());
-            let context_size = self.context_size;
+            let (model, stop, prompt) = (self.model.clone(), stop.clone(), req.prompt.to_string());
+            let (context_size, max_tokens) = (self.context_size, req.max_tokens);
             tokio::task::spawn_blocking(move || {
                 generate(&model, context_size, &prompt, max_tokens, |piece| {
                     tx.send(piece.to_string()).is_ok() && !stop.load(Ordering::Relaxed)

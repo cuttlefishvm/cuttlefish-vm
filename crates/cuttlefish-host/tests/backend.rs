@@ -8,7 +8,7 @@
 use cuttlefish_core::spec::ModelRef;
 use cuttlefish_host::{
     backend::{BackendFactory, Registry},
-    infer::{InferBackend, InferResult},
+    infer::{InferBackend, InferRequest, InferResult},
 };
 use std::sync::Arc;
 
@@ -21,8 +21,7 @@ struct FakeBackend(String);
 impl InferBackend for FakeBackend {
     async fn infer(
         &self,
-        _prompt: &str,
-        _max_tokens: u32,
+        _req: InferRequest<'_>,
         _on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
     ) -> anyhow::Result<InferResult> {
         Ok(InferResult {

@@ -52,6 +52,38 @@ use serde::{Deserialize, Serialize};
 /// cannot be forged into a reference to another job's data.
 pub type Handle = u32;
 
+/// What kind of thing a handle refers to, reported by [`Event::Opened`].
+///
+/// A block needs this to know which commands are worth issuing: [`Command::Slice`]
+/// on a PNG is a mistake, and [`Command::PageText`] on a plain text file is
+/// meaningless. Reporting it up front means a block can branch on what it
+/// actually got rather than guessing from a file extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MediaKind {
+    /// Valid UTF-8. Both [`Command::Slice`] and [`Command::SliceBytes`] work.
+    Text,
+    /// An image the host recognised. Usable as an [`Command::Infer`] image.
+    Image {
+        /// Format as detected from content, e.g. `png`, `jpeg`.
+        format: String,
+    },
+    /// A paged document — a PDF, say.
+    Document {
+        /// How many pages it has.
+        pages: u32,
+        /// Whether it carries an extractable text layer.
+        ///
+        /// False for a scanned document, where the only way to read it is to
+        /// rasterize pages and hand them to a vision model. A block that checks
+        /// this can pick the cheap path when it exists and the expensive one
+        /// when it must, instead of silently extracting nothing.
+        has_text_layer: bool,
+    },
+    /// Bytes the host could not classify. Only [`Command::SliceBytes`] applies.
+    Binary,
+}
+
 /// What a guest asks the host to do, returned from its `init`/`step` exports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -63,6 +95,19 @@ pub enum Command {
         /// Upper bound on tokens generated. A guest can also end generation
         /// early by returning [`TokenAction::Stop`] from its `on_token` export.
         max_tokens: u32,
+        /// Images to accompany the prompt, named by handle.
+        ///
+        /// Handles rather than bytes, for the same reason file contents are not
+        /// handed over: an image can be tens of megabytes, and routing it
+        /// through guest memory would put the 4 GiB wasm32 ceiling back in play
+        /// for no benefit. The host already holds the bytes; it can pass them to
+        /// the model directly.
+        ///
+        /// Requires a model with vision capability. Empty for ordinary
+        /// text-only inference, which is why it is `#[serde(default)]` — a block
+        /// compiled before this field existed still deserializes.
+        #[serde(default)]
+        images: Vec<Handle>,
     },
     /// Open a file. Capability-checked against the job's spec.
     ///
@@ -84,6 +129,42 @@ pub enum Command {
         /// Maximum bytes to return. The host may return fewer; see
         /// [`Event::Sliced`].
         len: u64,
+    },
+    /// Pull one bounded window of an open file as raw bytes.
+    ///
+    /// The binary counterpart to [`Command::Slice`]. Prefer `Slice` for text:
+    /// it needs no encoding, and it handles the character-boundary problem for
+    /// you. This exists for blocks that genuinely need bytes — inspecting an
+    /// image header, say — and pays base64's cost to carry them.
+    SliceBytes {
+        /// Handle from a previous [`Command::Open`].
+        handle: Handle,
+        /// Byte offset to read from.
+        offset: u64,
+        /// Maximum bytes to return.
+        len: u64,
+    },
+    /// Extract one page of a document as text.
+    ///
+    /// Fails when the document has no text layer; check
+    /// [`MediaKind::Document::has_text_layer`] first.
+    PageText {
+        /// Handle from a previous [`Command::Open`].
+        handle: Handle,
+        /// Zero-based page number.
+        page: u32,
+    },
+    /// Render one page of a document to an image.
+    ///
+    /// Yields a *new* handle referring to the rendered image, which can then be
+    /// named in [`Command::Infer`]. That indirection is deliberate: the image
+    /// stays host-side like every other bulk value, and a rendered page is
+    /// usable exactly wherever a file-backed image is.
+    PageImage {
+        /// Handle from a previous [`Command::Open`].
+        handle: Handle,
+        /// Zero-based page number.
+        page: u32,
     },
     /// Report progress to whoever is watching the job's event stream.
     Emit {
@@ -123,6 +204,12 @@ pub enum Event {
         handle: Handle,
         /// Total size of the file, in bytes.
         len: u64,
+        /// What the host made of the contents; see [`MediaKind`].
+        ///
+        /// `#[serde(default)]` so a block built before this field existed still
+        /// deserializes, treating anything it opens as text.
+        #[serde(default)]
+        kind: MediaKind,
     },
     /// A window of a file was read.
     Sliced {
@@ -137,6 +224,31 @@ pub enum Event {
         /// walking a file must resume from this value rather than advancing by
         /// the length it asked for.
         next_offset: u64,
+    },
+    /// A window of a file was read as raw bytes.
+    SlicedBytes {
+        /// The window's contents, base64-encoded.
+        ///
+        /// Base64 rather than a binary side channel: the boundary is JSON, and
+        /// keeping it inspectable is worth more than the third it costs on a
+        /// path blocks are not expected to use in bulk.
+        bytes_base64: String,
+        /// Where the returned bytes ended. Unlike [`Event::Sliced`] there is no
+        /// truncation, so this is always `offset + len` clamped to the file.
+        next_offset: u64,
+    },
+    /// A document page was extracted as text.
+    PageTexted {
+        /// The page's text.
+        text: String,
+    },
+    /// A document page was rendered to an image.
+    PageImaged {
+        /// A new handle referring to the rendered image; name it in
+        /// [`Command::Infer`].
+        handle: Handle,
+        /// Its size in bytes.
+        len: u64,
     },
     /// Progress was forwarded. Carries nothing; it exists so `Emit` has a reply
     /// and the command loop keeps its shape.
@@ -273,4 +385,15 @@ pub mod error_codes {
     pub const TIMEOUT: &str = "timeout";
     /// The job was cancelled by request.
     pub const CANCELLED: &str = "cancelled";
+    /// A command needed a capability this build does not have — asking for a
+    /// page image without document rendering compiled in, say.
+    pub const UNSUPPORTED: &str = "unsupported";
+}
+
+impl Default for MediaKind {
+    /// Text, because that is what every command predating [`MediaKind`]
+    /// assumed, and because it keeps an older block's behaviour unchanged.
+    fn default() -> Self {
+        Self::Text
+    }
 }

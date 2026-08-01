@@ -9,7 +9,7 @@
 //! wanting the whole file would loop on `Slice` from `next_offset`, and its
 //! memory ceiling would still be `WINDOW` rather than the file's size.
 
-use cuttlefish_sdk::{export_block, Block, Command, Event, TokenAction};
+use cuttlefish_sdk::{export_block, Block, Command, Event, MediaKind, TokenAction};
 
 /// How much of a file this block is willing to hold at once.
 ///
@@ -51,21 +51,53 @@ impl Block for EchoSummarize {
 
     fn step(&mut self, event: Event) -> Command {
         match event {
-            Event::Opened { handle, len } => Command::Slice {
-                handle,
-                offset: 0,
-                len: len.min(WINDOW),
+            // Branch on what the host actually found, rather than assuming
+            // text. A PDF gets read through its text layer when it has one, and
+            // rendered for a vision model when it does not — which is the
+            // difference between summarizing a scan and summarizing nothing.
+            Event::Opened { handle, len, kind } => match kind {
+                MediaKind::Document {
+                    has_text_layer: true,
+                    ..
+                } => Command::PageText { handle, page: 0 },
+                MediaKind::Document { .. } => Command::PageImage { handle, page: 0 },
+                MediaKind::Image { .. } => Command::Infer {
+                    prompt: "Describe this image.".into(),
+                    max_tokens: 128,
+                    images: vec![handle],
+                },
+                MediaKind::Text => Command::Slice {
+                    handle,
+                    offset: 0,
+                    len: len.min(WINDOW),
+                },
+                MediaKind::Binary => Command::Fail {
+                    code: "unsupported".into(),
+                    message: "this block reads text, images, and documents".into(),
+                },
             },
             Event::Sliced { text, .. } => Command::Infer {
                 prompt: format!("Summarize the following:\n\n{text}"),
                 max_tokens: 128,
+                images: Vec::new(),
+            },
+            Event::PageTexted { text } => Command::Infer {
+                prompt: format!("Summarize the following:\n\n{text}"),
+                max_tokens: 128,
+                images: Vec::new(),
+            },
+            // A rendered page is an image handle like any other.
+            Event::PageImaged { handle, .. } => Command::Infer {
+                prompt: "Read this page and summarize it.".into(),
+                max_tokens: 128,
+                images: vec![handle],
             },
             Event::InferDone { text, .. } => Command::Done {
                 result: serde_json::json!({ "path": self.path, "summary": text }),
             },
-            Event::Emitted => Command::Fail {
+            Event::SlicedBytes { .. } | Event::Emitted => Command::Fail {
                 code: "unexpected_event".into(),
-                message: "this block never emits progress".into(),
+                message: "this block requests neither raw bytes nor progress".into(),
             },
         }
     }
