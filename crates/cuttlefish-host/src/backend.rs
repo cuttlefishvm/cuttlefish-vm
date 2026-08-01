@@ -84,6 +84,12 @@ impl Registry {
         let mut registry = Self::new();
         registry.register(Box::new(crate::infer::StubFactory));
         registry.register(Box::new(crate::ollama::OllamaFactory));
+        // Present only when the `llamacpp` feature is on. A spec naming
+        // `llamacpp` in a build without it gets the normal unknown-provider
+        // error listing what *is* available, which is a far better outcome than
+        // a link failure or a silent fallback to something else.
+        #[cfg(feature = "llamacpp")]
+        registry.register(Box::new(crate::llamacpp::LlamaCppFactory));
         registry
     }
 

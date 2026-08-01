@@ -55,10 +55,22 @@
             pkgs.maturin     # only needed if/when a PyO3 bridge crate shows up
             pkgs.libiconv    # darwin linking for any cdylib/native extension
 
-            # Coverage, matching what CI reports to Codecov. Needs the
-            # llvm-tools-preview component above.
+            # Coverage, matching what CI reports. Needs the llvm-tools-preview
+            # component above.
             pkgs.cargo-llvm-cov
+
+            # Only needed for the optional `llamacpp` feature, which compiles
+            # llama.cpp from source: cmake drives that build, and bindgen needs
+            # libclang to generate the FFI. Present unconditionally so that
+            # `--features llamacpp` works in this shell without extra setup;
+            # they cost nothing when the feature is off.
+            pkgs.cmake
+            pkgs.libclang
           ];
+
+          # bindgen locates libclang through this; without it the `llamacpp`
+          # feature fails to build with a message that does not mention clang.
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
 
           shellHook = ''
             echo "Python $(python3 --version)"
