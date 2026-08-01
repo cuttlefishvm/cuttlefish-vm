@@ -89,6 +89,36 @@ jobs:
           cargo llvm-cov --workspace --locked --summary-only \
             --ignore-filename-regex '(^|/)blocks/' || true
 
+  # The `llamacpp` feature is off by default, so nothing above compiles it —
+  # which is exactly how an optional feature rots unnoticed. This builds it on
+  # one platform only: it compiles llama.cpp from source, and doing that three
+  # times per run would dominate CI for a feature most users will not enable.
+  #
+  # Only the tests that need no model file run here. The ones that do are
+  # `#[ignore]`d and read CUTTLEFISH_TEST_GGUF; run them locally against any
+  # .gguf, including one Ollama has already pulled.
+  llamacpp:
+    name: Optional llama.cpp Feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cuttlefish-host's tests build the wasm guest fixture, so this job
+          # needs the target too — without it they fail deep inside a dependency
+          # with "can't find crate for `std`", which points nowhere useful.
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        # llama-cpp-sys-2 drives a cmake build and uses bindgen, which needs
+        # libclang. Neither is needed for a default build.
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
+      - name: Clippy
+        run: cargo clippy -p cuttlefish-host --features llamacpp --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test -p cuttlefish-host --features llamacpp --locked
+
   msrv:
     name: Minimum Supported Rust Version
     runs-on: ubuntu-latest

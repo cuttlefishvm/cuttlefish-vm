@@ -29,5 +29,7 @@ pub mod backend;
 pub mod caps;
 pub mod handles;
 pub mod infer;
+#[cfg(feature = "llamacpp")]
+pub mod llamacpp;
 pub mod ollama;
 pub mod runner;

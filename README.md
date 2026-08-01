@@ -79,13 +79,26 @@ build, not of the language:
 | Provider | Target | Status |
 |---|---|---|
 | `Ollama` | model tag, e.g. `llama3.2:1b` | available |
+| `LlamaCpp` | path to a `.gguf` file | available behind the `llamacpp` feature |
 | `Stub` | the canned reply to return | available — deterministic, for testing pipelines without a model |
 | OpenAI-compatible HTTP | endpoint URL | planned; covers llama.cpp's server, vLLM, LM Studio, hosted providers |
-| embedded llama.cpp | path to a `.gguf` | planned; removes the process boundary |
 
-Adding one means implementing `InferBackend` and registering a factory —
-the spec parser, the runner, and the daemon are untouched. Set `OLLAMA_HOST`
-to point at a non-default Ollama.
+Adding one means implementing `InferBackend` and registering a factory — the
+spec parser, the runner, and the daemon are untouched. Naming a provider this
+build does not have produces an error listing the ones it does.
+
+Set `OLLAMA_HOST` to point at a non-default Ollama.
+
+**Embedded llama.cpp** is opt-in because it compiles llama.cpp from source,
+which needs cmake, a C++ toolchain, and libclang:
+
+```console
+$ nix develop --command cargo build -p cuttlefishd --features llamacpp
+```
+
+It runs the model inside the daemon — no second process, and each job gets its
+own context so nothing carries between them. Ollama needs none of that
+toolchain, so prefer it unless you specifically want the model in-process.
 
 Design rationale lives in the code, not in a separate design document — each
 crate's module docs explain what it is responsible for and why it looks the way

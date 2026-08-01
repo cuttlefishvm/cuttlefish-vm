@@ -17,6 +17,12 @@ path = "src/lib.rs"
 name = "cuttlefishd"
 path = "src/main.rs"
 
+[features]
+default = []
+# Pass-through so `cargo build -p cuttlefishd --features llamacpp` works without
+# the caller having to know which crate actually owns the feature.
+llamacpp = ["cuttlefish-host/llamacpp"]
+
 [dependencies]
 cuttlefish-abi = { workspace = true }
 cuttlefish-core = { workspace = true }
