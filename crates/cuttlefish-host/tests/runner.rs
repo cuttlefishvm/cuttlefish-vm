@@ -254,3 +254,92 @@ async fn a_multibyte_document_survives_the_slice_boundary() {
 
     assert_eq!(envelope.status, JobStatus::Completed);
 }
+
+/// A backend that cannot see images, to prove the runner refuses rather than
+/// dropping them.
+struct TextOnlyBackend;
+
+#[async_trait::async_trait]
+impl cuttlefish_host::infer::InferBackend for TextOnlyBackend {
+    async fn infer(
+        &self,
+        _req: cuttlefish_host::infer::InferRequest<'_>,
+        _on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
+    ) -> anyhow::Result<cuttlefish_host::infer::InferResult> {
+        Ok(cuttlefish_host::infer::InferResult {
+            text: "an answer about nothing".into(),
+            tokens_in: 1,
+            tokens_out: 1,
+        })
+    }
+
+    fn model_name(&self) -> String {
+        "text-only".into()
+    }
+    // supports_images() defaults to false — that default is what is under test.
+}
+
+#[tokio::test]
+async fn images_sent_to_a_text_only_backend_fail_loudly() {
+    // The failure this guards is subtle: without it the backend above returns
+    // "an answer about nothing" with status completed, and the caller has no way
+    // to tell that its image was discarded. A confident wrong answer is worse
+    // than an error.
+    let f = fixture("irrelevant");
+    let png = f.doc.parent().unwrap().join("image.png");
+    std::fs::write(&png, [0x89, b'P', b'N', b'G', 13, 10, 26, 10]).unwrap();
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(TextOnlyBackend),
+        spec(&f, serde_json::json!({ "path": png.to_str().unwrap() })),
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        envelope.status,
+        JobStatus::Failed,
+        "a discarded image must not look like success"
+    );
+    let error = envelope.error.expect("a failed job carries an error");
+    assert_eq!(error.code, error_codes::UNSUPPORTED);
+    assert!(
+        error.message.contains("vision-capable"),
+        "the message should say what to do about it: {}",
+        error.message
+    );
+    assert!(envelope.result.is_none());
+}
+
+#[tokio::test]
+async fn images_reach_a_backend_that_accepts_them() {
+    // The other half: the guard must not block the working path. The stub
+    // reports what it received, so this asserts the image actually arrived
+    // rather than merely that the job succeeded.
+    let f = fixture("irrelevant");
+    let png = f.doc.parent().unwrap().join("ok.png");
+    std::fs::write(&png, [0x89, b'P', b'N', b'G', 13, 10, 26, 10]).unwrap();
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        spec(&f, serde_json::json!({ "path": png.to_str().unwrap() })),
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed);
+    let summary = envelope.result.unwrap()["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        summary.contains("1 image(s)"),
+        "the image must actually reach the backend, got: {summary:?}"
+    );
+}

@@ -195,8 +195,17 @@ impl InferBackend for OllamaBackend {
         self.model.clone()
     }
 
-    /// Ollama accepts images for any model; it reports the mismatch itself if
-    /// the model cannot use them.
+    /// True, but the honest claim is narrower than the signature allows:
+    /// whether images work depends on the *model*, not on this backend, and
+    /// this type does not know which model it is pointed at until a request is
+    /// made.
+    ///
+    /// Forwarding is nonetheless the better behaviour, because Ollama answers
+    /// the question authoritatively and specifically — HTTP 400 with
+    /// "Multimodal data provided, but model does not support multimodal
+    /// requests" (verified against llama3.2:1b). Guessing here from a model
+    /// name would produce a worse message and a new way to be wrong, since the
+    /// set of vision models changes without this code changing.
     fn supports_images(&self) -> bool {
         true
     }

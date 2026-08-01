@@ -109,7 +109,16 @@ impl InferBackend for StubBackend {
         let mut out = String::new();
         let mut tokens_out = 0u32;
 
-        for word in self.reply.split_whitespace().take(req.max_tokens as usize) {
+        // Make the images visible in the output. A caller asserting on the
+        // result can then tell whether they actually arrived, instead of
+        // getting a plausible answer that ignored them.
+        let reply = if req.images.is_empty() {
+            self.reply.clone()
+        } else {
+            format!("[{} image(s)] {}", req.images.len(), self.reply)
+        };
+
+        for word in reply.split_whitespace().take(req.max_tokens as usize) {
             let piece = if out.is_empty() {
                 word.to_string()
             } else {
@@ -143,8 +152,10 @@ impl InferBackend for StubBackend {
         "stub".into()
     }
 
-    /// The stub accepts images and ignores them, so a multimodal pipeline can be
-    /// tested without a vision model.
+    /// The stub accepts images so a multimodal pipeline is testable without a
+    /// vision model — but it *reports* what it received rather than discarding
+    /// it. Silently ignoring images is the failure this whole guard exists to
+    /// prevent; a test backend that does it cannot catch anyone else doing it.
     fn supports_images(&self) -> bool {
         true
     }

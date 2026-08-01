@@ -99,6 +99,32 @@ Guest processing blocks build for a different target than the host:
 $ nix develop --command cargo build -p cf-block-echo-summarize --target wasm32-unknown-unknown
 ```
 
+## Prefer a loud failure to a plausible answer
+
+The worst outcome in this codebase is not a crash — it is a result that looks
+right and isn't, because nothing downstream can tell the difference. A caller
+cannot distinguish "summarized the document" from "summarized the empty string
+extracted from a scan", and neither can a test that only checks for `Ok`.
+
+So when something cannot be done properly, say so:
+
+- **Never discard input you cannot use.** Images sent to a text-only model must
+  fail, not be dropped — dropping them yields a confident answer about nothing,
+  which reads as a bad model rather than a misconfigured job.
+- **Never substitute an empty value for a failure.** An empty page, an empty
+  token, an empty extraction: each is indistinguishable from a legitimately
+  empty result.
+- **Be wary of `unwrap_or_default`, `unwrap_or_else(|_| ...)`, and `ok()` on a
+  fallible path.** Each turns a failure into a value. Sometimes that is right —
+  a missing chat template genuinely means "this is a base model" — but the
+  fallback then needs a comment saying why the error is not interesting.
+- **Say what to do next.** "The backend serving `X` cannot accept images; use a
+  vision-capable model through the `ollama` provider" beats "unsupported".
+
+When you fix one of these, **prove the test detects it**: break the fix, watch
+the test fail, restore it. A test written after a fix often passes for reasons
+unrelated to the bug.
+
 ## Testing expectations
 
 Write the failing test first. This matters more here than in most projects

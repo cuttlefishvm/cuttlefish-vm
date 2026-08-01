@@ -74,10 +74,18 @@ pub fn page_text(path: &Path, page: u32) -> anyhow::Result<String> {
     // a single-page document, or one it did not mark — the whole text is the
     // only sensible answer for page zero.
     let pages: Vec<&str> = text.split('\u{c}').collect();
-    Ok(pages
-        .get(page as usize)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| if page == 0 { text } else { String::new() }))
+    match pages.get(page as usize) {
+        Some(found) => Ok(found.to_string()),
+        None if page == 0 => Ok(text),
+        // Returning an empty string here would be a silent wrong answer: the
+        // caller would summarize nothing and report success. The page exists
+        // according to the document's own page tree, so failing to extract it is
+        // a real failure and says so.
+        None => anyhow::bail!(
+            "page {page} exists but no text could be extracted for it; \
+             the page may be scanned — check `has_text_layer` and render it instead"
+        ),
+    }
 }
 
 /// Render one page to a PNG, zero-based.

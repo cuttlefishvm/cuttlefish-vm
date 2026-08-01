@@ -139,10 +139,16 @@ fn generate(
         Ok(template) => {
             let message = LlamaChatMessage::new("user".to_string(), prompt.to_string())
                 .map_err(|e| anyhow::anyhow!("building chat message: {e}"))?;
+            // Not `unwrap_or_else(|_| raw_prompt)`. A model that *has* a template
+            // and fails to apply it is broken, and falling back to the raw
+            // prompt would resurrect exactly the degenerate output this template
+            // handling was added to fix — while looking like it worked.
             model
                 .apply_chat_template(&template, &[message], true)
-                .unwrap_or_else(|_| prompt.to_string())
+                .map_err(|e| anyhow::anyhow!("applying the model's chat template: {e}"))?
         }
+        // No template means a base completion model, where the raw prompt is
+        // correct rather than a fallback.
         Err(_) => prompt.to_string(),
     };
 
@@ -198,9 +204,13 @@ fn generate(
             break;
         }
 
+        // Not `unwrap_or_default()`. An empty piece from a decode failure is
+        // indistinguishable from a token that legitimately renders to nothing,
+        // so swallowing it silently truncates output mid-generation and returns
+        // a shorter answer that looks complete.
         let piece = model
             .token_to_piece(token, &mut decoder, false, None)
-            .unwrap_or_default();
+            .map_err(|e| anyhow::anyhow!("decoding generated token: {e}"))?;
         tokens_out += 1;
         text.push_str(&piece);
 
