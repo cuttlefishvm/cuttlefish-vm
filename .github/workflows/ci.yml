@@ -103,6 +103,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cuttlefish-host's tests build the wasm guest fixture, so this job
+          # needs the target too — without it they fail deep inside a dependency
+          # with "can't find crate for `std`", which points nowhere useful.
+          targets: wasm32-unknown-unknown
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Install build dependencies
