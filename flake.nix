@@ -66,11 +66,24 @@
             # they cost nothing when the feature is off.
             pkgs.cmake
             pkgs.libclang
+
+            # Only for the optional `pdf-render` feature. pdfium is a shared
+            # library loaded at runtime rather than linked, so it must be on the
+            # loader path — see PDFIUM_DYNAMIC_LIB_PATH below.
+            pkgs.pdfium-binaries
           ];
 
           # bindgen locates libclang through this; without it the `llamacpp`
           # feature fails to build with a message that does not mention clang.
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+
+          # pdfium-render calls `bind_to_system_library`, which searches the
+          # dynamic loader path. Nix does not put library outputs there, so
+          # without this the `pdf-render` feature compiles and then fails at
+          # runtime saying it cannot find pdfium.
+          PDFIUM_DYNAMIC_LIB_PATH = "${pkgs.pdfium-binaries}/lib";
+          DYLD_FALLBACK_LIBRARY_PATH = "${pkgs.pdfium-binaries}/lib";
+          LD_LIBRARY_PATH = "${pkgs.pdfium-binaries}/lib";
 
           shellHook = ''
             echo "Python $(python3 --version)"

@@ -249,3 +249,52 @@ fn rendering_produces_a_png() {
     let png = documents::render_page(&sample_pdf(), 0, 256).expect("page 0 should render");
     assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "not a PNG");
 }
+
+/// An image-only PDF: no text operators at all, the way a scan looks.
+fn scanned_pdf() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/docs/scanned.pdf")
+}
+
+#[test]
+fn a_scanned_pdf_reports_no_text_layer() {
+    // This is the distinction the whole document design rests on. Reported
+    // wrongly, a block extracts the empty string and summarizes nothing while
+    // reporting success.
+    let info = documents::inspect(&scanned_pdf()).expect("the scanned PDF should inspect");
+    assert_eq!(info.pages, 1);
+    assert!(
+        !info.has_text_layer,
+        "an image-only PDF must not claim a text layer"
+    );
+}
+
+#[test]
+#[cfg(feature = "pdf-render")]
+#[ignore = "pdfium segfaults on this fixture; see the comment below"]
+fn a_scanned_page_renders_even_though_it_has_no_text() {
+    // KNOWN CRASH, recorded rather than hidden.
+    //
+    // pdfium takes down the whole process (SIGSEGV) on `scanned.pdf`, a file
+    // lopdf parses without complaint — page count and text-layer detection both
+    // succeed on it. So this is not simply a malformed fixture being caught:
+    // a PDF that pure-Rust parsers accept can kill a C++ renderer.
+    //
+    // The consequence is bigger than this test. pdfium runs in-process, so one
+    // bad PDF does not fail one job — it kills the daemon and every job running
+    // alongside it. That contradicts the isolation the rest of the system is
+    // built on, where a failing job fails alone.
+    //
+    // Fixing it properly means running the renderer somewhere a crash is
+    // survivable — a subprocess, most likely — which is a design change rather
+    // than a patch. Until then `pdf-render` should be considered unsafe for
+    // untrusted input.
+    // The other half: when there is no text layer, rendering is the only way to
+    // read the page, so it had better work.
+    let png = documents::render_page(&scanned_pdf(), 0, 256).expect("a scan should render");
+    assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "not a PNG");
+    assert!(
+        png.len() > 100,
+        "suspiciously small render: {} bytes",
+        png.len()
+    );
+}

@@ -42,7 +42,16 @@ base64 = "0.22"
 # works with any text model.
 lopdf = "0.44"
 pdf-extract = "0.12"
-pdfium-render = { version = "0.9", optional = true }
+# Pinned to a pdfium API version rather than `latest`. pdfium is loaded at
+# runtime, so the crate's expected symbol set has to be no newer than the
+# library actually present — nixpkgs ships 7749, and `latest` looks for symbols
+# that build does not export, failing with a bare "symbol not found" at the
+# first render. 7543 is the newest option at or below it.
+pdfium-render = { version = "0.9", optional = true, default-features = false, features = [
+    "pdfium_7543",
+    "image_latest",
+    "thread_safe",
+] }
 image = { version = "0.25", optional = true }
 
 [dev-dependencies]

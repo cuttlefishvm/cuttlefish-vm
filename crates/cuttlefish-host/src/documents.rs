@@ -95,7 +95,30 @@ pub fn page_text(path: &Path, page: u32) -> anyhow::Result<String> {
 pub fn render_page(path: &Path, page: u32, width: u16) -> anyhow::Result<Vec<u8>> {
     use pdfium_render::prelude::*;
 
-    let pdfium = Pdfium::default();
+    // pdfium is a shared library loaded at runtime, not linked in.
+    //
+    // `bind_to_system_library` alone searches only the platform's default
+    // loader paths, which is exactly where a Nix-provided library is *not*.
+    // `PDFIUM_DYNAMIC_LIB_PATH` is the escape hatch — set by this project's dev
+    // shell — with the system library as the fallback for a conventional
+    // install.
+    let bindings = match std::env::var("PDFIUM_DYNAMIC_LIB_PATH") {
+        Ok(dir) if !dir.is_empty() => {
+            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+                .or_else(|_| Pdfium::bind_to_system_library())
+        }
+        _ => Pdfium::bind_to_system_library(),
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "could not load the pdfium shared library ({e}). It is a runtime \
+             dependency of the `pdf-render` feature, not a build-time one: \
+             install pdfium-binaries and set PDFIUM_DYNAMIC_LIB_PATH to its lib \
+             directory, or use the document's text layer instead."
+        )
+    })?;
+    let pdfium = Pdfium::new(bindings);
+
     let document = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|e| anyhow::anyhow!("opening {} for rendering: {e}", path.display()))?;
@@ -106,15 +129,21 @@ pub fn render_page(path: &Path, page: u32, width: u16) -> anyhow::Result<Vec<u8>
         anyhow::bail!("page {page} is out of range; the document has {count}");
     }
 
-    let rendered = pages
-        .get(page as u16)
-        .map_err(|e| anyhow::anyhow!("reading page {page}: {e}"))?
-        .render_with_config(&PdfRenderConfig::new().set_target_width(width))
+    // pdfium counts pages and pixels in i32, so the conversions are its API's
+    // rather than a choice made here. The page is bound to a local because
+    // `render_with_config` borrows it — inlining the call would drop the page
+    // while the render still refers to it.
+    let target = pages
+        .get(page as i32)
+        .map_err(|e| anyhow::anyhow!("reading page {page}: {e}"))?;
+    let rendered = target
+        .render_with_config(&PdfRenderConfig::new().set_target_width(i32::from(width)))
         .map_err(|e| anyhow::anyhow!("rendering page {page}: {e}"))?;
 
     let mut png = std::io::Cursor::new(Vec::new());
     rendered
         .as_image()
+        .map_err(|e| anyhow::anyhow!("converting page {page} to an image: {e}"))?
         .write_to(&mut png, image::ImageFormat::Png)
         .map_err(|e| anyhow::anyhow!("encoding page {page} as PNG: {e}"))?;
 
