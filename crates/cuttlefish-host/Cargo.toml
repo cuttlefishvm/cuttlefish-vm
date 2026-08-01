@@ -30,7 +30,7 @@ tokio-util = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-llama-cpp-2 = { version = "0.1.153", optional = true }
+llama-cpp-2 = { version = "0.1.153", optional = true, features = ["mtmd"] }
 # Only for llama.cpp's stateful token decoder; see llamacpp.rs.
 encoding_rs = { version = "0.8", optional = true }
 async-trait = "0.1"
