@@ -12,7 +12,7 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use anyhow::Context;
-    use cuttlefish_host::infer::StubBackend;
+    use cuttlefish_host::backend::Registry;
     use cuttlefishd::{api, serve, state};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -37,9 +37,16 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::path::Path::new("."));
     spec.read_roots = spec.read_roots.iter().map(|r| spec_dir.join(r)).collect();
 
+    // The spec names a provider; the registry decides what serves it. Adding a
+    // backend therefore changes neither this file nor the spec parser.
+    let backend = Registry::with_builtins()
+        .resolve(&spec.model)
+        .with_context(|| format!("resolving model `{}`", spec.model))?;
+    eprintln!("cuttlefishd serving `{}` via {}", spec.name, spec.model);
+
     let state = api::AppState {
         engine: Arc::new(wasmtime::Engine::default()),
-        backend: Arc::new(StubBackend::default()),
+        backend,
         jobs: state::JobStore::default(),
         spec: Arc::new(spec),
         module_bytes: Arc::new(

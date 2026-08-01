@@ -32,7 +32,7 @@ A job is described by a `.cuttlefish` spec: which model, what it's allowed to to
 spec summarize_docs = {
   description = "Use when the agent needs a summary of a local file
                   and content must not leave the machine.";
-  model = Path "../models/qwen2.5-7b-instruct-q4_k_m.gguf";
+  model = Ollama "llama3.2:1b";
   data_policy = Local_only;
   capabilities = [ Read "./docs" ];
   block = "../blocks/echo-summarize";
@@ -56,16 +56,36 @@ enforced and output streamed:
 ```console
 $ cuttlefish run --spec summarize_docs --input '{"path": "examples/docs/a.txt"}'
 {
-  "result": { "path": "examples/docs/a.txt", "summary": "a stub summary" },
+  "result": {
+    "path": "examples/docs/a.txt",
+    "summary": "The cuttlefish, also known as sepia or sea pen, is a marine animal
+                recognized by its ability to rapidly change color and texture to
+                blend in with its surroundings."
+  },
   "status": "completed",
-  "usage": { "duration_ms": 196, "model": "stub", "tokens_in": 12, "tokens_out": 3 }
+  "usage": { "duration_ms": 1628, "model": "llama3.2:1b", "tokens_in": 46, "tokens_out": 44 }
 }
 ```
 
-Inference is still a deterministic stub rather than llama.cpp — everything
-around it is real. Also still to come: the typed DSL with block signatures,
-multi-block pipelines, the model pool, the block registry, and the agent
-harness.
+That is a real local model, not a stub. Still to come: more inference
+providers, the typed DSL with block signatures, multi-block pipelines, the
+model pool, the block registry, and the agent harness.
+
+### Inference providers
+
+A spec names a provider and a target; which backends exist is a property of the
+build, not of the language:
+
+| Provider | Target | Status |
+|---|---|---|
+| `Ollama` | model tag, e.g. `llama3.2:1b` | available |
+| `Stub` | the canned reply to return | available — deterministic, for testing pipelines without a model |
+| OpenAI-compatible HTTP | endpoint URL | planned; covers llama.cpp's server, vLLM, LM Studio, hosted providers |
+| embedded llama.cpp | path to a `.gguf` | planned; removes the process boundary |
+
+Adding one means implementing `InferBackend` and registering a factory —
+the spec parser, the runner, and the daemon are untouched. Set `OLLAMA_HOST`
+to point at a non-default Ollama.
 
 Design rationale lives in the code, not in a separate design document — each
 crate's module docs explain what it is responsible for and why it looks the way

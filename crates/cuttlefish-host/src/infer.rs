@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 
 /// What one completed generation produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferResult {
     /// The generated text.
     pub text: String,
@@ -43,7 +44,9 @@ pub trait InferBackend: Send + Sync {
 /// A deterministic fake that streams a fixed reply word by word.
 ///
 /// Enough to exercise streaming, early-stop, and token accounting with no model
-/// present.
+/// present. Registered as the `stub` provider, so a spec can select it with
+/// `model = Stub "anything"` — which makes it possible to test a pipeline end to
+/// end without depending on a model's wording, or on a model at all.
 pub struct StubBackend {
     /// What every request generates.
     pub reply: String,
@@ -100,5 +103,30 @@ impl InferBackend for StubBackend {
 
     fn model_name(&self) -> String {
         "stub".into()
+    }
+}
+
+/// Builds [`StubBackend`], registered as the `stub` provider.
+pub struct StubFactory;
+
+impl crate::backend::BackendFactory for StubFactory {
+    fn provider(&self) -> &'static str {
+        "stub"
+    }
+
+    fn describe(&self) -> &'static str {
+        "deterministic canned responses; no model required"
+    }
+
+    /// The target becomes the reply, so a spec can choose what the stub says.
+    /// An empty target keeps the default, which is what most callers want.
+    fn build(&self, target: &str) -> anyhow::Result<std::sync::Arc<dyn InferBackend>> {
+        Ok(std::sync::Arc::new(if target.is_empty() {
+            StubBackend::default()
+        } else {
+            StubBackend {
+                reply: target.to_string(),
+            }
+        }))
     }
 }
