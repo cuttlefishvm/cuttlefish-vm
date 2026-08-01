@@ -9,7 +9,7 @@
 //! wanting the whole file would loop on `Slice` from `next_offset`, and its
 //! memory ceiling would still be `WINDOW` rather than the file's size.
 
-use cuttlefish_sdk::{export_block, Block, Command, Event, MediaKind, TokenAction};
+use cuttlefish_sdk::{export_block, Block, Command, Event, MediaKind, Signature, TokenAction};
 
 /// How much of a file this block is willing to hold at once.
 ///
@@ -27,6 +27,19 @@ struct EchoSummarize {
 }
 
 impl Block for EchoSummarize {
+    fn signature() -> Signature {
+        // Takes a path, produces that path alongside a summary. Stated
+        // concretely rather than as `json` so a pipeline seam involving this
+        // block is actually checked — a `json` seam typechecks unconditionally,
+        // which is the same as not checking it.
+        Signature {
+            input: "{path: text}".parse().expect("a literal type"),
+            output: "{path: text, summary: text}"
+                .parse()
+                .expect("a literal type"),
+        }
+    }
+
     fn start(&mut self, input: serde_json::Value) -> Command {
         self.stop_after_first = input
             .get("stop_after_first")

@@ -65,7 +65,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-pub use cuttlefish_abi::{Command, Event, Handle, MediaKind, TokenAction};
+pub use cuttlefish_abi::{Command, Event, Handle, MediaKind, Signature, TokenAction, Ty};
 
 /// How a guest hands a (pointer, length) pair back to the host.
 ///
@@ -92,6 +92,23 @@ pub struct Desc {
 /// [`step`](Block::step) after each command it carries out, until the block
 /// returns [`Command::Done`] or [`Command::Fail`].
 pub trait Block: Default {
+    /// What this block accepts and produces.
+    ///
+    /// Declared here rather than in a file beside the block, so it cannot
+    /// disagree with the code below it. The host reads this to typecheck a
+    /// pipeline's seams before running anything.
+    ///
+    /// The default is permissive — JSON in, JSON out — so an existing block
+    /// keeps working. That is deliberately the weakest useful answer: a pipeline
+    /// of `Json` seams typechecks unconditionally, so a block that means to be
+    /// composed should say something more specific.
+    fn signature() -> Signature {
+        Signature {
+            input: Ty::Json,
+            output: Ty::Json,
+        }
+    }
+
     /// Produce the first command from the job's input.
     ///
     /// Prefer returning [`Command::Fail`] to panicking on malformed input: a
@@ -168,6 +185,13 @@ macro_rules! export_block {
         #[no_mangle]
         pub extern "C" fn cf_alloc(len: usize) -> usize {
             $crate::__alloc(len)
+        }
+
+        /// Report this block's type signature. Read at build time, before any
+        /// job runs, to check that a pipeline's seams line up.
+        #[no_mangle]
+        pub extern "C" fn cf_signature() -> usize {
+            $crate::__write_json(&<$ty as $crate::Block>::signature())
         }
 
         #[no_mangle]

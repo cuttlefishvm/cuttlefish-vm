@@ -231,3 +231,87 @@ fn media_kinds_round_trip() {
         );
     }
 }
+
+#[test]
+fn types_round_trip_through_their_string_form() {
+    use cuttlefish_abi::Ty;
+    use std::collections::BTreeMap;
+
+    let mut fields = BTreeMap::new();
+    fields.insert("path".to_string(), Ty::Text);
+    fields.insert("pages".to_string(), Ty::List(Box::new(Ty::Text)));
+
+    for ty in [
+        Ty::Text,
+        Ty::Bytes,
+        Ty::Image,
+        Ty::Document,
+        Ty::Json,
+        Ty::List(Box::new(Ty::Text)),
+        Ty::List(Box::new(Ty::List(Box::new(Ty::Bytes)))),
+        Ty::Record(fields.clone()),
+        Ty::Record(BTreeMap::new()),
+    ] {
+        let text = ty.to_string();
+        assert_eq!(
+            text.parse::<Ty>().unwrap(),
+            ty,
+            "round trip failed for {text}"
+        );
+
+        // And through JSON, which is how it actually crosses the wasm boundary.
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(serde_json::from_str::<Ty>(&json).unwrap(), ty, "{json}");
+    }
+}
+
+#[test]
+fn a_record_containing_a_list_survives_field_splitting() {
+    use cuttlefish_abi::Ty;
+    // The comma inside `[a, b]` must not be read as a field separator — a naive
+    // split(',') cuts this in the wrong place and produces nonsense.
+    let ty: Ty = "{chunks: [text], name: text}".parse().unwrap();
+    match ty {
+        Ty::Record(fields) => {
+            assert_eq!(fields.len(), 2, "got {fields:?}");
+            assert_eq!(fields["chunks"], Ty::List(Box::new(Ty::Text)));
+        }
+        other => panic!("expected a record, got {other:?}"),
+    }
+}
+
+#[test]
+fn assignability_is_not_equality() {
+    use cuttlefish_abi::Ty;
+    use std::collections::BTreeMap;
+
+    // Everything fits json — it is the top type.
+    assert!(Ty::Text.assignable_to(&Ty::Json));
+    assert!(Ty::List(Box::new(Ty::Image)).assignable_to(&Ty::Json));
+
+    // But json does not fit something specific: that would defeat the check.
+    assert!(!Ty::Json.assignable_to(&Ty::Text));
+
+    let mut produced = BTreeMap::new();
+    produced.insert("a".into(), Ty::Text);
+    produced.insert("extra".into(), Ty::Text);
+    let mut required = BTreeMap::new();
+    required.insert("a".into(), Ty::Text);
+
+    // Extra fields are fine — a producer adding one must not break a consumer.
+    assert!(Ty::Record(produced).assignable_to(&Ty::Record(required.clone())));
+
+    // A missing field is not.
+    assert!(!Ty::Record(BTreeMap::new()).assignable_to(&Ty::Record(required)));
+
+    // Mismatched kinds never fit.
+    assert!(!Ty::Text.assignable_to(&Ty::Image));
+    assert!(!Ty::List(Box::new(Ty::Text)).assignable_to(&Ty::List(Box::new(Ty::Image))));
+}
+
+#[test]
+fn an_unknown_type_is_rejected_by_name() {
+    use cuttlefish_abi::Ty;
+    let err = "nonsense".parse::<Ty>().unwrap_err();
+    assert!(err.contains("nonsense"), "{err}");
+}

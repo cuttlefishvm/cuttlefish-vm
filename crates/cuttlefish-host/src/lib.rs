@@ -33,6 +33,7 @@ pub mod infer;
 #[cfg(feature = "llamacpp")]
 pub mod llamacpp;
 pub mod ollama;
+pub mod pipeline;
 /// Rendering PDF pages out-of-process, so a renderer crash cannot take the
 /// daemon with it.
 #[cfg(feature = "pdf-render")]

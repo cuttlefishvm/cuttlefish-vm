@@ -27,7 +27,7 @@
 //!
 //! Being liberal in what it accepts would be exactly the wrong instinct here.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Where a job's model comes from.
@@ -110,8 +110,21 @@ pub struct Spec {
     pub data_policy: DataPolicy,
     /// Directories this job may read beneath. Empty means none.
     pub read_roots: Vec<PathBuf>,
-    /// The proc-block implementing the job.
-    pub block: PathBuf,
+    /// The proc-blocks implementing the job, in the order they run.
+    ///
+    /// Each block's output feeds the next one's input, and those seams are
+    /// typechecked before anything runs. A single-element pipeline is the
+    /// ordinary case and can be written as `block = "..."`.
+    pub pipeline: Vec<PathBuf>,
+}
+
+impl Spec {
+    /// The first block. A spec always has at least one.
+    pub fn block(&self) -> &Path {
+        self.pipeline
+            .first()
+            .expect("a spec has at least one block")
+    }
 }
 
 /// Why a spec was rejected.
@@ -187,7 +200,7 @@ pub fn parse_spec(src: &str) -> Result<Spec, SpecError> {
         .ok_or_else(|| SpecError::Malformed("expected `spec <name> = {`".into()))?
         .to_string();
 
-    let (mut description, mut model, mut data_policy, mut read_roots, mut block) =
+    let (mut description, mut model, mut data_policy, mut read_roots, mut pipeline) =
         (None, None, None, None, None);
 
     for statement in src[open + 1..close].split(';') {
@@ -203,7 +216,33 @@ pub fn parse_spec(src: &str) -> Result<Spec, SpecError> {
 
         match key.trim() {
             "description" => description = Some(quoted(value, "description")?),
-            "block" => block = Some(PathBuf::from(quoted(value, "block")?)),
+            // `block` is sugar for a one-element pipeline. Both spellings
+            // produce the same thing, so nothing downstream has two cases.
+            "block" => pipeline = Some(vec![PathBuf::from(quoted(value, "block")?)]),
+            "pipeline" => {
+                let inner = value
+                    .trim()
+                    .strip_prefix('[')
+                    .and_then(|v| v.strip_suffix(']'))
+                    .ok_or_else(|| {
+                        SpecError::Malformed("pipeline must be a `[...]` list".into())
+                    })?;
+                let stages: Result<Vec<PathBuf>, SpecError> = inner
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(|entry| Ok(PathBuf::from(quoted(entry, "pipeline")?)))
+                    .collect();
+                let stages = stages?;
+                if stages.is_empty() {
+                    // An empty pipeline runs nothing and returns nothing, which
+                    // is never what an author meant to write.
+                    return Err(SpecError::Malformed(
+                        "a pipeline needs at least one block".into(),
+                    ));
+                }
+                pipeline = Some(stages);
+            }
             "capabilities" => read_roots = Some(capabilities(value)?),
             "model" => {
                 // Any `Provider "target"` parses. Whether that provider exists
@@ -243,6 +282,6 @@ pub fn parse_spec(src: &str) -> Result<Spec, SpecError> {
         model: model.ok_or(SpecError::MissingField("model"))?,
         data_policy: data_policy.ok_or(SpecError::MissingField("data_policy"))?,
         read_roots: read_roots.ok_or(SpecError::MissingField("capabilities"))?,
-        block: block.ok_or(SpecError::MissingField("block"))?,
+        pipeline: pipeline.ok_or(SpecError::MissingField("block"))?,
     })
 }

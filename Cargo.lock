@@ -930,6 +930,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "wasmtime",
+ "wat",
 ]
 
 [[package]]
