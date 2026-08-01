@@ -38,12 +38,17 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-cuttlefish-sdk = {{ path = "{}" }}
+cuttlefish-sdk = {{ path = '{}' }}
 serde_json = "1"
 
 [workspace]
 "#,
-            sdk.display()
+            // A TOML *literal* string (single quotes) and forward slashes: a
+            // Windows path in a normal TOML string makes `\a` an escape
+            // sequence, so the manifest fails to parse and the fixture fails to
+            // build — on one platform only, with an error that says nothing
+            // about paths.
+            sdk.display().to_string().replace('\\', "/")
         ),
     )
     .unwrap();
