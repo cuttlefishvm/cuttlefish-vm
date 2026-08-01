@@ -40,7 +40,7 @@ impl Block for Walker {
 
     fn step(&mut self, event: Event) -> Command {
         match event {
-            Event::Opened { handle, len } => {
+            Event::Opened { handle, len, .. } => {
                 self.handle = handle;
                 self.len = len;
                 Command::Slice {
@@ -65,15 +65,16 @@ impl Block for Walker {
                     Command::Infer {
                         prompt: format!("Summarize: {}", self.collected),
                         max_tokens: 16,
+                        images: Vec::new(),
                     }
                 }
             }
             Event::InferDone { text, .. } => Command::Done {
                 result: serde_json::json!({ "summary": text, "read": self.collected }),
             },
-            Event::Emitted => Command::Fail {
+            _ => Command::Fail {
                 code: "unexpected_event".into(),
-                message: "this block never emits".into(),
+                message: "this block handles only open, slice, and infer".into(),
             },
         }
     }
@@ -100,7 +101,11 @@ fn a_block_walks_a_file_in_windows_and_finishes() {
 
     // Host opens a 10-byte file.
     assert_eq!(
-        b.step(Event::Opened { handle: 1, len: 10 }),
+        b.step(Event::Opened {
+            handle: 1,
+            len: 10,
+            kind: cuttlefish_abi::MediaKind::Text
+        }),
         Command::Slice {
             handle: 1,
             offset: 0,
@@ -140,7 +145,8 @@ fn a_block_walks_a_file_in_windows_and_finishes() {
         cmd,
         Command::Infer {
             prompt: "Summarize: abcdefghij".into(),
-            max_tokens: 16
+            max_tokens: 16,
+            images: Vec::new()
         },
         "reaching the end must move on to inference, not slice past it"
     );
@@ -163,7 +169,11 @@ fn a_short_window_is_resumed_from_next_offset() {
     // would skip bytes; this pins that it does not.
     let mut b = Walker::default();
     b.start(serde_json::json!({"path": "/d"}));
-    b.step(Event::Opened { handle: 9, len: 6 });
+    b.step(Event::Opened {
+        handle: 9,
+        len: 6,
+        kind: cuttlefish_abi::MediaKind::Text,
+    });
 
     let cmd = b.step(Event::Sliced {
         text: "ab".into(),

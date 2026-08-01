@@ -68,6 +68,7 @@ fn read_json_decodes_what_the_host_wrote() {
     let event = cuttlefish_abi::Event::Opened {
         handle: 3,
         len: 900,
+        kind: cuttlefish_abi::MediaKind::Text,
     };
     let encoded = serde_json::to_vec(&event).unwrap();
 

@@ -4,7 +4,7 @@
 //! within one build would silently break every already-compiled block.
 
 use cuttlefish_abi::{
-    error_codes, Command, Envelope, Event, JobError, JobStatus, TokenAction, Usage,
+    error_codes, Command, Envelope, Event, JobError, JobStatus, MediaKind, TokenAction, Usage,
 };
 
 #[test]
@@ -12,10 +12,11 @@ fn infer_command_serializes_to_the_expected_json() {
     let cmd = Command::Infer {
         prompt: "hi".into(),
         max_tokens: 32,
+        images: Vec::new(),
     };
     assert_eq!(
         serde_json::to_string(&cmd).unwrap(),
-        r#"{"cmd":"infer","prompt":"hi","max_tokens":32}"#
+        r#"{"cmd":"infer","prompt":"hi","max_tokens":32,"images":[]}"#
     );
 }
 
@@ -25,7 +26,20 @@ fn every_command_round_trips() {
         Command::Infer {
             prompt: "p".into(),
             max_tokens: 1,
+            images: Vec::new(),
         },
+        Command::Infer {
+            prompt: "look".into(),
+            max_tokens: 8,
+            images: vec![1, 2],
+        },
+        Command::SliceBytes {
+            handle: 2,
+            offset: 0,
+            len: 512,
+        },
+        Command::PageText { handle: 3, page: 0 },
+        Command::PageImage { handle: 3, page: 1 },
         Command::Open {
             path: "/a/b".into(),
         },
@@ -65,6 +79,7 @@ fn every_event_round_trips() {
         Event::Opened {
             handle: 3,
             len: 900,
+            kind: MediaKind::Text,
         },
         Event::Sliced {
             text: "abc".into(),
@@ -166,4 +181,53 @@ fn job_status_serializes_as_snake_case() {
     // The daemon's HTTP clients match on these strings.
     let json = serde_json::to_string(&JobStatus::Cancelled).unwrap();
     assert_eq!(json, r#""cancelled""#);
+}
+
+#[test]
+fn an_older_block_still_deserializes_the_new_fields() {
+    // Blocks are compiled separately and ship independently, so a block built
+    // before images and media kinds existed must keep working. Both fields
+    // default, which is what makes that true — this test is the guard on it.
+    let cmd: Command =
+        serde_json::from_str(r#"{"cmd":"infer","prompt":"hi","max_tokens":4}"#).unwrap();
+    assert_eq!(
+        cmd,
+        Command::Infer {
+            prompt: "hi".into(),
+            max_tokens: 4,
+            images: Vec::new()
+        }
+    );
+
+    let ev: Event = serde_json::from_str(r#"{"event":"opened","handle":1,"len":10}"#).unwrap();
+    assert_eq!(
+        ev,
+        Event::Opened {
+            handle: 1,
+            len: 10,
+            kind: MediaKind::Text
+        }
+    );
+}
+
+#[test]
+fn media_kinds_round_trip() {
+    for kind in [
+        MediaKind::Text,
+        MediaKind::Binary,
+        MediaKind::Image {
+            format: "jpeg".into(),
+        },
+        MediaKind::Document {
+            pages: 3,
+            has_text_layer: false,
+        },
+    ] {
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MediaKind>(&json).unwrap(),
+            kind,
+            "{json}"
+        );
+    }
 }

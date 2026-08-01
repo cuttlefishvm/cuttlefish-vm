@@ -71,6 +71,29 @@ That is a real local model, not a stub. Still to come: more inference
 providers, the typed DSL with block signatures, multi-block pipelines, the
 model pool, the block registry, and the agent harness.
 
+### Beyond text
+
+A block is told what it opened, and branches on it:
+
+| Input | What a block does |
+|---|---|
+| Text | `Slice` windows, as before |
+| Image | names the handle in `Infer` — the host feeds the bytes to a vision model |
+| PDF with a text layer | `PageText`, and any text model can read it |
+| PDF without one (a scan) | `PageImage` renders the page, and a vision model reads it |
+| Anything else | `SliceBytes` for raw bytes |
+
+`Open` reports `pages` and `has_text_layer` for documents, so a block takes the
+cheap path when it exists and the expensive one when it must — rather than
+extracting nothing from a scan and summarizing the empty string.
+
+Images never enter guest memory. A block names a *handle* in its inference
+request and the host loads the bytes, so a 40 MB scan costs the guest nothing —
+the same rule that governs file contents.
+
+Rendering PDF pages to images needs the `pdf-render` feature (pdfium is a large
+native dependency); text extraction is always available.
+
 ### Inference providers
 
 A spec names a provider and a target; which backends exist is a property of the

@@ -31,7 +31,7 @@
 //!
 //!     fn step(&mut self, event: Event) -> Command {
 //!         match event {
-//!             Event::Opened { handle, len } => Command::Slice { handle, offset: 0, len },
+//!             Event::Opened { handle, len, .. } => Command::Slice { handle, offset: 0, len },
 //!             Event::Sliced { text, .. } => Command::Done {
 //!                 result: serde_json::json!({ "shouted": text.to_uppercase() }),
 //!             },
@@ -65,7 +65,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-pub use cuttlefish_abi::{Command, Event, TokenAction};
+pub use cuttlefish_abi::{Command, Event, Handle, MediaKind, TokenAction};
 
 /// How a guest hands a (pointer, length) pair back to the host.
 ///

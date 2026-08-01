@@ -16,6 +16,10 @@ default = []
 # else in the workspace changes when it is absent — the backend registry simply
 # does not offer the `llamacpp` provider.
 llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# Rasterizing PDF pages for vision models. Off by default: pdfium is a large
+# native dependency, and text extraction (always available) covers documents
+# that have a text layer.
+pdf-render = ["dep:pdfium-render", "dep:image"]
 
 [dependencies]
 cuttlefish-abi = { workspace = true }
@@ -33,6 +37,13 @@ async-trait = "0.1"
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
+base64 = "0.22"
+# Document reading. Pure Rust and always on — extraction is the cheap path that
+# works with any text model.
+lopdf = "0.44"
+pdf-extract = "0.12"
+pdfium-render = { version = "0.9", optional = true }
+image = { version = "0.25", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
