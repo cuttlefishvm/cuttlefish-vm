@@ -90,9 +90,28 @@ pub fn page_text(path: &Path, page: u32) -> anyhow::Result<String> {
 
 /// Render one page to a PNG, zero-based.
 ///
+/// Runs pdfium in a **subprocess**. pdfium segfaults on input other parsers
+/// accept, and in-process that would kill the daemon and every job running
+/// alongside it rather than failing the one job holding the bad PDF. See
+/// [`crate::render_worker`].
+///
 /// Requires the `pdf-render` feature.
 #[cfg(feature = "pdf-render")]
 pub fn render_page(path: &Path, page: u32, width: u16) -> anyhow::Result<Vec<u8>> {
+    crate::render_worker::render_page(path, page, width)
+}
+
+/// Render a page in *this* process. Only the render worker should call this.
+///
+/// Kept separate so the isolation is not accidentally bypassed: anything
+/// reaching for `render_page` gets the safe path, and the unsafe one is named
+/// in a way that says why it is not the default.
+#[cfg(feature = "pdf-render")]
+pub(crate) fn render_page_in_process(
+    path: &Path,
+    page: u32,
+    width: u16,
+) -> anyhow::Result<Vec<u8>> {
     use pdfium_render::prelude::*;
 
     // pdfium is a shared library loaded at runtime, not linked in.

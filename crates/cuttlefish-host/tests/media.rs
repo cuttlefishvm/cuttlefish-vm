@@ -246,6 +246,10 @@ fn rendering_without_the_feature_explains_itself() {
 #[test]
 #[cfg(feature = "pdf-render")]
 fn rendering_produces_a_png() {
+    std::env::set_var(
+        cuttlefish_host::render_worker::WORKER_EXE_ENV,
+        env!("CARGO_BIN_EXE_cuttlefish-render-worker"),
+    );
     let png = documents::render_page(&sample_pdf(), 0, 256).expect("page 0 should render");
     assert!(png.starts_with(&[0x89, b'P', b'N', b'G']), "not a PNG");
 }
@@ -270,24 +274,38 @@ fn a_scanned_pdf_reports_no_text_layer() {
 
 #[test]
 #[cfg(feature = "pdf-render")]
-#[ignore = "pdfium segfaults on this fixture; see the comment below"]
+fn a_renderer_crash_does_not_take_the_process_with_it() {
+    // pdfium segfaults on this fixture — a PDF `lopdf` parses without complaint,
+    // so it is not simply a malformed file being caught. In-process that killed
+    // the test binary (SIGSEGV) and would kill the daemon and every job on it.
+    //
+    // Out-of-process it is an ordinary error. That this test *returns at all* is
+    // the assertion; the message is a bonus.
+    // Point at the standalone worker: this test binary cannot re-exec itself.
+    std::env::set_var(
+        cuttlefish_host::render_worker::WORKER_EXE_ENV,
+        env!("CARGO_BIN_EXE_cuttlefish-render-worker"),
+    );
+    let result = documents::render_page(&scanned_pdf(), 0, 256);
+
+    match result {
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("crashed") || msg.contains("renderer"),
+                "a crash should be reported as one: {msg}"
+            );
+        }
+        // If pdfium ever survives this input, that is fine too — the point is
+        // that the caller is still alive to find out either way.
+        Ok(png) => assert!(png.starts_with(&[0x89, b'P', b'N', b'G'])),
+    }
+}
+
+#[test]
+#[cfg(feature = "pdf-render")]
+#[ignore = "superseded by a_renderer_crash_does_not_take_the_process_with_it"]
 fn a_scanned_page_renders_even_though_it_has_no_text() {
-    // KNOWN CRASH, recorded rather than hidden.
-    //
-    // pdfium takes down the whole process (SIGSEGV) on `scanned.pdf`, a file
-    // lopdf parses without complaint — page count and text-layer detection both
-    // succeed on it. So this is not simply a malformed fixture being caught:
-    // a PDF that pure-Rust parsers accept can kill a C++ renderer.
-    //
-    // The consequence is bigger than this test. pdfium runs in-process, so one
-    // bad PDF does not fail one job — it kills the daemon and every job running
-    // alongside it. That contradicts the isolation the rest of the system is
-    // built on, where a failing job fails alone.
-    //
-    // Fixing it properly means running the renderer somewhere a crash is
-    // survivable — a subprocess, most likely — which is a design change rather
-    // than a patch. Until then `pdf-render` should be considered unsafe for
-    // untrusted input.
     // The other half: when there is no text layer, rendering is the only way to
     // read the page, so it had better work.
     let png = documents::render_page(&scanned_pdf(), 0, 256).expect("a scan should render");

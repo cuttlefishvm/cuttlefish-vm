@@ -21,6 +21,12 @@ llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # that have a text layer.
 pdf-render = ["dep:pdfium-render", "dep:image"]
 
+# Only built with the feature that needs it; see render_worker.
+[[bin]]
+name = "cuttlefish-render-worker"
+path = "src/bin/cuttlefish-render-worker.rs"
+required-features = ["pdf-render"]
+
 [dependencies]
 cuttlefish-abi = { workspace = true }
 cuttlefish-core = { workspace = true }
