@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "cf-block-echo-summarize"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "cuttlefish-sdk",
  "serde_json",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "cuttlefish"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "cuttlefish-abi"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -496,14 +496,14 @@ dependencies = [
 
 [[package]]
 name = "cuttlefish-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "thiserror 2.0.19",
 ]
 
 [[package]]
 name = "cuttlefish-host"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "cuttlefish-sdk"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "cuttlefish-abi",
  "serde",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "cuttlefishd"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "axum",
