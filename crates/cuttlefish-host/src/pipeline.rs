@@ -114,6 +114,19 @@ pub fn check(engine: &Engine, blocks: &[PathBuf]) -> Result<Checked, PipelineErr
 
     let mut stages: Vec<Stage> = Vec::with_capacity(blocks.len());
     for path in blocks {
+        // A directory here almost always means the spec names a block's *source*
+        // rather than its compiled artifact — an easy mistake while there is no
+        // `cuttlefish build` step to compile one into the other. Saying so beats
+        // "Is a directory (os error 21)".
+        if path.is_dir() {
+            return Err(PipelineError::Uninspectable {
+                path: path.clone(),
+                message: "this is a directory. A pipeline names compiled `.wasm` \
+                          artifacts, not block source directories — build the \
+                          block first and point at the `.wasm`."
+                    .into(),
+            });
+        }
         let module_bytes = std::fs::read(path).map_err(|source| PipelineError::Unreadable {
             path: path.clone(),
             source,

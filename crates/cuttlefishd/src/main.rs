@@ -70,12 +70,20 @@ async fn main() -> anyhow::Result<()> {
         backend,
         jobs: state::JobStore::default(),
         spec: Arc::new(spec),
-        // The checked pipeline already holds the module bytes; the positional
-        // wasm argument overrides them so an operator can point at a freshly
-        // built block without editing the spec.
-        module_bytes: Arc::new(match std::fs::read(&wasm_path) {
-            Ok(bytes) => bytes,
-            Err(_) => checked.stages()[0].module_bytes.clone(),
+        // The checked pipeline already holds every block's bytes. The positional
+        // wasm argument overrides the *first* stage, so an operator can point at
+        // a freshly built block without editing the spec — useful for a
+        // single-block spec, and harmless for a longer one.
+        stages: Arc::new({
+            let mut stages: Vec<Vec<u8>> = checked
+                .stages()
+                .iter()
+                .map(|s| s.module_bytes.clone())
+                .collect();
+            if let Ok(bytes) = std::fs::read(&wasm_path) {
+                stages[0] = bytes;
+            }
+            stages
         }),
     };
 

@@ -11,6 +11,25 @@
 
 use cuttlefish_sdk::{export_block, Block, Command, Event, MediaKind, Signature, TokenAction};
 
+/// Build the summarization prompt.
+///
+/// The obvious phrasing — "Summarize the following:" then the text — reads to a
+/// small model as an assertion to evaluate rather than content to condense.
+/// Given a one-line document, llama3.2:1b answered "There is no information
+/// about cuttlefish delegating jobs to local models in my knowledge base",
+/// which looks like a broken pipeline and is not: the text arrived intact.
+///
+/// Delimiting the document and saying explicitly not to judge it fixes that
+/// with the same model. Prompt shape is part of a block's behaviour, not an
+/// afterthought.
+fn summarize_prompt(text: &str) -> String {
+    format!(
+        "Summarize the document between the markers in one or two sentences. \
+         Do not comment on whether it is true.\n\n<<<DOCUMENT\n{}\nDOCUMENT>>>",
+        text.trim()
+    )
+}
+
 /// How much of a file this block is willing to hold at once.
 ///
 /// The particular value is arbitrary; the point is that a bound exists. Guest
@@ -90,12 +109,12 @@ impl Block for EchoSummarize {
                 },
             },
             Event::Sliced { text, .. } => Command::Infer {
-                prompt: format!("Summarize the following:\n\n{text}"),
+                prompt: summarize_prompt(&text),
                 max_tokens: 128,
                 images: Vec::new(),
             },
             Event::PageTexted { text } => Command::Infer {
-                prompt: format!("Summarize the following:\n\n{text}"),
+                prompt: summarize_prompt(&text),
                 max_tokens: 128,
                 images: Vec::new(),
             },

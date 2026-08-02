@@ -103,6 +103,19 @@
               # homebrew shellenv runs (which would otherwise shadow nix packages).
               _zd=$(mktemp -d)
               printf '[ -f "$HOME/.zshrc" ] && ZDOTDIR="" source "$HOME/.zshrc"\n' > "$_zd/.zshrc"
+
+              # Re-prepend the nix PATH *after* the user's .zshrc has run.
+              #
+              # Sourcing .zshrc is what makes this an ordinary shell, but it also
+              # runs `brew shellenv` / rustup init, which prepend their own bins
+              # and shadow everything this flake pins. The symptom is nasty
+              # precisely because the shellHook above prints the right versions
+              # first: the banner says rustc 1.97 and then cargo reports 1.87,
+              # so the shell looks correct and behaves otherwise.
+              #
+              # Caught live: `cargo build` failed with "rustc 1.87.0 is not
+              # supported" inside a shell whose banner had just announced 1.97.1.
+              printf 'export PATH=%s:"$PATH"\n' "''${PATH@Q}" >> "$_zd/.zshrc"
               printf 'export PROMPT="%%F{cyan}[nix]%%f $PROMPT"\n' >> "$_zd/.zshrc"
               printf 'alias vim=nvim\n' >> "$_zd/.zshrc"
               printf 'autoload -Uz compinit && compinit\n' >> "$_zd/.zshrc"
