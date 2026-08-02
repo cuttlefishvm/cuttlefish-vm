@@ -21,6 +21,7 @@
 //! documentation-lives-in-the-code convention).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,82 @@ impl IndexFile {
     }
 }
 
+/// Something went wrong reading, writing, or resolving through the catalog.
+#[derive(Debug, thiserror::Error)]
+// Constructed for real starting in Task 6 onward (index read/write, resolution).
+#[allow(dead_code)]
+pub enum CatalogError {
+    /// `name@version` was already catalogued; versions are immutable once published.
+    #[error("{name_version} is already catalogued; versions are immutable once published")]
+    AlreadyExists {
+        /// The name@version that was already present.
+        name_version: String,
+    },
+    /// No entry matches the requested `name@version`.
+    #[error("no such catalog entry: {name_version}{}", format_did_you_mean(did_you_mean))]
+    NotFound {
+        /// The name@version that was requested.
+        name_version: String,
+        /// Names within edit distance 2 of the requested one, closest first,
+        /// capped at 5. Empty when nothing is close.
+        did_you_mean: Vec<String>,
+    },
+    /// An unqualified name was used somewhere that requires an exact version
+    /// (resolving a node reference already recorded inside a bundle's
+    /// manifest — see `ResolutionContext::Durable`).
+    #[error("{name} has no version — an exact name@version is required here")]
+    UnqualifiedName {
+        /// The unqualified name that was rejected.
+        name: String,
+    },
+    /// The catalog's own `index.json` failed to parse.
+    #[error("catalog index at {path} is corrupt: {reason}")]
+    CorruptIndex {
+        /// Path to the unreadable index file.
+        path: PathBuf,
+        /// What went wrong parsing it.
+        reason: String,
+    },
+    /// The artifact's magic bytes match neither a wasm module nor a bundle.
+    #[error("{path}: not a recognised artifact (header: {header:02x?})")]
+    UnrecognizedArtifact {
+        /// The path that was handed to `add`.
+        path: PathBuf,
+        /// The first bytes actually seen.
+        header: Vec<u8>,
+    },
+    /// The artifact's magic bytes were recognised, but its contents could not
+    /// be read: a wasm-magic file whose module body is truncated or
+    /// otherwise invalid, or a bundle-magic file whose manifest JSON fails to
+    /// parse. Distinct from `CorruptIndex` (that's the catalog's own
+    /// bookkeeping file, not an input artifact) and from
+    /// `UnrecognizedArtifact` (that's the magic byte itself not matching
+    /// anything).
+    #[error("{path}: {reason}")]
+    UninspectableArtifact {
+        /// The path that was handed to `add`.
+        path: PathBuf,
+        /// What went wrong reading past the magic bytes.
+        reason: String,
+    },
+    /// Underlying I/O failure — a plain failure to open/read/write a path,
+    /// before any catalog-specific logic ever inspects the bytes.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Render `did_you_mean` as a message suffix, or nothing if it's empty —
+/// never a dangling "(did you mean: ?)" for a genuinely unmatched name.
+// Used by CatalogError::NotFound; constructed for real starting in Task 6 onward.
+#[allow(dead_code)]
+fn format_did_you_mean(names: &[String]) -> String {
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(" (did you mean: {}?)", names.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +191,26 @@ mod tests {
             serde_json::from_str(&json).expect("must deserialize what we just serialized");
         assert_eq!(round_tripped.version, INDEX_VERSION);
         assert!(round_tripped.entries.contains_key("chunk-text@1"));
+    }
+
+    #[test]
+    fn not_found_with_suggestions_reads_as_one_sentence() {
+        let err = CatalogError::NotFound {
+            name_version: "summarise@1".to_string(),
+            did_you_mean: vec!["summarize@1".to_string()],
+        };
+        assert_eq!(
+            err.to_string(),
+            "no such catalog entry: summarise@1 (did you mean: summarize@1?)"
+        );
+    }
+
+    #[test]
+    fn not_found_with_no_suggestions_has_no_dangling_parenthetical() {
+        let err = CatalogError::NotFound {
+            name_version: "xyz@1".to_string(),
+            did_you_mean: vec![],
+        };
+        assert_eq!(err.to_string(), "no such catalog entry: xyz@1");
     }
 }
