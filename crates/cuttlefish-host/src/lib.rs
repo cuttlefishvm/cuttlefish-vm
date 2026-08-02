@@ -27,6 +27,7 @@
 
 pub mod backend;
 pub mod caps;
+pub mod catalog;
 pub mod documents;
 pub mod handles;
 pub mod infer;
