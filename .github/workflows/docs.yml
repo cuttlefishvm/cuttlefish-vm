@@ -91,12 +91,22 @@ jobs:
           # behaviourally through the host's integration tests instead. Leaving
           # them in would make the figure track "how much guest code exists"
           # rather than "how much host logic is tested".
+          # stderr goes to a file rather than /dev/null. A real crash here (not
+          # "no tests exist") used to look identical to the empty-workspace
+          # case — both degraded to the same silent "unknown" badge, with
+          # nothing in the log to say which one happened. That is exactly the
+          # kind of quiet failure this project's own rule (see AGENTS.md) says
+          # not to ship: it hid a genuine bug — a nested `cargo build` in a
+          # test failing under llvm-cov's RUSTC_WRAPPER — for several PRs.
+          cov_log=$(mktemp)
           pct=$(cargo llvm-cov --workspace --locked --json --summary-only \
-                  --ignore-filename-regex '(^|/)blocks/' 2>/dev/null \
+                  --ignore-filename-regex '(^|/)blocks/' 2>"$cov_log" \
                 | python3 -c 'import sys, json; print(round(json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"], 1))' \
-                2>/dev/null || true)
+                2>>"$cov_log" || true)
 
           if [ -z "${pct:-}" ]; then
+            echo "::warning::coverage badge falling back to 'unknown' — cargo llvm-cov produced no usable output. Log follows:"
+            cat "$cov_log"
             msg="unknown"
             color="lightgrey"
           else

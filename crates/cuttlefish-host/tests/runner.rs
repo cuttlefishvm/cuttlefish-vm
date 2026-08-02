@@ -6,6 +6,8 @@
 //! actually be used. A mock would happily agree with a host that reads the
 //! descriptor wrong.
 
+mod support;
+
 use cuttlefish_abi::{error_codes, JobStatus};
 use cuttlefish_host::{
     caps::Capabilities,
@@ -32,7 +34,7 @@ fn example_block() -> Vec<u8> {
     static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
     WASM.get_or_init(|| {
-        let status = std::process::Command::new(env!("CARGO"))
+        let status = crate::support::clean_cargo(env!("CARGO"))
             .args([
                 "build",
                 "-p",
