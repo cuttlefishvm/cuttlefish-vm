@@ -144,144 +144,199 @@ pub enum SpecError {
     UnsupportedCapability(String),
 }
 
-/// Strip surrounding double quotes, or explain that they were required.
-fn quoted(value: &str, field: &str) -> Result<String, SpecError> {
-    value
-        .trim()
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .map(str::to_string)
-        .ok_or_else(|| SpecError::Malformed(format!("field `{field}` must be a quoted string")))
-}
-
-/// Parse the capability list: `[ Read "a", Read "b" ]`.
-fn capabilities(value: &str) -> Result<Vec<PathBuf>, SpecError> {
-    let inner = value
-        .trim()
-        .strip_prefix('[')
-        .and_then(|v| v.strip_suffix(']'))
-        .ok_or_else(|| SpecError::Malformed("capabilities must be a `[...]` list".into()))?;
-
-    inner
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            let rest = entry.strip_prefix("Read ").ok_or_else(|| {
-                // Name the offending kind rather than saying "invalid": the
-                // author needs to know which entry, and this list is one place
-                // a typo grants nothing while looking correct.
-                let kind = entry.split_whitespace().next().unwrap_or(entry);
-                SpecError::UnsupportedCapability(kind.to_string())
-            })?;
-            Ok(PathBuf::from(quoted(rest, "capabilities")?))
-        })
-        .collect()
-}
+use crate::lex::{lex, Tok, Token};
 
 /// Parse a spec.
+///
+/// Recursive descent over tokens, not splitting on punctuation — see
+/// [`crate::lex`] for why that distinction is load-bearing rather than
+/// stylistic.
 pub fn parse_spec(src: &str) -> Result<Spec, SpecError> {
-    let open = src
-        .find('{')
-        .ok_or_else(|| SpecError::Malformed("expected `{`".into()))?;
-    let close = src
-        .rfind('}')
-        .ok_or_else(|| SpecError::Malformed("expected `}`".into()))?;
-    if close < open {
-        return Err(SpecError::Malformed("`}` before `{`".into()));
+    let tokens = lex(src).map_err(|e| SpecError::Malformed(e.to_string()))?;
+    Parser {
+        tokens: &tokens,
+        at: 0,
+    }
+    .spec()
+}
+
+struct Parser<'a> {
+    tokens: &'a [Token],
+    at: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn peek(&self) -> Option<&'a Tok> {
+        self.tokens.get(self.at).map(|t| &t.tok)
     }
 
-    let name = src[..open]
-        .trim()
-        .strip_prefix("spec")
-        .and_then(|header| header.split('=').next())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| SpecError::Malformed("expected `spec <name> = {`".into()))?
-        .to_string();
-
-    let (mut description, mut model, mut data_policy, mut read_roots, mut pipeline) =
-        (None, None, None, None, None);
-
-    for statement in src[open + 1..close].split(';') {
-        let statement = statement.trim();
-        if statement.is_empty() {
-            continue;
-        }
-
-        let (key, value) = statement.split_once('=').ok_or_else(|| {
-            SpecError::Malformed(format!("expected `key = value` in `{statement}`"))
-        })?;
-        let value = value.trim();
-
-        match key.trim() {
-            "description" => description = Some(quoted(value, "description")?),
-            // `block` is sugar for a one-element pipeline. Both spellings
-            // produce the same thing, so nothing downstream has two cases.
-            "block" => pipeline = Some(vec![PathBuf::from(quoted(value, "block")?)]),
-            "pipeline" => {
-                let inner = value
-                    .trim()
-                    .strip_prefix('[')
-                    .and_then(|v| v.strip_suffix(']'))
-                    .ok_or_else(|| {
-                        SpecError::Malformed("pipeline must be a `[...]` list".into())
-                    })?;
-                let stages: Result<Vec<PathBuf>, SpecError> = inner
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|entry| !entry.is_empty())
-                    .map(|entry| Ok(PathBuf::from(quoted(entry, "pipeline")?)))
-                    .collect();
-                let stages = stages?;
-                if stages.is_empty() {
-                    // An empty pipeline runs nothing and returns nothing, which
-                    // is never what an author meant to write.
-                    return Err(SpecError::Malformed(
-                        "a pipeline needs at least one block".into(),
-                    ));
-                }
-                pipeline = Some(stages);
-            }
-            "capabilities" => read_roots = Some(capabilities(value)?),
-            "model" => {
-                // Any `Provider "target"` parses. Whether that provider exists
-                // is the host's question, not this parser's — see `ModelRef`.
-                let (provider, rest) = value.split_once(char::is_whitespace).ok_or_else(|| {
-                    SpecError::Malformed(
-                        r#"model needs a provider and a target, as in `Ollama "llama3.2:1b"`"#
-                            .into(),
-                    )
-                })?;
-                if provider.is_empty() || !provider.chars().all(|c| c.is_alphanumeric() || c == '_')
-                {
-                    return Err(SpecError::Malformed(format!(
-                        "`{provider}` is not a valid model provider name"
-                    )));
-                }
-                model = Some(ModelRef::new(provider, quoted(rest, "model")?));
-            }
-            "data_policy" => {
-                data_policy = Some(match value {
-                    "Local_only" => DataPolicy::LocalOnly,
-                    "Any" => DataPolicy::Any,
-                    other => {
-                        return Err(SpecError::Malformed(format!(
-                            "unknown data_policy `{other}`"
-                        )))
-                    }
-                })
-            }
-            other => return Err(SpecError::UnknownField(other.to_string())),
+    /// Describe where the parser is, for an error message.
+    fn here(&self) -> String {
+        match self.tokens.get(self.at) {
+            Some(t) => format!("{} at {}", t.tok.describe(), t.span),
+            None => "end of input".into(),
         }
     }
 
-    Ok(Spec {
-        name,
-        description: description.ok_or(SpecError::MissingField("description"))?,
-        model: model.ok_or(SpecError::MissingField("model"))?,
-        data_policy: data_policy.ok_or(SpecError::MissingField("data_policy"))?,
-        read_roots: read_roots.ok_or(SpecError::MissingField("capabilities"))?,
-        pipeline: pipeline.ok_or(SpecError::MissingField("block"))?,
-    })
+    fn advance(&mut self) -> Option<&'a Token> {
+        let t = self.tokens.get(self.at);
+        if t.is_some() {
+            self.at += 1;
+        }
+        t
+    }
+
+    fn expect(&mut self, want: &Tok) -> Result<(), SpecError> {
+        match self.peek() {
+            Some(got) if got == want => {
+                self.at += 1;
+                Ok(())
+            }
+            _ => Err(SpecError::Malformed(format!(
+                "expected {}, found {}",
+                want.describe(),
+                self.here()
+            ))),
+        }
+    }
+
+    fn ident(&mut self) -> Result<String, SpecError> {
+        match self.advance().map(|t| &t.tok) {
+            Some(Tok::Ident(name)) => Ok(name.clone()),
+            _ => {
+                self.at = self.at.saturating_sub(1);
+                Err(SpecError::Malformed(format!(
+                    "expected a name, found {}",
+                    self.here()
+                )))
+            }
+        }
+    }
+
+    fn string(&mut self, field: &str) -> Result<String, SpecError> {
+        match self.advance().map(|t| &t.tok) {
+            Some(Tok::Str(value)) => Ok(value.clone()),
+            _ => {
+                self.at = self.at.saturating_sub(1);
+                Err(SpecError::Malformed(format!(
+                    "field `{field}` must be a quoted string, found {}",
+                    self.here()
+                )))
+            }
+        }
+    }
+
+    /// `spec NAME = { field* }`
+    fn spec(&mut self) -> Result<Spec, SpecError> {
+        match self.ident()?.as_str() {
+            "spec" => {}
+            other => {
+                return Err(SpecError::Malformed(format!(
+                    "a spec file starts with `spec`, found `{other}`"
+                )))
+            }
+        }
+        let name = self.ident()?;
+        self.expect(&Tok::Equals)?;
+        self.expect(&Tok::OpenBrace)?;
+
+        let (mut description, mut model, mut data_policy, mut read_roots, mut pipeline) =
+            (None, None, None, None, None);
+
+        while self.peek().is_some() && self.peek() != Some(&Tok::CloseBrace) {
+            let key = self.ident()?;
+            self.expect(&Tok::Equals)?;
+
+            match key.as_str() {
+                "description" => description = Some(self.string("description")?),
+                "block" => pipeline = Some(vec![PathBuf::from(self.string("block")?)]),
+                "pipeline" => pipeline = Some(self.pipeline()?),
+                "capabilities" => read_roots = Some(self.capabilities()?),
+                "model" => model = Some(self.model()?),
+                "data_policy" => {
+                    data_policy = Some(match self.ident()?.as_str() {
+                        "Local_only" => DataPolicy::LocalOnly,
+                        "Any" => DataPolicy::Any,
+                        other => {
+                            return Err(SpecError::Malformed(format!(
+                                "unknown data_policy `{other}`"
+                            )))
+                        }
+                    })
+                }
+                other => return Err(SpecError::UnknownField(other.to_string())),
+            }
+
+            // A trailing semicolon is conventional but not required — and,
+            // unlike before, one *inside* a string is just a character.
+            if self.peek() == Some(&Tok::Semicolon) {
+                self.at += 1;
+            }
+        }
+        self.expect(&Tok::CloseBrace)?;
+
+        Ok(Spec {
+            name,
+            description: description.ok_or(SpecError::MissingField("description"))?,
+            model: model.ok_or(SpecError::MissingField("model"))?,
+            data_policy: data_policy.ok_or(SpecError::MissingField("data_policy"))?,
+            read_roots: read_roots.ok_or(SpecError::MissingField("capabilities"))?,
+            pipeline: pipeline.ok_or(SpecError::MissingField("block"))?,
+        })
+    }
+
+    /// `Provider "target"`
+    fn model(&mut self) -> Result<ModelRef, SpecError> {
+        let provider = self.ident()?;
+        if provider.is_empty() || !provider.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(SpecError::Malformed(format!(
+                "`{provider}` is not a valid model provider name"
+            )));
+        }
+        Ok(ModelRef::new(provider, self.string("model")?))
+    }
+
+    /// `[ "a", "b" ]`
+    fn pipeline(&mut self) -> Result<Vec<PathBuf>, SpecError> {
+        let mut blocks = Vec::new();
+        self.expect(&Tok::OpenBracket)?;
+        while self.peek() != Some(&Tok::CloseBracket) {
+            blocks.push(PathBuf::from(self.string("pipeline")?));
+            if self.peek() == Some(&Tok::Comma) {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        self.expect(&Tok::CloseBracket)?;
+
+        if blocks.is_empty() {
+            // A pipeline that runs nothing and returns nothing is never what an
+            // author meant to write.
+            return Err(SpecError::Malformed(
+                "a pipeline needs at least one block".into(),
+            ));
+        }
+        Ok(blocks)
+    }
+
+    /// `[ Read "a", Read "b" ]`
+    fn capabilities(&mut self) -> Result<Vec<PathBuf>, SpecError> {
+        let mut roots = Vec::new();
+        self.expect(&Tok::OpenBracket)?;
+        while self.peek() != Some(&Tok::CloseBracket) {
+            let kind = self.ident()?;
+            if kind != "Read" {
+                return Err(SpecError::UnsupportedCapability(kind));
+            }
+            roots.push(PathBuf::from(self.string("capabilities")?));
+            if self.peek() == Some(&Tok::Comma) {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        self.expect(&Tok::CloseBracket)?;
+        Ok(roots)
+    }
 }

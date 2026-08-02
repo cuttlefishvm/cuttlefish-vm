@@ -3,5 +3,7 @@ spec summarize_docs = {
   model = Ollama "llama3.2:1b";
   data_policy = Local_only;
   capabilities = [ Read "./docs" ];
-  block = "../blocks/echo-summarize";
+  # A compiled artifact, not the block's source directory: there is no
+  # build step yet that turns one into the other.
+  block = "../target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm";
 }

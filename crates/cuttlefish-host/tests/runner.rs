@@ -71,7 +71,7 @@ fn fixture(contents: &str) -> Fixture {
 
 fn spec(f: &Fixture, input: serde_json::Value) -> JobSpec {
     JobSpec {
-        module_bytes: example_block(),
+        stages: vec![example_block()],
         input,
         caps: f.caps.clone(),
     }
@@ -222,7 +222,7 @@ async fn a_module_that_is_not_wasm_fails_as_a_trap() {
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         JobSpec {
-            module_bytes: b"definitely not wasm".to_vec(),
+            stages: vec![b"definitely not wasm".to_vec()],
             input: serde_json::json!({ "path": f.doc.to_str().unwrap() }),
             caps: f.caps.clone(),
         },

@@ -70,7 +70,7 @@ async fn start() -> Harness {
         backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
         jobs: JobStore::default(),
         spec: Arc::new(spec),
-        module_bytes: Arc::new(example_block()),
+        stages: Arc::new(vec![example_block()]),
     };
 
     let sock_for_server = sock.clone();

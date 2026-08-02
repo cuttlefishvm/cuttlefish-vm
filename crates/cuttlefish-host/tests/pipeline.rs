@@ -198,3 +198,138 @@ fn a_missing_block_file_names_the_path() {
         .expect("a missing block cannot be checked");
     assert!(err.to_string().contains("/no/such/block.wasm"), "{err}");
 }
+
+// -- execution --------------------------------------------------------------
+
+/// Compile a block that echoes its input with a field added, so a chain's
+/// stages can be told apart in the result.
+fn tagging_block(dir: &std::path::Path, name: &str, tag: &str) -> PathBuf {
+    let crate_dir = dir.join(name);
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/cuttlefish-sdk");
+
+    std::fs::write(
+        crate_dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n\
+             cuttlefish-sdk = {{ path = '{}' }}\nserde_json = \"1\"\n\n[workspace]\n",
+            sdk.display().to_string().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+
+    std::fs::write(
+        crate_dir.join("src/lib.rs"),
+        format!(
+            r#"use cuttlefish_sdk::{{export_block, Block, Command, Event}};
+
+#[derive(Default)]
+struct B;
+
+impl Block for B {{
+    fn start(&mut self, input: serde_json::Value) -> Command {{
+        let mut seen: Vec<String> = input
+            .get("seen")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        seen.push("{tag}".to_string());
+        Command::Done {{ result: serde_json::json!({{ "seen": seen }}) }}
+    }}
+    fn step(&mut self, _event: Event) -> Command {{
+        Command::Fail {{ code: "unexpected".into(), message: "no commands issued".into() }}
+    }}
+}}
+
+export_block!(B);
+"#
+        ),
+    )
+    .unwrap();
+
+    let status = std::process::Command::new(env!("CARGO"))
+        .current_dir(&crate_dir)
+        .args(["build", "--target", "wasm32-unknown-unknown"])
+        .status()
+        .expect("cargo should start");
+    assert!(status.success(), "building {name} failed");
+
+    crate_dir
+        .join("target/wasm32-unknown-unknown/debug")
+        .join(format!("{}.wasm", name.replace('-', "_")))
+}
+
+#[tokio::test]
+async fn a_pipeline_threads_each_result_into_the_next_block() {
+    use cuttlefish_host::{
+        caps::Capabilities,
+        infer::StubBackend,
+        runner::{run_job, JobSpec},
+    };
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let first = std::fs::read(tagging_block(dir.path(), "chain_one", "first")).unwrap();
+    let second = std::fs::read(tagging_block(dir.path(), "chain_two", "second")).unwrap();
+    let third = std::fs::read(tagging_block(dir.path(), "chain_three", "third")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        JobSpec {
+            stages: vec![first, second, third],
+            input: serde_json::json!({}),
+            caps: Capabilities::default(),
+        },
+        tx,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, cuttlefish_abi::JobStatus::Completed);
+    // Order is the whole meaning of a pipeline: each block saw the previous
+    // one's output, and they ran in the order written.
+    assert_eq!(
+        envelope.result.unwrap()["seen"],
+        serde_json::json!(["first", "second", "third"])
+    );
+}
+
+#[tokio::test]
+async fn a_failing_stage_ends_the_job_and_names_the_stage() {
+    use cuttlefish_host::{
+        caps::Capabilities,
+        infer::StubBackend,
+        runner::{run_job, JobSpec},
+    };
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let good = std::fs::read(tagging_block(dir.path(), "fail_one", "first")).unwrap();
+
+    // A later stage that is not wasm at all: it must fail, and the error must
+    // say *which* block, or a long pipeline turns debugging into a hunt.
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        JobSpec {
+            stages: vec![good, b"not wasm".to_vec()],
+            input: serde_json::json!({}),
+            caps: Capabilities::default(),
+        },
+        tx,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, cuttlefish_abi::JobStatus::Failed);
+    let message = envelope.error.unwrap().message;
+    assert!(
+        message.contains("block 2"),
+        "the failing stage must be named: {message}"
+    );
+    assert!(envelope.result.is_none());
+}

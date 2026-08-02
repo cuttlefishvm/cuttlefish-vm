@@ -44,8 +44,11 @@ pub enum JobEvent {
 
 /// Everything needed to run one job.
 pub struct JobSpec {
-    /// The compiled guest module.
-    pub module_bytes: Vec<u8>,
+    /// The pipeline's compiled blocks, in execution order.
+    ///
+    /// Each block's result becomes the next one's input. A single-block
+    /// pipeline is the ordinary case, so most jobs have one element here.
+    pub stages: Vec<Vec<u8>>,
     /// The job's input, handed to the guest's `init`.
     pub input: serde_json::Value,
     /// What this job is permitted to reach.
@@ -274,42 +277,136 @@ pub async fn run_job(
 
     // Dropped when this function returns, closing every file the job opened.
     // That job-scoped lifetime is what makes handles unforgeable across jobs.
+    //
+    // Shared across stages on purpose: a handle produced by one block — a
+    // rendered page, say — stays usable by the next. Confining it to one stage
+    // would make a pipeline strictly weaker than a single block that did the
+    // same work, while adding nothing, since the job boundary is what the
+    // security property rests on.
     let mut handles = Handles::default();
+
+    if job.stages.is_empty() {
+        usage.duration_ms = started.elapsed().as_millis() as u64;
+        return fail(
+            error_codes::SCHEMA_VALIDATION_FAILED,
+            "this job has no blocks to run",
+            usage,
+        );
+    }
+
+    let total = job.stages.len();
+    let mut value = job.input;
+
+    for (index, module_bytes) in job.stages.iter().enumerate() {
+        // Tell watchers which stage is running. A pipeline that stalls is much
+        // easier to diagnose when the stream says where.
+        if total > 1 {
+            let _ = events
+                .send(JobEvent::Progress(serde_json::json!({
+                    "stage": index + 1,
+                    "of": total,
+                })))
+                .await;
+        }
+
+        match run_stage(
+            &engine,
+            &backend,
+            module_bytes,
+            value,
+            &job.caps,
+            &mut handles,
+            &events,
+            &cancel,
+            &mut usage,
+            started,
+            index,
+        )
+        .await
+        {
+            Ok(result) => value = result,
+            Err(envelope) => return envelope,
+        }
+    }
+
+    usage.duration_ms = started.elapsed().as_millis() as u64;
+    Envelope {
+        status: JobStatus::Completed,
+        result: Some(value),
+        error: None,
+        usage,
+    }
+}
+
+/// Run one block to completion, returning what it produced.
+///
+/// `Err` carries a finished [`Envelope`]: a stage that fails ends the whole job,
+/// because a later stage's input is the earlier one's output and there is
+/// nothing sensible to feed it.
+#[allow(clippy::too_many_arguments)]
+async fn run_stage(
+    engine: &Engine,
+    backend: &Arc<dyn InferBackend>,
+    module_bytes: &[u8],
+    input: serde_json::Value,
+    caps: &Capabilities,
+    handles: &mut Handles,
+    events: &mpsc::Sender<JobEvent>,
+    cancel: &CancellationToken,
+    usage: &mut Usage,
+    started: Instant,
+    stage_index: usize,
+) -> Result<serde_json::Value, Envelope> {
+    // Naming the stage turns "the job failed" into "the second block failed",
+    // which is the difference between a usable error and a hunt.
+    let blame = |message: String| -> String {
+        if stage_index == 0 {
+            message
+        } else {
+            format!("block {} of the pipeline: {message}", stage_index + 1)
+        }
+    };
     // Documents are read from their path rather than their descriptor — both
     // extraction and rendering want a file. Kept beside the handle table so the
     // two are dropped together at the end of the job.
     let mut doc_paths: std::collections::HashMap<u32, std::path::PathBuf> =
         std::collections::HashMap::new();
 
-    let mut guest = match Guest::new(&engine, &job.module_bytes) {
+    let mut guest = match Guest::new(engine, module_bytes) {
         Ok(g) => g,
-        Err(e) => return fail(error_codes::WASM_TRAP, e.to_string(), usage),
+        Err(e) => {
+            return Err(fail(
+                error_codes::WASM_TRAP,
+                blame(e.to_string()),
+                usage.clone(),
+            ))
+        }
     };
 
-    let mut command = match guest.call_init(&job.input) {
+    let mut command = match guest.call_init(&input) {
         Ok(c) => c,
-        Err(e) => return fail(error_codes::WASM_TRAP, e.to_string(), usage),
+        Err(e) => {
+            return Err(fail(
+                error_codes::WASM_TRAP,
+                blame(e.to_string()),
+                usage.clone(),
+            ))
+        }
     };
 
     loop {
         if cancel.is_cancelled() {
             usage.duration_ms = started.elapsed().as_millis() as u64;
-            return cancelled(usage, "job cancelled");
+            return Err(cancelled(usage.clone(), "job cancelled"));
         }
 
         let event = match command {
-            Command::Done { result } => {
-                usage.duration_ms = started.elapsed().as_millis() as u64;
-                return Envelope {
-                    status: JobStatus::Completed,
-                    result: Some(result),
-                    error: None,
-                    usage,
-                };
-            }
+            // Ends this stage, not the job: the value becomes the next
+            // block's input, or the job's result if this was the last.
+            Command::Done { result } => return Ok(result),
             Command::Fail { code, message } => {
                 usage.duration_ms = started.elapsed().as_millis() as u64;
-                return fail(&code, message, usage);
+                return Err(fail(&code, blame(message), usage.clone()));
             }
             Command::Emit { progress } => {
                 let _ = events.send(JobEvent::Progress(progress)).await;
@@ -321,13 +418,13 @@ pub async fn run_job(
             // there is no second place a path can enter the system.
             Command::Open { path } => {
                 let p = std::path::PathBuf::from(&path);
-                if !job.caps.allows_read(&p) {
+                if !caps.allows_read(&p) {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(
+                    return Err(fail(
                         error_codes::CAPABILITY_DENIED,
                         format!("read not permitted: {path}"),
-                        usage,
-                    );
+                        usage.clone(),
+                    ));
                 }
                 match handles.open(&p) {
                     Ok((handle, len, kind)) => {
@@ -355,7 +452,11 @@ pub async fn run_job(
                     }
                     Err(e) => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
-                        return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
+                        return Err(fail(
+                            error_codes::CAPABILITY_DENIED,
+                            e.to_string(),
+                            usage.clone(),
+                        ));
                     }
                 }
             }
@@ -371,7 +472,11 @@ pub async fn run_job(
                 },
                 Err(e) => {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
+                    return Err(fail(
+                        error_codes::CAPABILITY_DENIED,
+                        e.to_string(),
+                        usage.clone(),
+                    ));
                 }
             },
 
@@ -389,24 +494,28 @@ pub async fn run_job(
                 }
                 Err(e) => {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
+                    return Err(fail(
+                        error_codes::CAPABILITY_DENIED,
+                        e.to_string(),
+                        usage.clone(),
+                    ));
                 }
             },
 
             Command::PageText { handle, page } => {
                 let Some(path) = doc_paths.get(&handle).cloned() else {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(
+                    return Err(fail(
                         error_codes::CAPABILITY_DENIED,
                         format!("no such handle: {handle}"),
-                        usage,
-                    );
+                        usage.clone(),
+                    ));
                 };
                 match crate::documents::page_text(&path, page) {
                     Ok(text) => Event::PageTexted { text },
                     Err(e) => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
-                        return fail(error_codes::UNSUPPORTED, e.to_string(), usage);
+                        return Err(fail(error_codes::UNSUPPORTED, e.to_string(), usage.clone()));
                     }
                 }
             }
@@ -414,11 +523,11 @@ pub async fn run_job(
             Command::PageImage { handle, page } => {
                 let Some(path) = doc_paths.get(&handle).cloned() else {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(
+                    return Err(fail(
                         error_codes::CAPABILITY_DENIED,
                         format!("no such handle: {handle}"),
-                        usage,
-                    );
+                        usage.clone(),
+                    ));
                 };
                 // A rendered page becomes a handle like any other, so it can be
                 // named in Infer exactly as a file-backed image would be.
@@ -434,7 +543,7 @@ pub async fn run_job(
                     }
                     Err(e) => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
-                        return fail(error_codes::UNSUPPORTED, e.to_string(), usage);
+                        return Err(fail(error_codes::UNSUPPORTED, e.to_string(), usage.clone()));
                     }
                 }
             }
@@ -452,7 +561,7 @@ pub async fn run_job(
                 // and the caller has no way to tell the difference.
                 if !images.is_empty() && !backend.supports_images() {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(
+                    return Err(fail(
                         error_codes::UNSUPPORTED,
                         format!(
                             "this job supplied {} image(s), but the backend serving `{}` cannot \
@@ -461,8 +570,8 @@ pub async fn run_job(
                             images.len(),
                             backend.model_name()
                         ),
-                        usage,
-                    );
+                        usage.clone(),
+                    ));
                 }
                 let mut image_bytes = Vec::with_capacity(images.len());
                 for handle in &images {
@@ -470,7 +579,11 @@ pub async fn run_job(
                         Ok(bytes) => image_bytes.push(bytes),
                         Err(e) => {
                             usage.duration_ms = started.elapsed().as_millis() as u64;
-                            return fail(error_codes::CAPABILITY_DENIED, e.to_string(), usage);
+                            return Err(fail(
+                                error_codes::CAPABILITY_DENIED,
+                                e.to_string(),
+                                usage.clone(),
+                            ));
                         }
                     }
                 }
@@ -518,7 +631,7 @@ pub async fn run_job(
 
                 if let Some(message) = trap {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(error_codes::WASM_TRAP, message, usage);
+                    return Err(fail(error_codes::WASM_TRAP, message, usage.clone()));
                 }
 
                 // Tokens generated in the same poll as the last one are still
@@ -530,11 +643,15 @@ pub async fn run_job(
                 match outcome {
                     None => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
-                        return cancelled(usage, "cancelled during inference");
+                        return Err(cancelled(usage.clone(), "cancelled during inference"));
                     }
                     Some(Err(e)) => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
-                        return fail(error_codes::MODEL_LOAD_FAILED, e.to_string(), usage);
+                        return Err(fail(
+                            error_codes::MODEL_LOAD_FAILED,
+                            e.to_string(),
+                            usage.clone(),
+                        ));
                     }
                     Some(Ok(r)) => {
                         usage.tokens_in += r.tokens_in;
@@ -552,7 +669,11 @@ pub async fn run_job(
             Ok(c) => c,
             Err(e) => {
                 usage.duration_ms = started.elapsed().as_millis() as u64;
-                return fail(error_codes::WASM_TRAP, e.to_string(), usage);
+                return Err(fail(
+                    error_codes::WASM_TRAP,
+                    blame(e.to_string()),
+                    usage.clone(),
+                ));
             }
         };
     }

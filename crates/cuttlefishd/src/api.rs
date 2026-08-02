@@ -38,8 +38,8 @@ pub struct AppState {
     pub jobs: JobStore,
     /// The one spec this daemon serves. A registry of many arrives later.
     pub spec: Arc<Spec>,
-    /// The compiled block implementing that spec.
-    pub module_bytes: Arc<Vec<u8>>,
+    /// The spec's compiled blocks, in execution order, already typechecked.
+    pub stages: Arc<Vec<Vec<u8>>>,
 }
 
 /// A job submission.
@@ -92,7 +92,7 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
     st.jobs.insert(Job::new(id.clone(), cancel.clone())).await;
 
     let job_spec = JobSpec {
-        module_bytes: (*st.module_bytes).clone(),
+        stages: (*st.stages).clone(),
         input: req.input,
         caps: Capabilities::new(st.spec.read_roots.clone()),
     };

@@ -240,3 +240,98 @@ fn an_empty_pipeline_is_rejected() {
     let src = SAMPLE.replace(r#"block = "../blocks/echo-summarize";"#, "pipeline = [ ];");
     assert!(parse_spec(&src).is_err());
 }
+
+// -- things the old character-splitting parser got wrong --------------------
+
+#[test]
+fn a_semicolon_inside_a_description_is_just_text() {
+    // The bug that motivated a real lexer. Descriptions are prose, so they
+    // contain semicolons routinely; splitting statements on `;` cut this in
+    // half and blamed the description for not being a quoted string.
+    let src = SAMPLE.replace(
+        r#"description = "Use when the agent needs a summary of a local file.";"#,
+        r#"description = "Use when summarizing; especially long files.";"#,
+    );
+    let spec = parse_spec(&src).expect("a semicolon in prose must parse");
+    assert_eq!(
+        spec.description,
+        "Use when summarizing; especially long files."
+    );
+}
+
+#[test]
+fn a_comma_inside_a_path_is_just_text() {
+    // Same failure, different separator: capability lists split on `,`.
+    let src = SAMPLE.replace(r#"Read "./docs""#, r#"Read "./my,docs""#);
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(spec.read_roots, vec![PathBuf::from("./my,docs")]);
+}
+
+#[test]
+fn braces_and_brackets_inside_strings_do_not_confuse_the_parser() {
+    let src = SAMPLE.replace(
+        r#"description = "Use when the agent needs a summary of a local file.";"#,
+        r#"description = "Use when the input looks like { a: [1] }.";"#,
+    );
+    let spec = parse_spec(&src).unwrap();
+    assert!(
+        spec.description.contains("{ a: [1] }"),
+        "{}",
+        spec.description
+    );
+}
+
+#[test]
+fn escapes_are_resolved() {
+    let src = SAMPLE.replace(
+        r#"description = "Use when the agent needs a summary of a local file.";"#,
+        r#"description = "Say \"hello\"\nthen stop.";"#,
+    );
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(spec.description, "Say \"hello\"\nthen stop.");
+}
+
+#[test]
+fn comments_are_ignored() {
+    let src = format!("# what this job is for\n{SAMPLE}\n# trailing note\n");
+    let spec = parse_spec(&src).expect("comments must not break parsing");
+    assert_eq!(spec.name, "summarize_docs");
+}
+
+#[test]
+fn a_trailing_semicolon_is_optional() {
+    let src = SAMPLE.replace(
+        r#"block = "../blocks/echo-summarize";"#,
+        r#"block = "../blocks/echo-summarize""#,
+    );
+    assert!(parse_spec(&src).is_ok());
+}
+
+#[test]
+fn an_unterminated_string_is_reported_with_a_position() {
+    // "malformed spec" with no location is a poor error for a hand-edited file.
+    let src = SAMPLE.replace(
+        r#""../blocks/echo-summarize";"#,
+        r#""../blocks/echo-summarize;"#,
+    );
+    let err = parse_spec(&src).unwrap_err().to_string();
+    assert!(err.contains("unterminated"), "{err}");
+    assert!(err.contains("line"), "the error should say where: {err}");
+}
+
+#[test]
+fn a_syntax_error_says_what_was_expected_and_where() {
+    let src = SAMPLE.replace("data_policy = Local_only;", "data_policy Local_only;");
+    let err = parse_spec(&src).unwrap_err().to_string();
+    assert!(err.contains("expected `=`"), "{err}");
+    assert!(err.contains("line"), "{err}");
+}
+
+#[test]
+fn an_unknown_escape_is_rejected_rather_than_silently_kept() {
+    let src = SAMPLE.replace(
+        r#"description = "Use when the agent needs a summary of a local file.";"#,
+        r#"description = "a \q b";"#,
+    );
+    assert!(parse_spec(&src).is_err());
+}

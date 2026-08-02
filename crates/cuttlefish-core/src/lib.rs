@@ -9,4 +9,5 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod lex;
 pub mod spec;
