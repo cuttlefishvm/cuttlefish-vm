@@ -21,12 +21,13 @@
 //! documentation-lives-in-the-code convention).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 /// Current schema version of `index.json`'s own on-disk format — bumped only
 /// when the *shape* of the index changes, never tied to this crate's version.
+// Used starting in Task 6 (index read/write); unused until then.
+#[allow(dead_code)]
 const INDEX_VERSION: u32 = 1;
 
 /// Whether a cataloged artifact is a single wasm block or a multi-node bundle.
@@ -58,6 +59,8 @@ pub struct Entry {
 }
 
 /// The whole on-disk `index.json`.
+// Used starting in Task 6 (index read/write); unused until then.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexFile {
     version: u32,
@@ -65,6 +68,8 @@ struct IndexFile {
 }
 
 impl IndexFile {
+    // Used starting in Task 6 (index read/write); unused until then.
+    #[allow(dead_code)]
     fn empty() -> Self {
         Self {
             version: INDEX_VERSION,
