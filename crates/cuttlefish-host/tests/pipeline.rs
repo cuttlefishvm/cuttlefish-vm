@@ -10,6 +10,8 @@
 //! premise is that a signature comes from the artifact that will run. A mocked
 //! signature would test the checker against a fiction.
 
+mod support;
+
 use cuttlefish_host::pipeline::{check, PipelineError};
 use std::path::PathBuf;
 use wasmtime::Engine;
@@ -82,7 +84,7 @@ export_block!(B);
     )
     .unwrap();
 
-    let status = std::process::Command::new(env!("CARGO"))
+    let status = crate::support::clean_cargo(env!("CARGO"))
         .current_dir(&crate_dir)
         .args(["build", "--target", "wasm32-unknown-unknown"])
         .status()
@@ -248,7 +250,7 @@ export_block!(B);
     )
     .unwrap();
 
-    let status = std::process::Command::new(env!("CARGO"))
+    let status = crate::support::clean_cargo(env!("CARGO"))
         .current_dir(&crate_dir)
         .args(["build", "--target", "wasm32-unknown-unknown"])
         .status()
