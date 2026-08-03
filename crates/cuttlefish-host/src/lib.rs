@@ -41,6 +41,7 @@ pub mod backend;
 pub mod bundle;
 pub mod caps;
 pub mod catalog;
+pub mod dag;
 pub mod documents;
 pub mod handles;
 pub mod infer;
