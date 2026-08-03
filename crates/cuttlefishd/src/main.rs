@@ -54,6 +54,13 @@ async fn main() -> anyhow::Result<()> {
     // of any one job, so it should stop startup rather than fail every job
     // identically once traffic arrives.
     let engine = Arc::new(wasmtime::Engine::default());
+    // A home directory must be discoverable even for a pipeline made entirely
+    // of direct `.wasm` paths that will never touch the catalog — resolving
+    // it lazily, only for specs that turn out to need a catalog lookup, would
+    // save that requirement for a narrow case (no `$HOME`, no
+    // `CUTTLEFISH_HOME`) at the cost of a second, independent copy of
+    // `resolve_and_load`'s own Direct-vs-Cataloged decision here. Simpler and
+    // less fragile to require it upfront and let this fail loudly and early.
     let catalog_root = cuttlefish_host::catalog::default_root()
         .context("could not determine home directory; set CUTTLEFISH_HOME")?;
     let catalog = cuttlefish_host::catalog::Catalog::open(catalog_root);
