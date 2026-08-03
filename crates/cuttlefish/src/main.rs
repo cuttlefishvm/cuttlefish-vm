@@ -5,6 +5,10 @@
 //! a human can drive the same thing without writing a client, and so that
 //! anything awkward to do by hand shows up as awkward here too.
 //!
+//! `catalog` is the one exception: it's a purely local filesystem operation
+//! (see `cuttlefish_host::catalog`) with no daemon involved at all, since the
+//! block catalog is designed to work standalone.
+//!
 //! Exit status is the machine-readable result: `0` completed, `1` failed, `2`
 //! cancelled. A shell script or an agent can branch on that without parsing
 //! stdout, which stays pure JSON for the same reason.
@@ -60,6 +64,36 @@ mod cli {
             #[arg(long, default_value = "/tmp/cuttlefish.sock")]
             socket: PathBuf,
         },
+        /// Manage the local block catalog (~/.cuttlefish/catalog by default).
+        /// Purely local filesystem operations — no running daemon required.
+        Catalog {
+            #[command(subcommand)]
+            action: CatalogCmd,
+        },
+    }
+
+    /// `cuttlefish catalog` subcommands.
+    #[derive(Subcommand)]
+    enum CatalogCmd {
+        /// Catalog a wasm block or bundle under name@version.
+        Add {
+            /// The name@version to catalog it under.
+            name_version: String,
+            /// Path to the compiled .wasm block or .cfbundle to catalog.
+            path: PathBuf,
+        },
+        /// List everything in the catalog.
+        List,
+        /// Show one entry's cached signature.
+        Show {
+            /// The name@version to show.
+            name_version: String,
+        },
+        /// Remove an entry from the catalog (index only; the blob remains).
+        Rm {
+            /// The name@version to remove.
+            name_version: String,
+        },
     }
 
     /// Parse arguments and carry out the requested command.
@@ -71,6 +105,85 @@ mod cli {
                 spec,
                 input,
             } => run(&socket, &spec, &input).await,
+            Cmd::Catalog { action } => catalog_cmd(action),
+        }
+    }
+
+    /// Where the catalog lives when the caller doesn't say otherwise:
+    /// `$CUTTLEFISH_HOME/catalog` if set, else `~/.cuttlefish/catalog`.
+    fn default_catalog_root() -> PathBuf {
+        if let Ok(home) = std::env::var("CUTTLEFISH_HOME") {
+            return PathBuf::from(home).join("catalog");
+        }
+        let home = dirs::home_dir().unwrap_or_else(|| {
+            eprintln!("error: could not determine home directory; set CUTTLEFISH_HOME");
+            std::process::exit(1);
+        });
+        home.join(".cuttlefish").join("catalog")
+    }
+
+    fn catalog_cmd(action: CatalogCmd) -> anyhow::Result<()> {
+        use cuttlefish_host::catalog::Catalog;
+
+        let catalog = Catalog::open(default_catalog_root());
+
+        match action {
+            CatalogCmd::Add { name_version, path } => {
+                let engine = wasmtime::Engine::default();
+                match catalog.add(&name_version, &path, &engine) {
+                    Ok(outcome) => {
+                        println!(
+                            "catalogued {}  ({})",
+                            outcome.name_version, outcome.signature
+                        );
+                        if outcome.is_permissive_default {
+                            println!(
+                                "warning: {} did not declare a signature (no cf_signature export \
+                                 present) — cached as the permissive default, which means \
+                                 pipeline::check will accept it next to almost anything. Add a \
+                                 signature() impl (see cuttlefish-sdk's Block trait) if this block \
+                                 has a real input/output shape.",
+                                outcome.name_version
+                            );
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            CatalogCmd::List => {
+                for (name_version, entry) in catalog.list()? {
+                    println!("{name_version:<24}{}", entry.signature);
+                }
+                Ok(())
+            }
+            CatalogCmd::Show { name_version } => match catalog.show(&name_version) {
+                Ok(entry) => {
+                    println!("{name_version}");
+                    println!("  kind:      {:?}", entry.kind);
+                    println!("  signature: {}", entry.signature);
+                    println!("  hash:      {}", entry.hash);
+                    println!("  created:   {}", entry.created_at);
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            },
+            CatalogCmd::Rm { name_version } => match catalog.rm(&name_version) {
+                Ok(()) => {
+                    println!("removed {name_version}");
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            },
         }
     }
 
