@@ -15,25 +15,23 @@
 //! cancelled. A shell script or an agent can branch on that without parsing
 //! stdout, which stays pure JSON for the same reason.
 //!
-//! Unix-only for now, for the same reason as the daemon: it speaks to a unix
-//! domain socket, and `reqwest`'s `unix_socket` is `cfg(unix)`. Everything
-//! unix-specific lives in one gated module rather than being scattered through
-//! per-item `cfg` attributes, so a Windows build has no unused imports or dead
-//! types to warn about.
+//! The split between `cli` and `daemon` below is by *dependency*, not by
+//! convenience. `catalog` and `build` touch nothing but the filesystem, so
+//! they compile and run everywhere. Only `run` and `specs` need a unix domain
+//! socket (`reqwest`'s `unix_socket` is `cfg(unix)`), so only those are gated
+//! — and behind a module with a matching non-unix stub, so the dispatch in
+//! `cli::main` needs no `cfg` and neither platform grows unused imports or
+//! dead types.
+//!
+//! Argument parsing is deliberately *not* split: one `clap` derive covers
+//! every subcommand on every platform, so `--help` is honest everywhere and a
+//! daemon command off unix is a clean runtime error rather than a
+//! mysteriously missing subcommand.
 
-#[cfg(unix)]
 mod cli {
     use anyhow::{bail, Context};
     use clap::{Parser, Subcommand};
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
-
-    /// How long to wait between status polls.
-    ///
-    /// Short enough to feel immediate, long enough not to spin. The daemon also
-    /// offers a streaming endpoint; this polls because a result is retained, so
-    /// watching the stream is not required in order to observe one.
-    const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
     #[derive(Parser)]
     #[command(
@@ -111,12 +109,12 @@ mod cli {
     /// Parse arguments and carry out the requested command.
     pub async fn main() -> anyhow::Result<()> {
         match Cli::parse().command {
-            Cmd::Specs { socket } => specs(&socket).await,
+            Cmd::Specs { socket } => crate::daemon::specs(&socket).await,
             Cmd::Run {
                 socket,
                 spec,
                 input,
-            } => run(&socket, &spec, &input).await,
+            } => crate::daemon::run(&socket, &spec, &input).await,
             Cmd::Catalog { action } => catalog_cmd(action),
             Cmd::Build { spec, output } => build_cmd(&spec, output),
         }
@@ -243,6 +241,25 @@ mod cli {
         );
         Ok(())
     }
+}
+
+/// Talking to the daemon: unix only, because the transport is.
+///
+/// Paired with the non-unix stub below so `cli::main` dispatches without a
+/// single `cfg`, and so the unix-only imports and the poll interval do not
+/// exist at all on a platform that cannot use them.
+#[cfg(unix)]
+mod daemon {
+    use anyhow::{bail, Context};
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// How long to wait between status polls.
+    ///
+    /// Short enough to feel immediate, long enough not to spin. The daemon also
+    /// offers a streaming endpoint; this polls because a result is retained, so
+    /// watching the stream is not required in order to observe one.
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
     /// Build a client bound to a unix socket.
     ///
@@ -256,7 +273,7 @@ mod cli {
             .context("building the unix-socket client")
     }
 
-    async fn specs(socket: &Path) -> anyhow::Result<()> {
+    pub async fn specs(socket: &Path) -> anyhow::Result<()> {
         // The authority in these URLs is ignored — the socket decides where the
         // request goes — but reqwest still requires a syntactically valid URL.
         let body: serde_json::Value = client(socket)?
@@ -271,7 +288,7 @@ mod cli {
         Ok(())
     }
 
-    async fn run(socket: &Path, spec: &str, input: &str) -> anyhow::Result<()> {
+    pub async fn run(socket: &Path, spec: &str, input: &str) -> anyhow::Result<()> {
         let input: serde_json::Value =
             serde_json::from_str(input).context("--input must be JSON")?;
         let client = client(socket)?;
@@ -322,18 +339,34 @@ mod cli {
     }
 }
 
-#[cfg(unix)]
+/// The same surface as the unix `daemon` module, refusing instead of
+/// connecting.
+///
+/// The message names the two commands that are unavailable rather than the
+/// whole binary: `catalog` and `build` work fine here, and saying otherwise
+/// sent people looking for a build they did not need.
+#[cfg(not(unix))]
+mod daemon {
+    use std::path::Path;
+
+    fn unsupported(command: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "`cuttlefish {command}` talks to the daemon over a unix domain socket, \
+             which this platform does not have. `cuttlefish catalog` and \
+             `cuttlefish build` are purely local and work here."
+        )
+    }
+
+    pub async fn specs(_socket: &Path) -> anyhow::Result<()> {
+        Err(unsupported("specs"))
+    }
+
+    pub async fn run(_socket: &Path, _spec: &str, _input: &str) -> anyhow::Result<()> {
+        Err(unsupported("run"))
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     cli::main().await
-}
-
-#[cfg(not(unix))]
-fn main() {
-    eprintln!(
-        "cuttlefish talks to the daemon over a unix domain socket and does not \
-         run on this platform yet. The library crates are cross-platform; only \
-         the transport is unix-only."
-    );
-    std::process::exit(1);
 }
