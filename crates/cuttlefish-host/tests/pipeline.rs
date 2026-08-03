@@ -12,10 +12,28 @@
 
 mod support;
 
-use cuttlefish_host::pipeline::{check, PipelineError};
+use cuttlefish_host::catalog::ArtifactKind;
+use cuttlefish_host::pipeline::{check, PipelineError, ResolvedInput};
 use std::path::PathBuf;
 use support::block_with;
 use wasmtime::Engine;
+
+/// Load a compiled block straight from disk into a `ResolvedInput`, with no
+/// catalog involved — these tests are about seam-checking, not resolution
+/// (that's `resolve_and_load`, tested separately once it exists).
+fn direct(path: PathBuf) -> ResolvedInput {
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    ResolvedInput {
+        name,
+        kind: ArtifactKind::Block,
+        resolved: None,
+        bytes: std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display())),
+    }
+}
 
 #[test]
 fn a_pipeline_whose_seams_line_up_is_accepted() {
@@ -28,7 +46,8 @@ fn a_pipeline_whose_seams_line_up_is_accepted() {
         "{summary: text}",
     );
 
-    let checked = check(&Engine::default(), &[first, second]).expect("the seams line up");
+    let checked =
+        check(&Engine::default(), &[direct(first), direct(second)]).expect("the seams line up");
 
     assert_eq!(checked.stages().len(), 2);
     assert_eq!(checked.input().to_string(), "{path: text}");
@@ -43,7 +62,7 @@ fn a_mismatched_seam_is_rejected_naming_both_blocks_and_both_types() {
     let producer = block_with(dir.path(), "seam_bad_a", "{path: text}", "{summary: text}");
     let consumer = block_with(dir.path(), "seam_bad_b", "{chunks: [text]}", "{out: text}");
 
-    let err = check(&Engine::default(), &[producer, consumer])
+    let err = check(&Engine::default(), &[direct(producer), direct(consumer)])
         .err()
         .expect("a mismatched seam must be rejected");
 
@@ -69,7 +88,7 @@ fn a_producer_may_add_fields_its_consumer_does_not_need() {
     let wide = block_with(dir.path(), "wide_a", "{path: text}", "{a: text, b: text}");
     let narrow = block_with(dir.path(), "narrow_b", "{a: text}", "{out: text}");
 
-    assert!(check(&Engine::default(), &[wide, narrow]).is_ok());
+    assert!(check(&Engine::default(), &[direct(wide), direct(narrow)]).is_ok());
 }
 
 #[test]
@@ -80,7 +99,7 @@ fn a_json_seam_accepts_anything() {
     let typed = block_with(dir.path(), "json_a", "{path: text}", "{a: text}");
     let loose = block_with(dir.path(), "json_b", "json", "{out: text}");
 
-    assert!(check(&Engine::default(), &[typed, loose]).is_ok());
+    assert!(check(&Engine::default(), &[direct(typed), direct(loose)]).is_ok());
 }
 
 #[test]
@@ -91,7 +110,7 @@ fn a_specific_input_does_not_accept_json() {
     let loose = block_with(dir.path(), "rev_a", "{path: text}", "json");
     let typed = block_with(dir.path(), "rev_b", "{needed: text}", "{out: text}");
 
-    assert!(check(&Engine::default(), &[loose, typed]).is_err());
+    assert!(check(&Engine::default(), &[direct(loose), direct(typed)]).is_err());
 }
 
 #[test]
@@ -99,7 +118,8 @@ fn a_single_block_pipeline_is_fine() {
     let dir = tempfile::tempdir().unwrap();
     let only = block_with(dir.path(), "single_a", "{path: text}", "{summary: text}");
 
-    let checked = check(&Engine::default(), &[only]).expect("one block is a valid pipeline");
+    let checked =
+        check(&Engine::default(), &[direct(only)]).expect("one block is a valid pipeline");
     assert_eq!(checked.stages().len(), 1);
     // With one stage the pipeline's type is that stage's type.
     assert_eq!(checked.input().to_string(), "{path: text}");
@@ -112,14 +132,6 @@ fn an_empty_pipeline_is_rejected() {
         .err()
         .expect("nothing to run");
     assert!(matches!(err, PipelineError::Empty));
-}
-
-#[test]
-fn a_missing_block_file_names_the_path() {
-    let err = check(&Engine::default(), &[PathBuf::from("/no/such/block.wasm")])
-        .err()
-        .expect("a missing block cannot be checked");
-    assert!(err.to_string().contains("/no/such/block.wasm"), "{err}");
 }
 
 // -- execution --------------------------------------------------------------
