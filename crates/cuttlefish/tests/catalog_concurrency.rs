@@ -40,6 +40,19 @@ fn write_wasm(dir: &Path) -> PathBuf {
     path
 }
 
+/// Render a finished child's exit status with both streams. A bare
+/// `assertion failed: status.success()` says nothing about *why* the CLI
+/// refused, which is exactly what you need when the failure only reproduces
+/// on another platform's CI.
+fn describe(out: &std::process::Output) -> String {
+    format!(
+        "exit {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 fn list_lines(home: &Path) -> Vec<String> {
     let out = Command::new(CUTTLEFISH)
         .args(["catalog", "list"])
@@ -49,7 +62,7 @@ fn list_lines(home: &Path) -> Vec<String> {
     assert!(
         out.status.success(),
         "catalog list failed after contention: {}",
-        String::from_utf8_lossy(&out.stderr)
+        describe(&out)
     );
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -78,7 +91,11 @@ fn list_always_separates_the_name_column_from_the_signature() {
         let out = spawn_add(home.path(), &wasm, name)
             .wait_with_output()
             .unwrap();
-        assert!(out.status.success(), "{name} should catalog");
+        assert!(
+            out.status.success(),
+            "{name} should catalog: {}",
+            describe(&out)
+        );
     }
 
     for line in list_lines(home.path()) {
@@ -113,9 +130,8 @@ fn concurrent_add_processes_with_distinct_names_all_land() {
         let out = child.wait_with_output().unwrap();
         assert!(
             out.status.success(),
-            "concurrent add of stress-{i}@1 failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
+            "concurrent add of stress-{i}@1 failed: {}",
+            describe(&out)
         );
     }
 
@@ -212,7 +228,11 @@ fn a_lock_free_list_keeps_succeeding_while_writer_processes_are_active() {
     let seed = spawn_add(home.path(), &wasm, "seed@1")
         .wait_with_output()
         .unwrap();
-    assert!(seed.status.success());
+    assert!(
+        seed.status.success(),
+        "seeding the catalog must succeed: {}",
+        describe(&seed)
+    );
 
     let writers: Vec<_> = (0..WRITERS)
         .map(|i| spawn_add(home.path(), &wasm, &format!("w-{i}@1")))
@@ -229,10 +249,11 @@ fn a_lock_free_list_keeps_succeeding_while_writer_processes_are_active() {
                         .env("CUTTLEFISH_HOME", &home)
                         .output()
                         .expect("catalog list must run");
-                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
                     assert!(
                         out.status.success(),
-                        "a lock-free reader saw a bad index mid-write: {stderr}"
+                        "a lock-free reader saw a bad index mid-write: {}",
+                        describe(&out)
                     );
                     assert!(
                         !stderr.contains("corrupt"),
@@ -252,7 +273,7 @@ fn a_lock_free_list_keeps_succeeding_while_writer_processes_are_active() {
         assert!(
             out.status.success(),
             "writer w-{i}@1 failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            describe(&out)
         );
     }
     for r in readers {
