@@ -35,6 +35,30 @@ fn direct(path: PathBuf) -> ResolvedInput {
     }
 }
 
+/// Build a `ResolvedInput` straight from in-memory bytes with an explicit
+/// `kind`, for the `ArtifactKind::Bundle` arm of `check()` — unlike `direct`,
+/// there is no on-disk fixture to compile; the bytes are the whole fixture.
+fn direct_bytes(name: &str, kind: ArtifactKind, bytes: Vec<u8>) -> ResolvedInput {
+    ResolvedInput {
+        name: name.to_string(),
+        kind,
+        resolved: None,
+        bytes,
+    }
+}
+
+/// Build a minimal `.cfbundle` container: magic `b"CFBD"` + an 8-byte
+/// little-endian manifest length + the manifest JSON bytes. Mirrors the
+/// `make_bundle` fixture helper in `catalog.rs`'s own unit tests (the
+/// authoritative source for this container's byte layout) rather than
+/// reinventing the layout here.
+fn make_bundle(manifest_json: &[u8]) -> Vec<u8> {
+    let mut bytes = b"CFBD".to_vec();
+    bytes.extend_from_slice(&(manifest_json.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(manifest_json);
+    bytes
+}
+
 #[test]
 fn a_pipeline_whose_seams_line_up_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
@@ -124,6 +148,57 @@ fn a_single_block_pipeline_is_fine() {
     // With one stage the pipeline's type is that stage's type.
     assert_eq!(checked.input().to_string(), "{path: text}");
     assert_eq!(checked.output().to_string(), "{summary: text}");
+}
+
+#[test]
+fn a_bundle_stage_is_checked_from_its_cached_manifest_signature() {
+    // A bundle carries no wasm to inspect directly; its signature comes from
+    // the manifest JSON `read_bundle_signature` pulls out. This is the
+    // Bundle-arm counterpart of `a_pipeline_whose_seams_line_up_is_accepted`.
+    let bundle =
+        make_bundle(br#"{"nodes":[],"edges":[],"signature":"{path: text} -> {summary: text}"}"#);
+
+    let checked = check(
+        &Engine::default(),
+        &[direct_bytes("my_bundle", ArtifactKind::Bundle, bundle)],
+    )
+    .expect("a well-formed bundle manifest checks fine");
+
+    assert_eq!(checked.stages().len(), 1);
+    assert_eq!(checked.input().to_string(), "{path: text}");
+    assert_eq!(checked.output().to_string(), "{summary: text}");
+}
+
+#[test]
+fn an_uninspectable_bundle_names_the_stage_exactly_once() {
+    // `read_bundle_signature`'s own error already embeds the stage's name
+    // (it uses the name as the artifact's display path), so `check()`
+    // wrapping that error's *full* text into `Uninspectable`'s `{name}:
+    // {message}` would print the name twice: "inspecting my_bundle:
+    // my_bundle: shorter than the bundle header". The name must appear once.
+    let too_short = b"CFBD".to_vec(); // shorter than the 12-byte bundle header
+
+    let err = check(
+        &Engine::default(),
+        &[direct_bytes("my_bundle", ArtifactKind::Bundle, too_short)],
+    )
+    .err()
+    .expect("a truncated bundle header must be rejected");
+
+    assert!(
+        matches!(err, PipelineError::Uninspectable { .. }),
+        "{err:?}"
+    );
+    let msg = err.to_string();
+    assert_eq!(
+        msg.matches("my_bundle").count(),
+        1,
+        "the stage name must appear exactly once: {msg}"
+    );
+    assert!(
+        msg.contains("shorter than the bundle header"),
+        "the underlying reason must still be present: {msg}"
+    );
 }
 
 #[test]

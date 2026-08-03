@@ -159,7 +159,18 @@ pub fn check(engine: &Engine, inputs: &[ResolvedInput]) -> Result<Checked, Pipel
                 let compact = crate::catalog::read_bundle_signature(&input.bytes, &input.name)
                     .map_err(|e| PipelineError::Uninspectable {
                         name: input.name.clone(),
-                        message: e.to_string(),
+                        // `read_bundle_signature`'s own error already embeds
+                        // the name (it's `{path}: {reason}` with `path` set
+                        // to our `name`); re-stringifying the whole error
+                        // here would print the name twice. Pull out just the
+                        // reason so `Uninspectable`'s own `{name}: {message}`
+                        // formatting is the only place the name appears.
+                        message: match e {
+                            crate::catalog::CatalogError::UninspectableArtifact {
+                                reason, ..
+                            } => reason,
+                            other => other.to_string(),
+                        },
                     })?;
                 compact
                     .parse::<Signature>()
