@@ -365,8 +365,9 @@ fn read_bundle_signature(bytes: &[u8], path: &Path) -> Result<String, CatalogErr
 
     let manifest_len =
         u64::from_le_bytes(bytes[4..HEADER_LEN].try_into().expect("8 bytes")) as usize;
-    let manifest_bytes = bytes
-        .get(HEADER_LEN..HEADER_LEN + manifest_len)
+    let manifest_bytes = HEADER_LEN
+        .checked_add(manifest_len)
+        .and_then(|end| bytes.get(HEADER_LEN..end))
         .ok_or_else(|| CatalogError::UninspectableArtifact {
             path: path.to_path_buf(),
             reason: format!("manifest_len {manifest_len} exceeds the file's actual length"),
@@ -740,38 +741,70 @@ mod tests {
         let mut bundle = make_bundle(br#"{"nodes":[],"edges":[],"signature":"x -> x"}"#);
         bundle.truncate(bundle.len() - 5); // manifest_len now overshoots what's left
         let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
-        assert!(
-            matches!(err, CatalogError::UninspectableArtifact { .. }),
-            "{err:?}"
-        );
+        match err {
+            CatalogError::UninspectableArtifact { reason, .. } => assert!(
+                reason.contains("exceeds the file's actual length"),
+                "{reason}"
+            ),
+            other => panic!("expected UninspectableArtifact, got {other:?}"),
+        }
     }
 
     #[test]
     fn invalid_manifest_json_is_uninspectable() {
         let bundle = make_bundle(b"not valid json at all");
         let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
-        assert!(
-            matches!(err, CatalogError::UninspectableArtifact { .. }),
-            "{err:?}"
-        );
+        match err {
+            CatalogError::UninspectableArtifact { reason, .. } => {
+                assert!(reason.contains("not valid JSON"), "{reason}")
+            }
+            other => panic!("expected UninspectableArtifact, got {other:?}"),
+        }
     }
 
     #[test]
     fn a_manifest_missing_the_signature_field_is_uninspectable() {
         let bundle = make_bundle(br#"{"nodes":[],"edges":[]}"#);
         let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
-        assert!(
-            matches!(err, CatalogError::UninspectableArtifact { .. }),
-            "{err:?}"
-        );
+        match err {
+            CatalogError::UninspectableArtifact { reason, .. } => {
+                assert!(reason.contains("no string field"), "{reason}")
+            }
+            other => panic!("expected UninspectableArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_overflowing_manifest_len_is_uninspectable_not_a_panic() {
+        // manifest_len near u64::MAX must not panic when added to HEADER_LEN —
+        // regression test for the checked_add fix (a bare `+` here panics with
+        // "attempt to add with overflow" in debug builds, turning a crafted
+        // bundle file into a crash instead of a clean error).
+        let mut bytes = b"CFBD".to_vec();
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let err = read_bundle_signature(&bytes, Path::new("test.cfbundle")).unwrap_err();
+        match err {
+            CatalogError::UninspectableArtifact { reason, .. } => {
+                assert!(
+                    reason.contains("exceeds the file's actual length"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected UninspectableArtifact, got {other:?}"),
+        }
     }
 
     #[test]
     fn a_file_shorter_than_the_header_is_uninspectable() {
         let err = read_bundle_signature(b"CFBD", Path::new("test.cfbundle")).unwrap_err();
-        assert!(
-            matches!(err, CatalogError::UninspectableArtifact { .. }),
-            "{err:?}"
-        );
+        match err {
+            CatalogError::UninspectableArtifact { reason, .. } => {
+                assert!(
+                    reason.contains("shorter than the bundle header"),
+                    "{reason}"
+                )
+            }
+            other => panic!("expected UninspectableArtifact, got {other:?}"),
+        }
     }
 }
