@@ -299,6 +299,46 @@ async fn cancel_is_accepted_and_the_job_still_reaches_a_terminal_state() {
 }
 
 #[tokio::test]
+async fn a_bare_catalog_name_resolves_through_the_same_path_main_rs_uses() {
+    // `main.rs` builds a `Catalog` at `catalog::default_root()`, then resolves
+    // every `spec.pipeline` entry with `pipeline::resolve_and_load(&catalog,
+    // spec_dir, entry, ResolutionContext::Interactive)` before handing the
+    // results to `pipeline::check`. `start()` above builds `AppState`
+    // directly and never exercises that resolution step, so it can't prove a
+    // bare catalog name (no `@version`, no path separators) actually works —
+    // this test calls the exact same two functions, in the exact same order,
+    // against a real `Catalog` on a real tempdir, confirmed by reading
+    // `main.rs`'s resolution block after this task's edit.
+    use cuttlefish_host::catalog::{Catalog, ResolutionContext};
+    use cuttlefish_host::pipeline::{check, resolve_and_load};
+
+    let catalog_dir = tempfile::tempdir().unwrap();
+    let spec_dir = tempfile::tempdir().unwrap();
+    let engine = wasmtime::Engine::default();
+
+    let wasm_path = spec_dir.path().join("echo-summarize.wasm");
+    std::fs::write(&wasm_path, example_block()).unwrap();
+
+    let catalog = Catalog::open(catalog_dir.path());
+    catalog
+        .add("echo-summarize@1", &wasm_path, &engine)
+        .expect("cataloging the compiled example block should succeed");
+
+    let resolved = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        "echo-summarize",
+        ResolutionContext::Interactive,
+    )
+    .expect("a bare name with no @version should resolve to the latest catalog entry");
+    assert_eq!(resolved.resolved.as_deref(), Some("echo-summarize@1"));
+
+    let checked =
+        check(&engine, &[resolved]).expect("the resolved single-stage pipeline should typecheck");
+    assert_eq!(checked.stages().len(), 1);
+}
+
+#[tokio::test]
 async fn specs_are_discoverable() {
     // The harness discovery endpoint: an agent reads this to decide whether a
     // job belongs here at all.

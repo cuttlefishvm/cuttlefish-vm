@@ -212,10 +212,33 @@ pub enum CatalogError {
     /// anything).
     #[error("{path}: {reason}")]
     UninspectableArtifact {
-        /// The path that was handed to `add`.
+        /// The path that was handed to `add`, or a synthetic label standing
+        /// in for one — `read_bundle_signature` takes a `label: &str` that
+        /// need not be a real filesystem path. `add` always passes a real
+        /// on-disk path, but `pipeline::check` calls it with a stage's
+        /// display name, which for a `Cataloged` stage (built by
+        /// `pipeline::resolve_and_load` from a bare catalog name, not a
+        /// filesystem path) is just that bare name.
         path: PathBuf,
         /// What went wrong reading past the magic bytes.
         reason: String,
+    },
+    /// An entry's `hash` came back from `index.json` in a shape that isn't a
+    /// well-formed sha256 digest (64 lowercase hex digits, optionally
+    /// prefixed with `sha256:`) — the exact shape `write_blob` always
+    /// produces. `index.json` is never format-validated on read, so a
+    /// hand-edited or maliciously crafted index could otherwise smuggle
+    /// `../` traversal or an absolute path into a filesystem join; this is
+    /// the guard that rejects it before that ever happens. Distinct from
+    /// `CorruptIndex` (that's `index.json` failing to *parse* as JSON at
+    /// all; this is JSON that parses fine but whose `hash` field is
+    /// nonsense).
+    #[error(
+        "catalog entry has a malformed hash {hash:?}: expected sha256:<64 lowercase hex digits>"
+    )]
+    MalformedHash {
+        /// The invalid hash value, exactly as found in the entry.
+        hash: String,
     },
     /// Underlying I/O failure — a plain failure to open/read/write a path,
     /// before any catalog-specific logic ever inspects the bytes.
@@ -293,13 +316,21 @@ fn pick_did_you_mean(target_name: &str, entries: &BTreeMap<String, Entry>) -> Ve
 }
 
 const WASM_MAGIC: &[u8] = b"\0asm";
-const BUNDLE_MAGIC: &[u8] = b"CFBD";
+/// The one source of truth for the `.cfbundle` container's magic bytes —
+/// shared with `bundle::build` (the writer) so the two can never drift
+/// apart the way `manifest_len`'s endianness once had to be pinned down
+/// after the fact.
+pub(crate) const BUNDLE_MAGIC: &[u8; 4] = b"CFBD";
+/// `.cfbundle`'s fixed header size: `BUNDLE_MAGIC` (4 bytes) + `manifest_len`
+/// as a little-endian `u64` (8 bytes). Shared with `bundle::build`, which
+/// writes exactly this many bytes before the manifest.
+pub(crate) const BUNDLE_HEADER_LEN: usize = BUNDLE_MAGIC.len() + 8;
 
 /// Identify an artifact by its magic bytes, never by file extension — the
 /// same "classify by content" rule `handles::classify` already applies to
 /// input files. `None` means neither magic matched; the caller turns that
 /// into `CatalogError::UnrecognizedArtifact`, naming the path.
-fn sniff_artifact_kind(bytes: &[u8]) -> Option<ArtifactKind> {
+pub(crate) fn sniff_artifact_kind(bytes: &[u8]) -> Option<ArtifactKind> {
     if bytes.starts_with(WASM_MAGIC) {
         Some(ArtifactKind::Block)
     } else if bytes.starts_with(BUNDLE_MAGIC) {
@@ -390,6 +421,19 @@ fn blobs_dir(root: &Path) -> PathBuf {
     root.join("blobs")
 }
 
+/// Whether `hex` is exactly 64 lowercase hex digits — the exact shape
+/// `write_blob` always produces via `format!("{:x}", Sha256::digest(bytes))`.
+/// This is the sole guard between an `Entry`'s `hash` field (read straight
+/// out of `index.json`, never format-validated elsewhere) and a filesystem
+/// path: without it, a hash like `../../../etc/passwd` or an absolute path
+/// would `Path::join` straight through to arbitrary files outside `blobs/`.
+fn is_well_formed_sha256_hex(hex: &str) -> bool {
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Read just enough of a `.cfbundle` container (magic already confirmed by
 /// the caller) to recover its cached `signature` field — never touching the
 /// stage blobs that follow the manifest, since the catalog only ever needs
@@ -401,39 +445,72 @@ fn blobs_dir(root: &Path) -> PathBuf {
 /// than left ambiguous a second time: whoever implements `cuttlefish build`
 /// (which doesn't exist as code yet) must write `manifest_len` little-endian
 /// to match what this reader expects, not native-endian.
-fn read_bundle_signature(bytes: &[u8], path: &Path) -> Result<String, CatalogError> {
-    const HEADER_LEN: usize = 4 + 8; // b"CFBD" + manifest_len as u64 LE
-
-    if bytes.len() < HEADER_LEN {
+pub(crate) fn read_bundle_signature(bytes: &[u8], label: &str) -> Result<String, CatalogError> {
+    if bytes.len() < BUNDLE_HEADER_LEN {
         return Err(CatalogError::UninspectableArtifact {
-            path: path.to_path_buf(),
+            path: PathBuf::from(label),
             reason: "shorter than the bundle header".to_string(),
         });
     }
 
     let manifest_len =
-        u64::from_le_bytes(bytes[4..HEADER_LEN].try_into().expect("8 bytes")) as usize;
-    let manifest_bytes = HEADER_LEN
+        u64::from_le_bytes(bytes[4..BUNDLE_HEADER_LEN].try_into().expect("8 bytes")) as usize;
+    let manifest_bytes = BUNDLE_HEADER_LEN
         .checked_add(manifest_len)
-        .and_then(|end| bytes.get(HEADER_LEN..end))
+        .and_then(|end| bytes.get(BUNDLE_HEADER_LEN..end))
         .ok_or_else(|| CatalogError::UninspectableArtifact {
-            path: path.to_path_buf(),
+            path: PathBuf::from(label),
             reason: format!("manifest_len {manifest_len} exceeds the file's actual length"),
         })?;
 
     let manifest: serde_json::Value = serde_json::from_slice(manifest_bytes).map_err(|e| {
         CatalogError::UninspectableArtifact {
-            path: path.to_path_buf(),
+            path: PathBuf::from(label),
             reason: format!("manifest is not valid JSON: {e}"),
         }
     })?;
+
+    // A node whose offset+len falls outside the stage-bytes region that
+    // actually follows the manifest is structurally impossible — it can
+    // only come from a hand-crafted or corrupt bundle, since `bundle::build`
+    // always writes offsets that fit. Reject it now, at the one point every
+    // bundle (this crate's own output or someone else's) passes through
+    // before being embedded in something else or cataloged, rather than
+    // leaving it to be discovered later as an out-of-bounds read once
+    // nested-subjobs actually executes a node.
+    if let Some(nodes) = manifest.get("nodes").and_then(|v| v.as_array()) {
+        let body_len = (bytes.len() - BUNDLE_HEADER_LEN - manifest_len) as u64;
+        for node in nodes {
+            let bounds = node
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .zip(node.get("len").and_then(|v| v.as_u64()));
+            let in_bounds = match bounds {
+                Some((offset, len)) => offset.checked_add(len).is_some_and(|end| end <= body_len),
+                None => false,
+            };
+            if !in_bounds {
+                return Err(CatalogError::UninspectableArtifact {
+                    path: PathBuf::from(label),
+                    reason: format!(
+                        "a node's offset/len ({:?}) doesn't fit within the bundle's \
+                         {body_len}-byte stage-bytes region",
+                        (
+                            node.get("offset").and_then(|v| v.as_u64()),
+                            node.get("len").and_then(|v| v.as_u64())
+                        )
+                    ),
+                });
+            }
+        }
+    }
 
     manifest
         .get("signature")
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| CatalogError::UninspectableArtifact {
-            path: path.to_path_buf(),
+            path: PathBuf::from(label),
             reason: "manifest has no string field \"signature\"".to_string(),
         })
 }
@@ -570,10 +647,10 @@ impl Catalog {
                     output: cuttlefish_abi::Ty::Json,
                 };
                 let is_permissive = sig == permissive;
-                (format!("{} -> {}", sig.input, sig.output), is_permissive)
+                (sig.to_string(), is_permissive)
             }
             ArtifactKind::Bundle => {
-                let sig = read_bundle_signature(&bytes, artifact_path)?;
+                let sig = read_bundle_signature(&bytes, &artifact_path.to_string_lossy())?;
                 (sig, false)
             }
         };
@@ -643,6 +720,20 @@ impl Catalog {
         })
     }
 
+    /// Read an entry's raw bytes back out of the blob store. The catalog's
+    /// only way to get from an `Entry` to actual artifact bytes — `blobs/`
+    /// stays an implementation detail, same as `add()` already hides
+    /// `write_blob`.
+    pub fn read_blob(&self, entry: &Entry) -> Result<Vec<u8>, CatalogError> {
+        let hex = entry.hash.strip_prefix("sha256:").unwrap_or(&entry.hash);
+        if !is_well_formed_sha256_hex(hex) {
+            return Err(CatalogError::MalformedHash {
+                hash: entry.hash.clone(),
+            });
+        }
+        Ok(fs::read(blobs_dir(&self.root).join(hex))?)
+    }
+
     /// Remove a `name@version` from the index. The blob it pointed at is left on
     /// disk — no garbage collection in v1 (an orphaned blob is wasted space, not
     /// a correctness problem; see the design doc).
@@ -666,11 +757,20 @@ impl Catalog {
     }
 
     /// Resolve one pipeline entry string per the catalog spec's three-step
-    /// algorithm: direct path/`.wasm` first, then an exact catalog lookup if
-    /// `@version` is present, then latest-by-`created_at` if it's not and
-    /// `context` allows an unqualified name.
+    /// algorithm: direct path/`.wasm`/`.cfbundle` first, then an exact
+    /// catalog lookup if `@version` is present, then latest-by-`created_at`
+    /// if it's not and `context` allows an unqualified name.
+    ///
+    /// A compiled-artifact suffix (`.wasm` or `.cfbundle`) is always treated
+    /// as Direct, even when nothing actually exists at that path — a
+    /// genuinely missing artifact should fail with a clear "no such file",
+    /// not be silently reinterpreted as a catalog name that happens to
+    /// contain a `.` in it. Both suffixes get identical treatment here:
+    /// `pipeline::resolve_and_load`'s own decision to prefer a joined path
+    /// for one of these suffixes (even before checking existence) is only
+    /// correct if this function honors the same suffixes the same way.
     pub fn resolve(&self, s: &str, context: ResolutionContext) -> Result<Resolved, CatalogError> {
-        if s.ends_with(".wasm") || Path::new(s).exists() {
+        if s.ends_with(".wasm") || s.ends_with(".cfbundle") || Path::new(s).exists() {
             return Ok(Resolved::Direct(PathBuf::from(s)));
         }
 
@@ -719,6 +819,18 @@ impl Catalog {
     }
 }
 
+/// Where the catalog lives when the caller doesn't say otherwise:
+/// `$CUTTLEFISH_HOME/catalog` if set, else `~/.cuttlefish/catalog`. `None`
+/// when neither is available — this library never exits the process on a
+/// caller's behalf, so reporting that is the caller's job (both `cuttlefish`
+/// and `cuttlefishd` already have their own error-reporting convention).
+pub fn default_root() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("CUTTLEFISH_HOME") {
+        return Some(PathBuf::from(home).join("catalog"));
+    }
+    dirs::home_dir().map(|home| home.join(".cuttlefish").join("catalog"))
+}
+
 /// The current UTC time, truncated to whole seconds and formatted as RFC
 /// 3339 (`2026-08-02T18:03:00Z`). Truncating avoids variable-width fractional
 /// seconds, so `created_at` strings sort correctly with plain string
@@ -741,6 +853,19 @@ mod tests {
     /// Enough threads to genuinely contend for the index lock on any machine
     /// this runs on, without making the test slow.
     const WRITERS: usize = 16;
+
+    #[test]
+    fn default_root_honors_cuttlefish_home() {
+        // No other test in this process mutates CUTTLEFISH_HOME, and
+        // catalog.rs's own tests never read it — set/remove is confined to
+        // this one test. (This toolchain's std::env::set_var/remove_var are
+        // safe fns, not unsafe — the crate forbids unsafe_code entirely, so
+        // an unsafe wrapper isn't an option regardless.)
+        std::env::set_var("CUTTLEFISH_HOME", "/tmp/cf-test-home");
+        let root = default_root();
+        std::env::remove_var("CUTTLEFISH_HOME");
+        assert_eq!(root, Some(PathBuf::from("/tmp/cf-test-home/catalog")));
+    }
 
     #[test]
     fn index_file_serializes_to_the_shape_the_spec_documents() {
@@ -1266,7 +1391,7 @@ mod tests {
         let bundle = make_bundle(
             br#"{"nodes":[],"edges":[],"signature":"{path: text} -> {summary: text}"}"#,
         );
-        let sig = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap();
+        let sig = read_bundle_signature(&bundle, "test.cfbundle").unwrap();
         assert_eq!(sig, "{path: text} -> {summary: text}");
     }
 
@@ -1274,7 +1399,7 @@ mod tests {
     fn a_manifest_len_exceeding_the_actual_bytes_is_uninspectable() {
         let mut bundle = make_bundle(br#"{"nodes":[],"edges":[],"signature":"x -> x"}"#);
         bundle.truncate(bundle.len() - 5); // manifest_len now overshoots what's left
-        let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
+        let err = read_bundle_signature(&bundle, "test.cfbundle").unwrap_err();
         match err {
             CatalogError::UninspectableArtifact { reason, .. } => assert!(
                 reason.contains("exceeds the file's actual length"),
@@ -1287,7 +1412,7 @@ mod tests {
     #[test]
     fn invalid_manifest_json_is_uninspectable() {
         let bundle = make_bundle(b"not valid json at all");
-        let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
+        let err = read_bundle_signature(&bundle, "test.cfbundle").unwrap_err();
         match err {
             CatalogError::UninspectableArtifact { reason, .. } => {
                 assert!(reason.contains("not valid JSON"), "{reason}")
@@ -1299,7 +1424,7 @@ mod tests {
     #[test]
     fn a_manifest_missing_the_signature_field_is_uninspectable() {
         let bundle = make_bundle(br#"{"nodes":[],"edges":[]}"#);
-        let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
+        let err = read_bundle_signature(&bundle, "test.cfbundle").unwrap_err();
         match err {
             CatalogError::UninspectableArtifact { reason, .. } => {
                 assert!(reason.contains("no string field"), "{reason}")
@@ -1309,14 +1434,65 @@ mod tests {
     }
 
     #[test]
+    fn a_node_whose_offset_and_len_overflow_the_stage_bytes_is_uninspectable() {
+        // No stage bytes follow the manifest at all here, so any non-zero
+        // offset/len is already out of bounds — exactly the "internally
+        // impossible node table" shape a hand-crafted or corrupt bundle
+        // could smuggle past a check that only ever reads the `signature`
+        // field.
+        let bundle = make_bundle(
+            br#"{"nodes":[{"name":"bad","kind":"block","resolved":null,
+                 "signature":"json -> json","offset":99999,"len":99999}],
+                 "signature":"json -> json"}"#,
+        );
+        let err = read_bundle_signature(&bundle, "test.cfbundle").unwrap_err();
+        match err {
+            CatalogError::UninspectableArtifact { reason, .. } => {
+                assert!(reason.contains("doesn't fit"), "{reason}")
+            }
+            other => panic!("expected UninspectableArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_node_whose_offset_and_len_exactly_fit_the_stage_bytes_is_fine() {
+        let mut bundle = make_bundle(
+            br#"{"nodes":[{"name":"ok","kind":"block","resolved":null,
+                 "signature":"json -> json","offset":0,"len":3}],
+                 "signature":"json -> json"}"#,
+        );
+        bundle.extend_from_slice(b"abc");
+        let sig = read_bundle_signature(&bundle, "test.cfbundle").unwrap();
+        assert_eq!(sig, "json -> json");
+    }
+
+    #[test]
+    fn an_overflowing_node_offset_plus_len_is_uninspectable_not_a_panic() {
+        // Regression-shaped like the manifest_len overflow fix elsewhere in
+        // this file: offset + len must not panic on overflow, it must
+        // report a clean error.
+        let bundle = make_bundle(
+            format!(
+                r#"{{"nodes":[{{"name":"bad","kind":"block","resolved":null,
+                     "signature":"json -> json","offset":{},"len":10}}],
+                     "signature":"json -> json"}}"#,
+                u64::MAX
+            )
+            .as_bytes(),
+        );
+        let err = read_bundle_signature(&bundle, "test.cfbundle").unwrap_err();
+        assert!(matches!(err, CatalogError::UninspectableArtifact { .. }));
+    }
+
+    #[test]
     fn an_overflowing_manifest_len_is_uninspectable_not_a_panic() {
-        // manifest_len near u64::MAX must not panic when added to HEADER_LEN —
+        // manifest_len near u64::MAX must not panic when added to BUNDLE_HEADER_LEN —
         // regression test for the checked_add fix (a bare `+` here panics with
         // "attempt to add with overflow" in debug builds, turning a crafted
         // bundle file into a crash instead of a clean error).
         let mut bytes = b"CFBD".to_vec();
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-        let err = read_bundle_signature(&bytes, Path::new("test.cfbundle")).unwrap_err();
+        let err = read_bundle_signature(&bytes, "test.cfbundle").unwrap_err();
         match err {
             CatalogError::UninspectableArtifact { reason, .. } => {
                 assert!(
@@ -1330,7 +1506,7 @@ mod tests {
 
     #[test]
     fn a_file_shorter_than_the_header_is_uninspectable() {
-        let err = read_bundle_signature(b"CFBD", Path::new("test.cfbundle")).unwrap_err();
+        let err = read_bundle_signature(b"CFBD", "test.cfbundle").unwrap_err();
         match err {
             CatalogError::UninspectableArtifact { reason, .. } => {
                 assert!(
@@ -1774,6 +1950,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_a_dot_cfbundle_suffix_is_direct_even_if_the_file_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let resolved = catalog
+            .resolve(
+                "/nonexistent/bundle.cfbundle",
+                ResolutionContext::Interactive,
+            )
+            .unwrap();
+        assert!(matches!(resolved, Resolved::Direct(_)));
+    }
+
+    #[test]
     fn resolve_an_existing_filesystem_path_is_direct_no_catalog_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let real_file = tempfile::NamedTempFile::new().unwrap();
@@ -1859,5 +2048,85 @@ mod tests {
             panic!("expected NotFound, got {err:?}")
         };
         assert_eq!(did_you_mean, &vec!["summarize@1".to_string()]);
+    }
+
+    #[test]
+    fn read_blob_returns_what_add_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let engine = wasmtime::Engine::default();
+        let wasm = wat::parse_str("(module)").unwrap();
+        let path = dir.path().join("m.wasm");
+        std::fs::write(&path, &wasm).unwrap();
+
+        let outcome = catalog.add("m@1", &path, &engine).unwrap();
+        let entry = catalog.show("m@1").unwrap();
+
+        let bytes = catalog.read_blob(&entry).unwrap();
+        assert_eq!(bytes, wasm);
+        assert_eq!(outcome.name_version, "m@1");
+    }
+
+    #[test]
+    fn read_blob_on_a_hand_edited_missing_hash_errors_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let fake = Entry {
+            hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            ..entry_fixture("2026-01-01T00:00:00Z")
+        };
+        let err = catalog.read_blob(&fake).unwrap_err();
+        match err {
+            CatalogError::Io(ref io_err) => {
+                assert_eq!(
+                    io_err.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "a well-formed hash with no matching blob file must surface as a plain \
+                     not-found I/O error: {err:?}"
+                );
+            }
+            other => {
+                panic!("a well-formed but absent hash must be a plain Io(NotFound), not {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn read_blob_rejects_a_path_traversal_hash_instead_of_touching_the_filesystem() {
+        // A hand-edited (or maliciously crafted) index.json is never
+        // format-validated on read anywhere else in this module — read_blob
+        // is the last line of defense before a hash string becomes a
+        // filesystem path. A well-formed sha256 digest is always exactly 64
+        // lowercase hex digits (see write_blob's `format!("{:x}", ...)`), so
+        // anything else — especially `../` traversal or an absolute path —
+        // must be rejected before Path::join ever sees it.
+        let dir = tempfile::tempdir().unwrap();
+        // Plant a marker file outside blobs/ that a traversal would reach if
+        // the guard were missing.
+        std::fs::write(dir.path().join("outside.txt"), b"do not leak this").unwrap();
+
+        let catalog = Catalog::open(dir.path());
+        let traversal = Entry {
+            hash: "sha256:../outside.txt".to_string(),
+            ..entry_fixture("2026-01-01T00:00:00Z")
+        };
+        let err = catalog.read_blob(&traversal).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::MalformedHash { .. }),
+            "a path-traversal hash must be rejected as MalformedHash before any path is \
+             constructed, got {err:?}"
+        );
+
+        let absolute = Entry {
+            hash: "sha256:/etc/passwd".to_string(),
+            ..entry_fixture("2026-01-01T00:00:00Z")
+        };
+        let err = catalog.read_blob(&absolute).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::MalformedHash { .. }),
+            "an absolute-path-like hash must be rejected as MalformedHash before any path is \
+             constructed, got {err:?}"
+        );
     }
 }

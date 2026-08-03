@@ -222,12 +222,37 @@ fn split_fields(body: &str) -> Vec<String> {
 /// and nothing forces anyone to notice; a declaration compiled into the module
 /// travels with it, cannot go stale, and leaves one artifact to ship rather than
 /// two to keep in step.
+///
+/// `Display`/`FromStr` render and parse it as `"{input} -> {output}"` —
+/// each side is a [`Ty`], and this is the compact form the catalog caches
+/// and a bundle manifest embeds. Splitting on `" -> "` is unambiguous only
+/// because `Ty::describe()` never produces that substring itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
     /// What the block needs as input.
     pub input: Ty,
     /// What it produces.
     pub output: Ty,
+}
+
+impl std::fmt::Display for Signature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} -> {}", self.input, self.output)
+    }
+}
+
+impl std::str::FromStr for Signature {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (input, output) = s
+            .split_once(" -> ")
+            .ok_or_else(|| format!("`{s}` is not a signature (expected `input -> output`)"))?;
+        Ok(Signature {
+            input: input.parse()?,
+            output: output.parse()?,
+        })
+    }
 }
 
 /// What kind of thing a handle refers to, reported by [`Event::Opened`].
@@ -573,5 +598,31 @@ impl Default for MediaKind {
     /// assumed, and because it keeps an older block's behaviour unchanged.
     fn default() -> Self {
         Self::Text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_signature_round_trips_through_its_compact_string() {
+        let sig = Signature {
+            input: Ty::Record([("path".to_string(), Ty::Text)].into_iter().collect()),
+            output: Ty::List(Box::new(Ty::Text)),
+        };
+        let s = sig.to_string();
+        assert_eq!(s, "{path: text} -> [text]");
+        assert_eq!(s.parse::<Signature>().unwrap(), sig);
+    }
+
+    #[test]
+    fn a_signature_without_an_arrow_is_rejected() {
+        assert!("just-a-type".parse::<Signature>().is_err());
+    }
+
+    #[test]
+    fn a_signature_with_an_unparseable_side_is_rejected() {
+        assert!("text -> not a type".parse::<Signature>().is_err());
     }
 }

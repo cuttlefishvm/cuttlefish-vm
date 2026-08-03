@@ -12,10 +12,52 @@
 
 mod support;
 
-use cuttlefish_host::pipeline::{check, PipelineError};
+use cuttlefish_host::catalog::{ArtifactKind, Catalog, ResolutionContext};
+use cuttlefish_host::pipeline::{check, resolve_and_load, PipelineError, ResolvedInput};
 use std::path::PathBuf;
 use support::block_with;
 use wasmtime::Engine;
+
+/// Load a compiled block straight from disk into a `ResolvedInput`, with no
+/// catalog involved — these tests are about seam-checking, not resolution
+/// (that's `resolve_and_load`, tested separately once it exists).
+fn direct(path: PathBuf) -> ResolvedInput {
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    ResolvedInput {
+        name,
+        kind: ArtifactKind::Block,
+        resolved: None,
+        bytes: std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display())),
+    }
+}
+
+/// Build a `ResolvedInput` straight from in-memory bytes with an explicit
+/// `kind`, for the `ArtifactKind::Bundle` arm of `check()` — unlike `direct`,
+/// there is no on-disk fixture to compile; the bytes are the whole fixture.
+fn direct_bytes(name: &str, kind: ArtifactKind, bytes: Vec<u8>) -> ResolvedInput {
+    ResolvedInput {
+        name: name.to_string(),
+        kind,
+        resolved: None,
+        bytes,
+    }
+}
+
+/// Build a minimal `.cfbundle` container: magic `b"CFBD"` + an 8-byte
+/// little-endian manifest length + the manifest JSON bytes. Mirrors the
+/// `make_bundle` fixture helper in `catalog.rs`'s own unit tests (the
+/// authoritative source for this container's byte layout) rather than
+/// reinventing the layout here.
+fn make_bundle(manifest_json: &[u8]) -> Vec<u8> {
+    let mut bytes = b"CFBD".to_vec();
+    bytes.extend_from_slice(&(manifest_json.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(manifest_json);
+    bytes
+}
 
 #[test]
 fn a_pipeline_whose_seams_line_up_is_accepted() {
@@ -28,7 +70,8 @@ fn a_pipeline_whose_seams_line_up_is_accepted() {
         "{summary: text}",
     );
 
-    let checked = check(&Engine::default(), &[first, second]).expect("the seams line up");
+    let checked =
+        check(&Engine::default(), &[direct(first), direct(second)]).expect("the seams line up");
 
     assert_eq!(checked.stages().len(), 2);
     assert_eq!(checked.input().to_string(), "{path: text}");
@@ -43,7 +86,7 @@ fn a_mismatched_seam_is_rejected_naming_both_blocks_and_both_types() {
     let producer = block_with(dir.path(), "seam_bad_a", "{path: text}", "{summary: text}");
     let consumer = block_with(dir.path(), "seam_bad_b", "{chunks: [text]}", "{out: text}");
 
-    let err = check(&Engine::default(), &[producer, consumer])
+    let err = check(&Engine::default(), &[direct(producer), direct(consumer)])
         .err()
         .expect("a mismatched seam must be rejected");
 
@@ -69,7 +112,7 @@ fn a_producer_may_add_fields_its_consumer_does_not_need() {
     let wide = block_with(dir.path(), "wide_a", "{path: text}", "{a: text, b: text}");
     let narrow = block_with(dir.path(), "narrow_b", "{a: text}", "{out: text}");
 
-    assert!(check(&Engine::default(), &[wide, narrow]).is_ok());
+    assert!(check(&Engine::default(), &[direct(wide), direct(narrow)]).is_ok());
 }
 
 #[test]
@@ -80,7 +123,7 @@ fn a_json_seam_accepts_anything() {
     let typed = block_with(dir.path(), "json_a", "{path: text}", "{a: text}");
     let loose = block_with(dir.path(), "json_b", "json", "{out: text}");
 
-    assert!(check(&Engine::default(), &[typed, loose]).is_ok());
+    assert!(check(&Engine::default(), &[direct(typed), direct(loose)]).is_ok());
 }
 
 #[test]
@@ -91,7 +134,7 @@ fn a_specific_input_does_not_accept_json() {
     let loose = block_with(dir.path(), "rev_a", "{path: text}", "json");
     let typed = block_with(dir.path(), "rev_b", "{needed: text}", "{out: text}");
 
-    assert!(check(&Engine::default(), &[loose, typed]).is_err());
+    assert!(check(&Engine::default(), &[direct(loose), direct(typed)]).is_err());
 }
 
 #[test]
@@ -99,11 +142,63 @@ fn a_single_block_pipeline_is_fine() {
     let dir = tempfile::tempdir().unwrap();
     let only = block_with(dir.path(), "single_a", "{path: text}", "{summary: text}");
 
-    let checked = check(&Engine::default(), &[only]).expect("one block is a valid pipeline");
+    let checked =
+        check(&Engine::default(), &[direct(only)]).expect("one block is a valid pipeline");
     assert_eq!(checked.stages().len(), 1);
     // With one stage the pipeline's type is that stage's type.
     assert_eq!(checked.input().to_string(), "{path: text}");
     assert_eq!(checked.output().to_string(), "{summary: text}");
+}
+
+#[test]
+fn a_bundle_stage_is_checked_from_its_cached_manifest_signature() {
+    // A bundle carries no wasm to inspect directly; its signature comes from
+    // the manifest JSON `read_bundle_signature` pulls out. This is the
+    // Bundle-arm counterpart of `a_pipeline_whose_seams_line_up_is_accepted`.
+    let bundle =
+        make_bundle(br#"{"nodes":[],"edges":[],"signature":"{path: text} -> {summary: text}"}"#);
+
+    let checked = check(
+        &Engine::default(),
+        &[direct_bytes("my_bundle", ArtifactKind::Bundle, bundle)],
+    )
+    .expect("a well-formed bundle manifest checks fine");
+
+    assert_eq!(checked.stages().len(), 1);
+    assert_eq!(checked.input().to_string(), "{path: text}");
+    assert_eq!(checked.output().to_string(), "{summary: text}");
+}
+
+#[test]
+fn an_uninspectable_bundle_names_the_stage_exactly_once() {
+    // `read_bundle_signature`'s own error already embeds the stage's name
+    // (it uses the name as the artifact's display path), so `check()`
+    // wrapping that error's *full* text into `Uninspectable`'s `{name}:
+    // {message}` would print the name twice: "inspecting my_bundle:
+    // my_bundle: shorter than the bundle header". The name must appear once.
+    let too_short = b"CFBD".to_vec(); // shorter than the 12-byte bundle header
+
+    let err = check(
+        &Engine::default(),
+        &[direct_bytes("my_bundle", ArtifactKind::Bundle, too_short)],
+    )
+    .err()
+    .expect("a truncated bundle header must be rejected");
+
+    assert!(
+        matches!(err, PipelineError::Uninspectable { .. }),
+        "{err:?}"
+    );
+    let msg = err.to_string();
+    assert_eq!(
+        msg.matches("my_bundle").count(),
+        1,
+        "the stage name must appear exactly once: {msg}"
+    );
+    assert!(
+        msg.contains("shorter than the bundle header"),
+        "the underlying reason must still be present: {msg}"
+    );
 }
 
 #[test]
@@ -112,14 +207,6 @@ fn an_empty_pipeline_is_rejected() {
         .err()
         .expect("nothing to run");
     assert!(matches!(err, PipelineError::Empty));
-}
-
-#[test]
-fn a_missing_block_file_names_the_path() {
-    let err = check(&Engine::default(), &[PathBuf::from("/no/such/block.wasm")])
-        .err()
-        .expect("a missing block cannot be checked");
-    assert!(err.to_string().contains("/no/such/block.wasm"), "{err}");
 }
 
 // -- execution --------------------------------------------------------------
@@ -255,4 +342,138 @@ async fn a_failing_stage_ends_the_job_and_names_the_stage() {
         "the failing stage must be named: {message}"
     );
     assert!(envelope.result.is_none());
+}
+
+// -- resolve_and_load ---------------------------------------------------------
+
+#[test]
+fn a_relative_direct_entry_resolves_against_spec_dir_not_cwd() {
+    let spec_dir = tempfile::tempdir().unwrap();
+    let wasm = block_with(spec_dir.path(), "rel_a", "text", "text");
+    // The entry as it would appear in a spec file: relative to the spec,
+    // not to wherever `cuttlefish` happens to be run from.
+    let relative_entry = "rel_a/target/wasm32-unknown-unknown/debug/rel_a.wasm".to_string();
+    let catalog = Catalog::open(spec_dir.path().join("unused-catalog"));
+
+    let resolved = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        &relative_entry,
+        ResolutionContext::Interactive,
+    )
+    .unwrap();
+
+    assert_eq!(resolved.bytes, std::fs::read(&wasm).unwrap());
+    assert_eq!(resolved.resolved, None);
+}
+
+#[test]
+fn a_bare_catalog_name_is_not_joined_against_spec_dir() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let catalog_dir = tempfile::tempdir().unwrap();
+    let wasm = block_with(src_dir.path(), "cat_a", "text", "text");
+    let catalog = Catalog::open(catalog_dir.path());
+    catalog.add("cat-a@1", &wasm, &Engine::default()).unwrap();
+
+    // spec_dir deliberately does not contain anything named "cat-a@1" — if
+    // the join were applied unconditionally this would fail to resolve.
+    let empty_spec_dir = tempfile::tempdir().unwrap();
+    let resolved = resolve_and_load(
+        &catalog,
+        empty_spec_dir.path(),
+        "cat-a@1",
+        ResolutionContext::Interactive,
+    )
+    .unwrap();
+
+    assert_eq!(resolved.resolved, Some("cat-a@1".to_string()));
+    assert_eq!(resolved.bytes, std::fs::read(&wasm).unwrap());
+}
+
+#[test]
+fn a_dotted_catalog_name_still_resolves_through_the_catalog_not_a_join() {
+    // Regression test: `resolve_and_load` used to decide whether to join an
+    // entry against `spec_dir` from the entry's *shape* alone, which could
+    // corrupt a catalog name that merely looked path-like into a bogus path
+    // before `catalog.resolve` ever got a chance to look it up. A catalog
+    // name may legally contain `.` (only `/` is rejected, by
+    // `validate_name_version`'s character-class check), so a name like
+    // "team.cat-a" is exactly the kind of not-quite-a-filename string this
+    // must still resolve correctly, via the catalog's own index lookup
+    // rather than a filesystem join.
+    let src_dir = tempfile::tempdir().unwrap();
+    let catalog_dir = tempfile::tempdir().unwrap();
+    let wasm = block_with(src_dir.path(), "team_cat_a", "text", "text");
+    let catalog = Catalog::open(catalog_dir.path());
+    catalog
+        .add("team.cat-a@1", &wasm, &Engine::default())
+        .unwrap();
+
+    // spec_dir deliberately has nothing at "team.cat-a@1" — if the entry
+    // were joined against it regardless, there'd be no file there and the
+    // bug would be masked rather than reproduced.
+    let empty_spec_dir = tempfile::tempdir().unwrap();
+    let resolved = resolve_and_load(
+        &catalog,
+        empty_spec_dir.path(),
+        "team.cat-a@1",
+        ResolutionContext::Interactive,
+    )
+    .unwrap();
+
+    assert_eq!(resolved.resolved, Some("team.cat-a@1".to_string()));
+    assert_eq!(resolved.bytes, std::fs::read(&wasm).unwrap());
+}
+
+#[test]
+fn an_unqualified_name_in_durable_context_is_rejected() {
+    let catalog_dir = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(catalog_dir.path());
+    let spec_dir = tempfile::tempdir().unwrap();
+
+    let err = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        "no-version",
+        ResolutionContext::Durable,
+    )
+    .unwrap_err();
+    assert!(matches!(err, PipelineError::Resolution(_)));
+}
+
+#[test]
+fn a_source_directory_is_rejected_with_a_friendly_message() {
+    let spec_dir = tempfile::tempdir().unwrap();
+    let block_src_dir = spec_dir.path().join("some-block-src");
+    std::fs::create_dir(&block_src_dir).unwrap();
+    let catalog = Catalog::open(spec_dir.path().join("unused-catalog"));
+
+    // Must contain a `/` so `resolve_and_load`'s own `looks_path_like` rule
+    // joins it against `spec_dir` — a bare `"some-block-src"` (no slash, no
+    // .wasm/.cfbundle suffix) is treated as a catalog name instead and would
+    // return NotFound, not the directory message this test checks for.
+    let err = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        "./some-block-src",
+        ResolutionContext::Interactive,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("directory"), "{msg}");
+}
+
+#[test]
+fn a_missing_direct_path_names_the_path() {
+    let spec_dir = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(spec_dir.path().join("unused-catalog"));
+
+    let err = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        "no/such/block.wasm",
+        ResolutionContext::Interactive,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("block.wasm"), "{err}");
 }
