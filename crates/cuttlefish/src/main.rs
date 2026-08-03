@@ -187,6 +187,20 @@ mod cli {
             .with_context(|| format!("parsing {}", spec_path.display()))?;
         let spec_dir = spec_path.parent().unwrap_or_else(|| Path::new("."));
 
+        let out_path = output.unwrap_or_else(|| spec_path.with_extension("cfbundle"));
+        // Checked before any seam-checking output is printed: a spec that
+        // already ends in `.cfbundle` (or an explicit `-o` pointing back at
+        // it) would otherwise have its own source overwritten with the build
+        // output. `out_path` can't be the same already-existing file as
+        // `spec_path` unless `canonicalize` resolves both to it, since a
+        // not-yet-existing `out_path` cannot be the file we just read.
+        if std::fs::canonicalize(&out_path).ok() == std::fs::canonicalize(spec_path).ok() {
+            bail!(
+                "refusing to build: output path {} is the same file as the spec being built",
+                out_path.display()
+            );
+        }
+
         let catalog_root = cuttlefish_host::catalog::default_root()
             .context("could not determine home directory; set CUTTLEFISH_HOME")?;
         let catalog = cuttlefish_host::catalog::Catalog::open(catalog_root);
@@ -217,20 +231,6 @@ mod cli {
         }
 
         let bytes = cuttlefish_host::bundle::build(&checked);
-        let out_path = output.unwrap_or_else(|| spec_path.with_extension("cfbundle"));
-
-        // A spec that already ends in `.cfbundle` (or an explicit `-o`
-        // pointing back at it) would otherwise have its own source
-        // overwritten with the build output — `out_path` can't be the same
-        // already-existing file as `spec_path` unless `canonicalize`
-        // resolves both to it, since a not-yet-existing `out_path` cannot be
-        // the file we just read.
-        if std::fs::canonicalize(&out_path).ok() == std::fs::canonicalize(spec_path).ok() {
-            bail!(
-                "refusing to build: output path {} is the same file as the spec being built",
-                out_path.display()
-            );
-        }
         std::fs::write(&out_path, &bytes)
             .with_context(|| format!("writing {}", out_path.display()))?;
 
