@@ -64,6 +64,17 @@ pub struct Entry {
 struct IndexFile {
     version: u32,
     entries: BTreeMap<String, Entry>,
+    /// `name@version` -> the hash it was published with, for versions that
+    /// have since been removed. Keeps `rm` from being a way to launder a
+    /// republish: the identity stays claimed by its original content even
+    /// after the entry is gone.
+    ///
+    /// `default` rather than an `INDEX_VERSION` bump on purpose — an index
+    /// written before this field existed is a perfectly good version-1 index
+    /// with nothing retired, and bumping the version would make every
+    /// already-written catalog report itself as corrupt.
+    #[serde(default)]
+    retired: BTreeMap<String, String>,
 }
 
 impl IndexFile {
@@ -71,8 +82,56 @@ impl IndexFile {
         Self {
             version: INDEX_VERSION,
             entries: BTreeMap::new(),
+            retired: BTreeMap::new(),
         }
     }
+}
+
+/// Characters legal in either half of a `name@version`. Deliberately narrow:
+/// a catalog identifier is a key people type and scripts interpolate, so
+/// whitespace and path separators earn nothing and invite confusion between
+/// an identifier and a filesystem path.
+fn is_legal_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+/// Check that `s` is a well-formed `name@version` before it can be written
+/// into the index.
+///
+/// This guards the write path only. `show`/`rm`/`resolve` stay permissive so
+/// that a key already in an index — hand-edited, or written before this check
+/// existed — remains inspectable and removable rather than stranded.
+fn validate_name_version(s: &str) -> Result<(), CatalogError> {
+    let invalid = |reason: String| CatalogError::InvalidNameVersion {
+        name_version: s.to_string(),
+        reason,
+    };
+
+    let separators = s.matches('@').count();
+    if separators != 1 {
+        return Err(invalid(match separators {
+            0 => "expected <name>@<version>, e.g. echo-summarize@1".to_string(),
+            n => format!("found {n} '@' separators"),
+        }));
+    }
+
+    let (name, version) = s.split_once('@').expect("exactly one '@' is present");
+    if name.is_empty() {
+        return Err(invalid("the name is empty".to_string()));
+    }
+    if version.is_empty() {
+        return Err(invalid("the version is empty".to_string()));
+    }
+
+    for (half, label) in [(name, "name"), (version, "version")] {
+        if let Some(bad) = half.chars().find(|c| !is_legal_identifier_char(*c)) {
+            return Err(invalid(format!(
+                "the {label} contains {bad:?}; only letters, digits, '.', '-' and '_' are allowed"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Something went wrong reading, writing, or resolving through the catalog.
@@ -83,6 +142,30 @@ pub enum CatalogError {
     AlreadyExists {
         /// The name@version that was already present.
         name_version: String,
+    },
+    /// The identifier handed to `add` is not a well-formed `name@version`.
+    #[error("{name_version:?} is not a name@version ({reason})")]
+    InvalidNameVersion {
+        /// The identifier that was rejected.
+        name_version: String,
+        /// Why it was rejected, as a sentence fragment.
+        reason: String,
+    },
+    /// `name@version` was published, then removed, and is now being re-added
+    /// with different content. Removing an entry drops it from the index but
+    /// does not un-publish the identity, so this is still the immutability
+    /// violation `AlreadyExists` guards against — just spread over two steps.
+    #[error(
+        "{name_version} was previously catalogued with different content; versions are \
+         immutable once published ({previous_hash} -> {new_hash})"
+    )]
+    RetiredWithDifferentContent {
+        /// The name@version being re-added.
+        name_version: String,
+        /// The hash it was published with originally.
+        previous_hash: String,
+        /// The hash of the artifact now being offered.
+        new_hash: String,
     },
     /// No entry matches the requested `name@version`.
     #[error(
@@ -465,6 +548,8 @@ impl Catalog {
         artifact_path: &Path,
         engine: &wasmtime::Engine,
     ) -> Result<AddOutcome, CatalogError> {
+        validate_name_version(name_version)?;
+
         let bytes = fs::read(artifact_path)?;
         let kind =
             sniff_artifact_kind(&bytes).ok_or_else(|| CatalogError::UnrecognizedArtifact {
@@ -502,6 +587,20 @@ impl Catalog {
                 return Err(CatalogError::AlreadyExists {
                     name_version: name_version.clone(),
                 });
+            }
+            // A removed version keeps its claim on the identity. Re-adding the
+            // exact bytes it was published with is an undo of the `rm`;
+            // re-adding anything else is a republish, which is the thing
+            // immutability exists to forbid.
+            if let Some(previous_hash) = index.retired.get(&name_version) {
+                if previous_hash != &hash {
+                    return Err(CatalogError::RetiredWithDifferentContent {
+                        name_version: name_version.clone(),
+                        previous_hash: previous_hash.clone(),
+                        new_hash: hash.clone(),
+                    });
+                }
+                index.retired.remove(&name_version);
             }
             index.entries.insert(
                 name_version.clone(),
@@ -549,7 +648,12 @@ impl Catalog {
     /// a correctness problem; see the design doc).
     pub fn rm(&self, name_version: &str) -> Result<(), CatalogError> {
         with_locked_index(&self.root, |index| {
-            if index.entries.remove(name_version).is_some() {
+            if let Some(entry) = index.entries.remove(name_version) {
+                // Record what this identity was published as, so a later
+                // `add` can tell an undo from a republish.
+                index
+                    .retired
+                    .insert(name_version.to_string(), entry.hash.clone());
                 Ok(())
             } else {
                 let name = name_version.split('@').next().unwrap_or(name_version);
@@ -653,6 +757,7 @@ mod tests {
         let index = IndexFile {
             version: INDEX_VERSION,
             entries,
+            retired: BTreeMap::new(),
         };
 
         let json = serde_json::to_string(&index).expect("IndexFile always serializes");
@@ -1405,6 +1510,196 @@ mod tests {
             panic!("expected NotFound, got {err:?}")
         };
         assert_eq!(did_you_mean, &vec!["summarize@1".to_string()]);
+    }
+
+    /// Write a valid, signature-less wasm block whose bytes vary with
+    /// `body_marker`, so two calls can produce artifacts that are both valid
+    /// and genuinely different content.
+    fn distinct_wasm(dir: &Path, name: &str, body_marker: u32) -> PathBuf {
+        let path = dir.join(format!("{name}.wasm"));
+        std::fs::write(
+            &path,
+            wat::parse_str(format!(
+                r#"(module (memory (export "memory") 1) (func (export "marker") (result i32) i32.const {body_marker}))"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn an_identifier_with_no_at_version_is_rejected_rather_than_catalogued_under_a_typo() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+
+        let err = Catalog::open(catalog_dir.path())
+            .add("echo-summarize", &wasm, &wasmtime::Engine::default())
+            .expect_err("dropping @version is a typo, not a name meaning itself");
+
+        assert!(
+            matches!(err, CatalogError::InvalidNameVersion { .. }),
+            "{err:?}"
+        );
+        assert!(
+            Catalog::open(catalog_dir.path()).list().unwrap().is_empty(),
+            "a rejected identifier must not leave an entry behind"
+        );
+    }
+
+    #[test]
+    fn an_identifier_with_an_empty_name_or_version_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+
+        for bad in ["@1", "name@", "", "   "] {
+            let err = catalog
+                .add(bad, &wasm, &engine)
+                .expect_err("an empty name or version is not a name@version");
+            assert!(
+                matches!(err, CatalogError::InvalidNameVersion { .. }),
+                "{bad:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identifier_with_more_than_one_at_separator_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+
+        let err = Catalog::open(catalog_dir.path())
+            .add("a@b@c", &wasm, &wasmtime::Engine::default())
+            .expect_err("two '@' separators is not a name@version");
+        assert!(
+            matches!(err, CatalogError::InvalidNameVersion { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_identifier_containing_path_or_whitespace_characters_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+
+        for bad in ["../../etc/passwd@1", "with space@1", "name@../../tmp/pwn"] {
+            let err = catalog
+                .add(bad, &wasm, &engine)
+                .expect_err("{bad} must be rejected");
+            assert!(
+                matches!(err, CatalogError::InvalidNameVersion { .. }),
+                "{bad:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_name_at_version_still_catalogs() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+
+        Catalog::open(catalog_dir.path())
+            .add(
+                "echo-summarize@1.2.3-rc.1",
+                &wasm,
+                &wasmtime::Engine::default(),
+            )
+            .expect("letters, digits, '.', '-' and '_' are all legal");
+    }
+
+    /// Validation guards the *write* path only. An index that already holds a
+    /// junk key (written before this check existed, or hand-edited) must stay
+    /// removable, or the fix would strand entries nothing can clean up.
+    #[test]
+    fn a_pre_existing_junk_identifier_can_still_be_shown_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "no-at-sign", "2026-01-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+
+        catalog
+            .show("no-at-sign")
+            .expect("an already-stored key must remain inspectable");
+        catalog
+            .rm("no-at-sign")
+            .expect("an already-stored key must remain removable");
+    }
+
+    #[test]
+    fn re_adding_a_removed_version_with_the_same_bytes_is_allowed() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "same", 7);
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+
+        catalog.add("thing@1", &wasm, &engine).unwrap();
+        catalog.rm("thing@1").unwrap();
+        catalog
+            .add("thing@1", &wasm, &engine)
+            .expect("re-adding identical bytes is an undo of the rm, not a rewrite of history");
+
+        assert_eq!(catalog.list().unwrap().len(), 1);
+    }
+
+    /// The hazard the immutability promise exists to prevent: a name@version
+    /// that someone already depends on silently coming to mean different
+    /// content. Deleting the entry first must not launder that.
+    #[test]
+    fn re_adding_a_removed_version_with_different_bytes_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let original = distinct_wasm(wasm_dir.path(), "original", 1);
+        let replacement = distinct_wasm(wasm_dir.path(), "replacement", 2);
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+
+        catalog.add("thing@1", &original, &engine).unwrap();
+        catalog.rm("thing@1").unwrap();
+
+        let err = catalog
+            .add("thing@1", &replacement, &engine)
+            .expect_err("rm must not be a way to republish a version with new content");
+        let CatalogError::RetiredWithDifferentContent {
+            name_version,
+            previous_hash,
+            new_hash,
+        } = &err
+        else {
+            panic!("expected RetiredWithDifferentContent, got {err:?}")
+        };
+        assert_eq!(name_version, "thing@1");
+        assert_ne!(previous_hash, new_hash);
+        assert!(
+            catalog.list().unwrap().is_empty(),
+            "the reject must not add"
+        );
+    }
+
+    /// An index written before retirement tracking existed has no `retired`
+    /// field at all. It must still load as a normal, non-corrupt catalog
+    /// rather than tripping the version check.
+    #[test]
+    fn an_index_written_without_the_retired_field_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            br#"{"version":1,"entries":{"old@1":{"hash":"sha256:ab","kind":"block","signature":"json -> json","created_at":"2026-01-01T00:00:00Z"}}}"#,
+        )
+        .unwrap();
+
+        let index = read_index(dir.path()).expect("an index predating `retired` is not corrupt");
+        assert!(index.entries.contains_key("old@1"));
+        assert!(index.retired.is_empty());
     }
 
     #[test]

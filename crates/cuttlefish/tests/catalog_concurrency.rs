@@ -58,6 +58,41 @@ fn list_lines(home: &Path) -> Vec<String> {
         .collect()
 }
 
+/// `list` pads the name column to a fixed width. A name at or past that width
+/// used to leave no gap at all, running the identifier straight into its
+/// signature (`a-very-long-name@1json -> json`) and making the line
+/// unsplittable. Every row must keep a visible separator no matter how long
+/// the name is.
+#[test]
+fn list_always_separates_the_name_column_from_the_signature() {
+    let home = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let wasm = write_wasm(src.path());
+
+    let names = [
+        "short@1",
+        "a-name-of-exactly-22ch@1",
+        "a-very-long-block-name-that-overflows-the-column@1.2.3",
+    ];
+    for name in names {
+        let out = spawn_add(home.path(), &wasm, name)
+            .wait_with_output()
+            .unwrap();
+        assert!(out.status.success(), "{name} should catalog");
+    }
+
+    for line in list_lines(home.path()) {
+        let (name, rest) = line
+            .split_once("  ")
+            .unwrap_or_else(|| panic!("no column separator in list row: {line:?}"));
+        assert!(!name.is_empty(), "empty name column in {line:?}");
+        assert!(
+            rest.trim_start().starts_with("json ->"),
+            "signature did not survive the column split in {line:?}"
+        );
+    }
+}
+
 /// Every distinct name added concurrently by a separate process must survive.
 /// A read-modify-write that escaped the lock would drop entries here: each
 /// process reads the index, inserts one key, and writes the whole file back,
