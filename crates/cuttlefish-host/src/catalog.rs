@@ -470,6 +470,41 @@ pub(crate) fn read_bundle_signature(bytes: &[u8], label: &str) -> Result<String,
         }
     })?;
 
+    // A node whose offset+len falls outside the stage-bytes region that
+    // actually follows the manifest is structurally impossible — it can
+    // only come from a hand-crafted or corrupt bundle, since `bundle::build`
+    // always writes offsets that fit. Reject it now, at the one point every
+    // bundle (this crate's own output or someone else's) passes through
+    // before being embedded in something else or cataloged, rather than
+    // leaving it to be discovered later as an out-of-bounds read once
+    // nested-subjobs actually executes a node.
+    if let Some(nodes) = manifest.get("nodes").and_then(|v| v.as_array()) {
+        let body_len = (bytes.len() - BUNDLE_HEADER_LEN - manifest_len) as u64;
+        for node in nodes {
+            let bounds = node
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .zip(node.get("len").and_then(|v| v.as_u64()));
+            let in_bounds = match bounds {
+                Some((offset, len)) => offset.checked_add(len).is_some_and(|end| end <= body_len),
+                None => false,
+            };
+            if !in_bounds {
+                return Err(CatalogError::UninspectableArtifact {
+                    path: PathBuf::from(label),
+                    reason: format!(
+                        "a node's offset/len ({:?}) doesn't fit within the bundle's \
+                         {body_len}-byte stage-bytes region",
+                        (
+                            node.get("offset").and_then(|v| v.as_u64()),
+                            node.get("len").and_then(|v| v.as_u64())
+                        )
+                    ),
+                });
+            }
+        }
+    }
+
     manifest
         .get("signature")
         .and_then(|v| v.as_str())
@@ -1396,6 +1431,57 @@ mod tests {
             }
             other => panic!("expected UninspectableArtifact, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_node_whose_offset_and_len_overflow_the_stage_bytes_is_uninspectable() {
+        // No stage bytes follow the manifest at all here, so any non-zero
+        // offset/len is already out of bounds — exactly the "internally
+        // impossible node table" shape a hand-crafted or corrupt bundle
+        // could smuggle past a check that only ever reads the `signature`
+        // field.
+        let bundle = make_bundle(
+            br#"{"nodes":[{"name":"bad","kind":"block","resolved":null,
+                 "signature":"json -> json","offset":99999,"len":99999}],
+                 "signature":"json -> json"}"#,
+        );
+        let err = read_bundle_signature(&bundle, "test.cfbundle").unwrap_err();
+        match err {
+            CatalogError::UninspectableArtifact { reason, .. } => {
+                assert!(reason.contains("doesn't fit"), "{reason}")
+            }
+            other => panic!("expected UninspectableArtifact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_node_whose_offset_and_len_exactly_fit_the_stage_bytes_is_fine() {
+        let mut bundle = make_bundle(
+            br#"{"nodes":[{"name":"ok","kind":"block","resolved":null,
+                 "signature":"json -> json","offset":0,"len":3}],
+                 "signature":"json -> json"}"#,
+        );
+        bundle.extend_from_slice(b"abc");
+        let sig = read_bundle_signature(&bundle, "test.cfbundle").unwrap();
+        assert_eq!(sig, "json -> json");
+    }
+
+    #[test]
+    fn an_overflowing_node_offset_plus_len_is_uninspectable_not_a_panic() {
+        // Regression-shaped like the manifest_len overflow fix elsewhere in
+        // this file: offset + len must not panic on overflow, it must
+        // report a clean error.
+        let bundle = make_bundle(
+            format!(
+                r#"{{"nodes":[{{"name":"bad","kind":"block","resolved":null,
+                     "signature":"json -> json","offset":{},"len":10}}],
+                     "signature":"json -> json"}}"#,
+                u64::MAX
+            )
+            .as_bytes(),
+        );
+        let err = read_bundle_signature(&bundle, "test.cfbundle").unwrap_err();
+        assert!(matches!(err, CatalogError::UninspectableArtifact { .. }));
     }
 
     #[test]
