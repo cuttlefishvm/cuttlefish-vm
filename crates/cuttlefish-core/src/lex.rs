@@ -57,6 +57,8 @@ pub enum Tok {
     Comma,
     /// `;`
     Semicolon,
+    /// `->`
+    Arrow,
 }
 
 impl Tok {
@@ -72,6 +74,7 @@ impl Tok {
             Tok::CloseBracket => "`]`".into(),
             Tok::Comma => "`,`".into(),
             Tok::Semicolon => "`;`".into(),
+            Tok::Arrow => "`->`".into(),
         }
     }
 }
@@ -186,10 +189,24 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                     span,
                 });
             }
-            c if c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == '-' => {
+            '-' => {
+                let mut la = chars.clone();
+                la.next();
+                if la.peek() == Some(&'>') {
+                    bump!();
+                    bump!();
+                    tokens.push(Token {
+                        tok: Tok::Arrow,
+                        span,
+                    });
+                } else {
+                    return Err(LexError::UnexpectedChar { ch: '-', span });
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' || c == '.' || c == '/' => {
                 let mut word = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | ':') {
+                    if c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | ':') {
                         word.push(c);
                         bump!();
                     } else {
@@ -219,4 +236,29 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
     }
 
     Ok(tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_arrow_lexes_as_one_token() {
+        let tokens = lex(r#""pdf" -> handle_pdf"#).unwrap();
+        assert_eq!(
+            tokens.iter().map(|t| t.tok.clone()).collect::<Vec<_>>(),
+            vec![
+                Tok::Str("pdf".into()),
+                Tok::Arrow,
+                Tok::Ident("handle_pdf".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_hyphen_is_still_an_error() {
+        // Confirms `-` alone (not followed by `>`) keeps today's behavior —
+        // this plan only special-cases the two-character `->` sequence.
+        assert!(lex("- foo").is_err());
+    }
 }
