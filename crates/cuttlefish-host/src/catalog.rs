@@ -544,6 +544,15 @@ impl Catalog {
         })
     }
 
+    /// Read an entry's raw bytes back out of the blob store. The catalog's
+    /// only way to get from an `Entry` to actual artifact bytes — `blobs/`
+    /// stays an implementation detail, same as `add()` already hides
+    /// `write_blob`.
+    pub fn read_blob(&self, entry: &Entry) -> Result<Vec<u8>, CatalogError> {
+        let hex = entry.hash.strip_prefix("sha256:").unwrap_or(&entry.hash);
+        Ok(fs::read(blobs_dir(&self.root).join(hex))?)
+    }
+
     /// Remove a `name@version` from the index. The blob it pointed at is left on
     /// disk — no garbage collection in v1 (an orphaned blob is wasted space, not
     /// a correctness problem; see the design doc).
@@ -1346,5 +1355,36 @@ mod tests {
             panic!("expected NotFound, got {err:?}")
         };
         assert_eq!(did_you_mean, &vec!["summarize@1".to_string()]);
+    }
+
+    #[test]
+    fn read_blob_returns_what_add_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let engine = wasmtime::Engine::default();
+        let wasm = wat::parse_str("(module)").unwrap();
+        let path = dir.path().join("m.wasm");
+        std::fs::write(&path, &wasm).unwrap();
+
+        let outcome = catalog.add("m@1", &path, &engine).unwrap();
+        let entry = catalog.show("m@1").unwrap();
+
+        let bytes = catalog.read_blob(&entry).unwrap();
+        assert_eq!(bytes, wasm);
+        assert_eq!(outcome.name_version, "m@1");
+    }
+
+    #[test]
+    fn read_blob_on_a_hand_edited_missing_hash_errors_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let fake = Entry {
+            hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            kind: ArtifactKind::Block,
+            signature: "json -> json".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        assert!(catalog.read_blob(&fake).is_err());
     }
 }
