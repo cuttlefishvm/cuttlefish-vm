@@ -15,7 +15,7 @@ use std::path::Path;
 /// Serve `app` on `endpoint` until the process ends.
 ///
 /// `endpoint` is a socket path on unix and a pipe name (`\\.\pipe\...`) on
-/// Windows; see [`crate::default_endpoint`].
+/// Windows; see [`cuttlefish_core::endpoint::default_endpoint`].
 pub async fn serve(app: Router, endpoint: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
