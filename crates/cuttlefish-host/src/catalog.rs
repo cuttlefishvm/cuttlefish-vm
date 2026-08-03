@@ -349,6 +349,7 @@ fn blobs_dir(root: &Path) -> PathBuf {
 #[allow(dead_code)]
 fn write_blob(root: &Path, bytes: &[u8]) -> Result<String, CatalogError> {
     use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     let hex = format!("{:x}", Sha256::digest(bytes));
     let dir = blobs_dir(root);
@@ -356,7 +357,15 @@ fn write_blob(root: &Path, bytes: &[u8]) -> Result<String, CatalogError> {
 
     let blob_path = dir.join(&hex);
     if !blob_path.exists() {
-        let tmp_path = dir.join(format!("{hex}.tmp"));
+        // Unique per call (process id + a process-lifetime counter), not
+        // derived from the hash — two concurrent writers of identical bytes
+        // must never share a temp path. A deterministic {hex}.tmp name let
+        // one writer's O_TRUNC-on-open truncate the other's in-flight or
+        // already-written-but-not-yet-renamed file, risking a truncated
+        // file landing at blob_path under a hash it doesn't actually match.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = dir.join(format!("{hex}.tmp.{}.{unique}", std::process::id()));
         {
             let mut tmp = File::create(&tmp_path)?;
             tmp.write_all(bytes)?;
