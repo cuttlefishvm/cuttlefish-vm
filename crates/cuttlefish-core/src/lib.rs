@@ -9,5 +9,6 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod graph;
 pub mod lex;
 pub mod spec;
