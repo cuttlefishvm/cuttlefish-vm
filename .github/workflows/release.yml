@@ -150,10 +150,16 @@ jobs:
   release-binaries:
     name: Build release binaries (${{ matrix.target }})
     needs: create-release
-    # needs succeeding even when create-release was skipped (workflow_dispatch
-    # dry runs): a skipped-not-failed dependency still unblocks this job, so
-    # cross-compilation health is checked on every dry run, and only the
-    # upload step below is gated to real tag pushes.
+    # By default a job with `needs:` is skipped when the needed job is
+    # skipped, not only when it fails — so on a workflow_dispatch dry run
+    # (create-release skips itself via its own `if:`), this job would skip
+    # too and never actually prove the cross-compilation matrix builds. This
+    # `if:` explicitly allows both outcomes: proceed when create-release
+    # succeeded (real tag push) or was skipped (dry run) — only propagate an
+    # actual failure. The upload step below is separately gated to real tag
+    # pushes, so a dry run still builds and packages every target without
+    # uploading anything.
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     permissions:
       contents: write
     strategy:
