@@ -64,6 +64,17 @@ pub struct Entry {
 struct IndexFile {
     version: u32,
     entries: BTreeMap<String, Entry>,
+    /// `name@version` -> the hash it was published with, for versions that
+    /// have since been removed. Keeps `rm` from being a way to launder a
+    /// republish: the identity stays claimed by its original content even
+    /// after the entry is gone.
+    ///
+    /// `default` rather than an `INDEX_VERSION` bump on purpose — an index
+    /// written before this field existed is a perfectly good version-1 index
+    /// with nothing retired, and bumping the version would make every
+    /// already-written catalog report itself as corrupt.
+    #[serde(default)]
+    retired: BTreeMap<String, String>,
 }
 
 impl IndexFile {
@@ -71,8 +82,56 @@ impl IndexFile {
         Self {
             version: INDEX_VERSION,
             entries: BTreeMap::new(),
+            retired: BTreeMap::new(),
         }
     }
+}
+
+/// Characters legal in either half of a `name@version`. Deliberately narrow:
+/// a catalog identifier is a key people type and scripts interpolate, so
+/// whitespace and path separators earn nothing and invite confusion between
+/// an identifier and a filesystem path.
+fn is_legal_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+/// Check that `s` is a well-formed `name@version` before it can be written
+/// into the index.
+///
+/// This guards the write path only. `show`/`rm`/`resolve` stay permissive so
+/// that a key already in an index — hand-edited, or written before this check
+/// existed — remains inspectable and removable rather than stranded.
+fn validate_name_version(s: &str) -> Result<(), CatalogError> {
+    let invalid = |reason: String| CatalogError::InvalidNameVersion {
+        name_version: s.to_string(),
+        reason,
+    };
+
+    let separators = s.matches('@').count();
+    if separators != 1 {
+        return Err(invalid(match separators {
+            0 => "expected <name>@<version>, e.g. echo-summarize@1".to_string(),
+            n => format!("found {n} '@' separators"),
+        }));
+    }
+
+    let (name, version) = s.split_once('@').expect("exactly one '@' is present");
+    if name.is_empty() {
+        return Err(invalid("the name is empty".to_string()));
+    }
+    if version.is_empty() {
+        return Err(invalid("the version is empty".to_string()));
+    }
+
+    for (half, label) in [(name, "name"), (version, "version")] {
+        if let Some(bad) = half.chars().find(|c| !is_legal_identifier_char(*c)) {
+            return Err(invalid(format!(
+                "the {label} contains {bad:?}; only letters, digits, '.', '-' and '_' are allowed"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Something went wrong reading, writing, or resolving through the catalog.
@@ -83,6 +142,30 @@ pub enum CatalogError {
     AlreadyExists {
         /// The name@version that was already present.
         name_version: String,
+    },
+    /// The identifier handed to `add` is not a well-formed `name@version`.
+    #[error("{name_version:?} is not a name@version ({reason})")]
+    InvalidNameVersion {
+        /// The identifier that was rejected.
+        name_version: String,
+        /// Why it was rejected, as a sentence fragment.
+        reason: String,
+    },
+    /// `name@version` was published, then removed, and is now being re-added
+    /// with different content. Removing an entry drops it from the index but
+    /// does not un-publish the identity, so this is still the immutability
+    /// violation `AlreadyExists` guards against — just spread over two steps.
+    #[error(
+        "{name_version} was previously catalogued with different content; versions are \
+         immutable once published ({previous_hash} -> {new_hash})"
+    )]
+    RetiredWithDifferentContent {
+        /// The name@version being re-added.
+        name_version: String,
+        /// The hash it was published with originally.
+        previous_hash: String,
+        /// The hash of the artifact now being offered.
+        new_hash: String,
     },
     /// No entry matches the requested `name@version`.
     #[error(
@@ -465,6 +548,8 @@ impl Catalog {
         artifact_path: &Path,
         engine: &wasmtime::Engine,
     ) -> Result<AddOutcome, CatalogError> {
+        validate_name_version(name_version)?;
+
         let bytes = fs::read(artifact_path)?;
         let kind =
             sniff_artifact_kind(&bytes).ok_or_else(|| CatalogError::UnrecognizedArtifact {
@@ -502,6 +587,20 @@ impl Catalog {
                 return Err(CatalogError::AlreadyExists {
                     name_version: name_version.clone(),
                 });
+            }
+            // A removed version keeps its claim on the identity. Re-adding the
+            // exact bytes it was published with is an undo of the `rm`;
+            // re-adding anything else is a republish, which is the thing
+            // immutability exists to forbid.
+            if let Some(previous_hash) = index.retired.get(&name_version) {
+                if previous_hash != &hash {
+                    return Err(CatalogError::RetiredWithDifferentContent {
+                        name_version: name_version.clone(),
+                        previous_hash: previous_hash.clone(),
+                        new_hash: hash.clone(),
+                    });
+                }
+                index.retired.remove(&name_version);
             }
             index.entries.insert(
                 name_version.clone(),
@@ -549,7 +648,12 @@ impl Catalog {
     /// a correctness problem; see the design doc).
     pub fn rm(&self, name_version: &str) -> Result<(), CatalogError> {
         with_locked_index(&self.root, |index| {
-            if index.entries.remove(name_version).is_some() {
+            if let Some(entry) = index.entries.remove(name_version) {
+                // Record what this identity was published as, so a later
+                // `add` can tell an undo from a republish.
+                index
+                    .retired
+                    .insert(name_version.to_string(), entry.hash.clone());
                 Ok(())
             } else {
                 let name = name_version.split('@').next().unwrap_or(name_version);
@@ -631,6 +735,12 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    /// Enough threads to genuinely contend for the index lock on any machine
+    /// this runs on, without making the test slow.
+    const WRITERS: usize = 16;
 
     #[test]
     fn index_file_serializes_to_the_shape_the_spec_documents() {
@@ -647,6 +757,7 @@ mod tests {
         let index = IndexFile {
             version: INDEX_VERSION,
             entries,
+            retired: BTreeMap::new(),
         };
 
         let json = serde_json::to_string(&index).expect("IndexFile always serializes");
@@ -875,6 +986,218 @@ mod tests {
         let index = read_index(dir.path()).expect("the index must still parse after contention");
         assert!(index.entries.contains_key("a@1"));
         assert!(index.entries.contains_key("b@1"));
+    }
+
+    /// `add`'s duplicate check runs *inside* the locked section, so a pack of
+    /// writers racing for one key must resolve to exactly one winner — the
+    /// "versions are immutable once published" promise only holds under
+    /// contention if the check-then-insert is genuinely atomic. Every thread
+    /// is held at a barrier so they collide on the lock rather than politely
+    /// serializing.
+    #[test]
+    fn racing_inserts_of_the_same_key_leave_exactly_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(WRITERS));
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    with_locked_index(&root, |index| {
+                        if index.entries.contains_key("race@1") {
+                            return Err(CatalogError::AlreadyExists {
+                                name_version: "race@1".to_string(),
+                            });
+                        }
+                        index
+                            .entries
+                            .insert("race@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let winners = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one racing writer may claim a key; got {winners}"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| r.is_ok() || matches!(r, Err(CatalogError::AlreadyExists { .. }))),
+            "every loser must lose with AlreadyExists, not an io or corruption error: {results:?}"
+        );
+
+        let index = read_index(&root).expect("the index must still parse after contention");
+        assert_eq!(index.entries.len(), 1);
+    }
+
+    /// The two-thread test above proves the lock exists; this proves it holds
+    /// up under real contention. Without a barrier, two threads usually finish
+    /// one after another and never touch the lock at the same time, so a
+    /// read-modify-write that lost updates could still pass.
+    #[test]
+    fn many_racing_writers_of_distinct_keys_all_land_with_no_lost_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(WRITERS));
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    with_locked_index(&root, |index| {
+                        index.entries.insert(
+                            format!("writer-{w}@1"),
+                            entry_fixture("2026-01-01T00:00:00Z"),
+                        );
+                        Ok::<_, CatalogError>(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let index = read_index(&root).expect("the index must still parse after contention");
+        assert_eq!(
+            index.entries.len(),
+            WRITERS,
+            "every writer's entry must survive; a lost update means the \
+             read-modify-write escaped the lock: {:?}",
+            index.entries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `with_locked_index` documents that readers need no lock because a
+    /// writer only ever publishes via rename, so a reader sees the wholly-old
+    /// or wholly-new file and never a half-written one. Nothing asserted it:
+    /// this hammers lock-free readers against writers and fails if any read
+    /// ever comes back corrupt.
+    #[test]
+    fn lock_free_readers_never_observe_a_partial_index_while_writers_hammer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // Seed first so index.json exists before any reader starts — a
+        // missing index is legitimately empty, which would mask a torn read.
+        seed(&root, "seed@1", "2026-01-01T00:00:00Z");
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..60 {
+                        with_locked_index(&root, |index| {
+                            index.entries.insert(
+                                format!("w{w}-{i}@1"),
+                                entry_fixture("2026-01-01T00:00:00Z"),
+                            );
+                            Ok::<_, CatalogError>(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        let index = read_index(&root)
+                            .expect("a lock-free reader must never see a partial or corrupt index");
+                        // A torn read that still parsed would most likely show
+                        // up as losing the seed entry that is only ever added.
+                        assert!(
+                            index.entries.contains_key("seed@1"),
+                            "an entry that is never removed vanished from a concurrent read"
+                        );
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let total: u32 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(
+            total > 0,
+            "the readers must have actually observed the index"
+        );
+    }
+
+    /// Every other concurrency test here races `add` against `add`. Removals
+    /// take the same lock and rewrite the same file, so a mixed workload is
+    /// where an asymmetry would show up — e.g. a removal path that wrote the
+    /// index outside the locked section. Each thread owns a disjoint key and
+    /// adds then removes it, so the end state is exactly the untouched
+    /// keep-alive entries regardless of interleaving.
+    #[test]
+    fn adds_and_removals_racing_on_one_index_leave_exactly_the_expected_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        seed(&root, "keep@1", "2026-01-01T00:00:00Z");
+        seed(&root, "keep@2", "2026-01-01T00:00:00Z");
+
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let key = format!("churn-{w}@1");
+                    barrier.wait();
+                    for _ in 0..10 {
+                        with_locked_index(&root, |index| {
+                            index
+                                .entries
+                                .insert(key.clone(), entry_fixture("2026-01-01T00:00:00Z"));
+                            Ok::<_, CatalogError>(())
+                        })
+                        .unwrap();
+                        with_locked_index(&root, |index| {
+                            index.entries.remove(&key).expect(
+                                "a key only this thread ever touches must still be present",
+                            );
+                            Ok::<_, CatalogError>(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let index = read_index(&root).expect("the index must still parse after mixed contention");
+        let names: Vec<_> = index.entries.keys().cloned().collect();
+        assert_eq!(
+            names,
+            vec!["keep@1".to_string(), "keep@2".to_string()],
+            "churn keys must all be gone and the untouched entries must survive"
+        );
     }
 
     #[test]
@@ -1187,6 +1510,196 @@ mod tests {
             panic!("expected NotFound, got {err:?}")
         };
         assert_eq!(did_you_mean, &vec!["summarize@1".to_string()]);
+    }
+
+    /// Write a valid, signature-less wasm block whose bytes vary with
+    /// `body_marker`, so two calls can produce artifacts that are both valid
+    /// and genuinely different content.
+    fn distinct_wasm(dir: &Path, name: &str, body_marker: u32) -> PathBuf {
+        let path = dir.join(format!("{name}.wasm"));
+        std::fs::write(
+            &path,
+            wat::parse_str(format!(
+                r#"(module (memory (export "memory") 1) (func (export "marker") (result i32) i32.const {body_marker}))"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn an_identifier_with_no_at_version_is_rejected_rather_than_catalogued_under_a_typo() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+
+        let err = Catalog::open(catalog_dir.path())
+            .add("echo-summarize", &wasm, &wasmtime::Engine::default())
+            .expect_err("dropping @version is a typo, not a name meaning itself");
+
+        assert!(
+            matches!(err, CatalogError::InvalidNameVersion { .. }),
+            "{err:?}"
+        );
+        assert!(
+            Catalog::open(catalog_dir.path()).list().unwrap().is_empty(),
+            "a rejected identifier must not leave an entry behind"
+        );
+    }
+
+    #[test]
+    fn an_identifier_with_an_empty_name_or_version_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+
+        for bad in ["@1", "name@", "", "   "] {
+            let err = catalog
+                .add(bad, &wasm, &engine)
+                .expect_err("an empty name or version is not a name@version");
+            assert!(
+                matches!(err, CatalogError::InvalidNameVersion { .. }),
+                "{bad:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identifier_with_more_than_one_at_separator_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+
+        let err = Catalog::open(catalog_dir.path())
+            .add("a@b@c", &wasm, &wasmtime::Engine::default())
+            .expect_err("two '@' separators is not a name@version");
+        assert!(
+            matches!(err, CatalogError::InvalidNameVersion { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_identifier_containing_path_or_whitespace_characters_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+
+        for bad in ["../../etc/passwd@1", "with space@1", "name@../../tmp/pwn"] {
+            let err = catalog
+                .add(bad, &wasm, &engine)
+                .expect_err("{bad} must be rejected");
+            assert!(
+                matches!(err, CatalogError::InvalidNameVersion { .. }),
+                "{bad:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_name_at_version_still_catalogs() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "block", 1);
+
+        Catalog::open(catalog_dir.path())
+            .add(
+                "echo-summarize@1.2.3-rc.1",
+                &wasm,
+                &wasmtime::Engine::default(),
+            )
+            .expect("letters, digits, '.', '-' and '_' are all legal");
+    }
+
+    /// Validation guards the *write* path only. An index that already holds a
+    /// junk key (written before this check existed, or hand-edited) must stay
+    /// removable, or the fix would strand entries nothing can clean up.
+    #[test]
+    fn a_pre_existing_junk_identifier_can_still_be_shown_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "no-at-sign", "2026-01-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+
+        catalog
+            .show("no-at-sign")
+            .expect("an already-stored key must remain inspectable");
+        catalog
+            .rm("no-at-sign")
+            .expect("an already-stored key must remain removable");
+    }
+
+    #[test]
+    fn re_adding_a_removed_version_with_the_same_bytes_is_allowed() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm = distinct_wasm(wasm_dir.path(), "same", 7);
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+
+        catalog.add("thing@1", &wasm, &engine).unwrap();
+        catalog.rm("thing@1").unwrap();
+        catalog
+            .add("thing@1", &wasm, &engine)
+            .expect("re-adding identical bytes is an undo of the rm, not a rewrite of history");
+
+        assert_eq!(catalog.list().unwrap().len(), 1);
+    }
+
+    /// The hazard the immutability promise exists to prevent: a name@version
+    /// that someone already depends on silently coming to mean different
+    /// content. Deleting the entry first must not launder that.
+    #[test]
+    fn re_adding_a_removed_version_with_different_bytes_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let original = distinct_wasm(wasm_dir.path(), "original", 1);
+        let replacement = distinct_wasm(wasm_dir.path(), "replacement", 2);
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+
+        catalog.add("thing@1", &original, &engine).unwrap();
+        catalog.rm("thing@1").unwrap();
+
+        let err = catalog
+            .add("thing@1", &replacement, &engine)
+            .expect_err("rm must not be a way to republish a version with new content");
+        let CatalogError::RetiredWithDifferentContent {
+            name_version,
+            previous_hash,
+            new_hash,
+        } = &err
+        else {
+            panic!("expected RetiredWithDifferentContent, got {err:?}")
+        };
+        assert_eq!(name_version, "thing@1");
+        assert_ne!(previous_hash, new_hash);
+        assert!(
+            catalog.list().unwrap().is_empty(),
+            "the reject must not add"
+        );
+    }
+
+    /// An index written before retirement tracking existed has no `retired`
+    /// field at all. It must still load as a normal, non-corrupt catalog
+    /// rather than tripping the version check.
+    #[test]
+    fn an_index_written_without_the_retired_field_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            br#"{"version":1,"entries":{"old@1":{"hash":"sha256:ab","kind":"block","signature":"json -> json","created_at":"2026-01-01T00:00:00Z"}}}"#,
+        )
+        .unwrap();
+
+        let index = read_index(dir.path()).expect("an index predating `retired` is not corrupt");
+        assert!(index.entries.contains_key("old@1"));
+        assert!(index.retired.is_empty());
     }
 
     #[test]

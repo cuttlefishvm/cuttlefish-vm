@@ -148,8 +148,16 @@ mod cli {
                 Ok(())
             }
             CatalogCmd::List => {
+                // Pad to a fixed column, but never to nothing: a name at or
+                // past the column width would otherwise run straight into its
+                // signature, leaving a row that cannot be split back apart.
+                const NAME_COLUMN: usize = 24;
+                const MIN_GAP: usize = 2;
                 for (name_version, entry) in catalog.list()? {
-                    println!("{name_version:<24}{}", entry.signature);
+                    let gap = NAME_COLUMN
+                        .saturating_sub(name_version.chars().count())
+                        .max(MIN_GAP);
+                    println!("{name_version}{:gap$}{}", "", entry.signature);
                 }
                 Ok(())
             }
