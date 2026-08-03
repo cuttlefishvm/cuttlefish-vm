@@ -194,7 +194,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # GITHUB_REF_NAME is the tag ("v0.1.0") on a real release, but on
+          # a workflow_dispatch dry run it is the branch name instead, which
+          # can contain a "/" (e.g. "feat/block-catalog") that breaks mkdir
+          # below if left in — sanitize it out either way.
           version="${GITHUB_REF_NAME#v}"
+          version="${version//\//-}"
           name="cuttlefish-${version}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/cuttlefish" "$name/"
@@ -208,7 +213,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # GITHUB_REF_NAME is the tag ("v0.1.0") on a real release, but on
+          # a workflow_dispatch dry run it is the branch name instead, which
+          # can contain a "/" (e.g. "feat/block-catalog") that breaks mkdir
+          # below if left in — sanitize it out either way.
           version="${GITHUB_REF_NAME#v}"
+          version="${version//\//-}"
           name="cuttlefish-${version}-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/cuttlefish.exe" "$name/"
