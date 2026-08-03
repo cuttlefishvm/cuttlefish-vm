@@ -13,6 +13,11 @@
 //! yet, against guesses about its shape. When the pipeline syntax lands, this
 //! module gets replaced rather than extended.
 //!
+//! The `nodes = { ... }` / `branches = { ... }` graph syntax added since is not
+//! that pipeline syntax: it is still the same flat `key = value` grammar, just
+//! shaped to describe a graph, with no expressions or inference beyond the
+//! `node.out` reference syntax itself.
+//!
 //! # Why it refuses so much
 //!
 //! A spec grants capabilities. Every accepted-but-misunderstood construct is a
