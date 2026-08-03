@@ -79,6 +79,29 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("resolving the pipeline for `{}`", spec.name))?;
     let checked = cuttlefish_host::pipeline::check(&engine, &resolved)
         .with_context(|| format!("checking the pipeline for `{}`", spec.name))?;
+
+    // A stage can typecheck cleanly as a Bundle (its cached signature parses
+    // and its seams fit) while still being unrunnable: `stages` below feeds
+    // every stage's raw bytes straight to the wasm engine, which cannot
+    // instantiate a `.cfbundle` container at all. Nested-subjobs (actually
+    // executing a bundle as a sub-job) isn't built yet, so reject this at
+    // startup — once, with a clear message — rather than let every job
+    // against this stage fail with a confusing wasm trap. `cuttlefish build`
+    // is unaffected: embedding a bundle stage in an outer bundle is fine, it
+    // is only *running* one directly that isn't supported yet.
+    if let Some(bundle_stage) = checked
+        .stages()
+        .iter()
+        .find(|s| s.kind == cuttlefish_host::catalog::ArtifactKind::Bundle)
+    {
+        anyhow::bail!(
+            "stage `{}` resolved to a bundle, not a block. Running a nested bundle as a \
+             sub-job isn't implemented yet — only single-block pipelines can be served today. \
+             `cuttlefish build` can still embed it, it just can't run here yet.",
+            bundle_stage.name
+        );
+    }
+
     eprintln!(
         "cuttlefishd pipeline `{}`: {} accepting {} producing {}",
         spec.name,
