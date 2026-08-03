@@ -50,6 +50,16 @@ warning: no-sig@1 did not declare a signature (no cf_signature export
 present) — cached as the permissive default...
 ```
 
+The identifier must be a well-formed `name@version`: exactly one `@`, both
+halves non-empty, and each limited to letters, digits, `.`, `-` and `_`.
+Anything else is rejected (exit 1) rather than catalogued under a junk key —
+notably a dropped `@version`, which is otherwise an easy typo to make:
+
+```
+$ cuttlefish catalog add echo-summarize block.wasm
+Error: "echo-summarize" is not a name@version (expected <name>@<version>, e.g. echo-summarize@1)
+```
+
 **Versions are immutable.** Re-`add`ing the same `name@version` fails
 (exit 1):
 
@@ -57,10 +67,27 @@ present) — cached as the permissive default...
 Error: echo-summarize@1 is already catalogued; versions are immutable once published
 ```
 
+Removing an entry does **not** release its identity. A `name@version` that
+was published and then `rm`'d can be re-added with the *same* bytes — that's
+an undo of the removal — but re-adding it with *different* content is
+rejected, so `rm` is not a way to quietly republish a version someone may
+already depend on:
+
+```
+$ cuttlefish catalog rm thing@1
+removed thing@1
+$ cuttlefish catalog add thing@1 the-same-block.wasm
+catalogued thing@1  (json -> json)
+$ cuttlefish catalog rm thing@1 && cuttlefish catalog add thing@1 a-different-block.wasm
+Error: thing@1 was previously catalogued with different content; versions are
+immutable once published (sha256:93a44b... -> sha256:ce9e2d...)
+```
+
 ### `list`
 
-One line per entry, `name@version` then signature. Empty catalog prints
-nothing.
+One line per entry, `name@version` then signature, separated by at least two
+spaces (names are padded to a column, but a long name never runs into its
+signature). Empty catalog prints nothing.
 
 ### `show`
 
@@ -76,17 +103,24 @@ Error: no such catalog entry: ech-summarize@1 (did you mean: echo-summarize@1?)
 Removes the index entry only — **does not free the underlying blob** (no
 garbage collection in v1, by design). Removing something that doesn't exist
 is the same not-found-with-suggestion error `show` gives, not a silent
-no-op.
+no-op. The removed `name@version` is recorded under `retired` in
+`index.json`, which is what lets a later `add` tell an undo from a
+republish (see `add` above).
 
 ## Things worth knowing
 
 - Names/versions are **case-sensitive, opaque strings** — not parsed as
-  semver.
+  semver. `1.2.3-rc.1` is a legal version because those characters are
+  allowed, not because anything understands it as semver.
+- Validation applies to `add` only. `show` and `rm` stay permissive, so a
+  junk key already in an index (hand-edited, or written before validation
+  existed) is still inspectable and removable rather than stranded.
 - A path ending in `.wasm`, or any existing filesystem path, is used
   directly — the catalog lookup only fires for a bare `name@version`.
 - On-disk layout: `~/.cuttlefish/catalog/{index.json, index.json.lock,
   blobs/<sha256-hex>}`. `index.json` is plain formatted JSON, safe to read
-  directly.
+  directly; it holds `entries` (live) and `retired` (removed
+  `name@version` -> the hash it was published with).
 - No daemon needs to be running for any `catalog` subcommand — unlike
   `cuttlefish run`/`specs`, which need a live `cuttlefishd`.
 

@@ -42,7 +42,29 @@ nix develop --command bash -c '
   set -e
 
   echo
+  echo "--- dropping the @version (expect InvalidNameVersion, exit 1) ---"
+  set +e
+  "$cf" catalog add echo-summarize \
+    target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm
+  echo "exit=$?"
+  set -e
+
+  echo
   echo "--- rm (index-only; the blob stays on disk) ---"
   "$cf" catalog rm echo-summarize@1
   "$cf" catalog list
+
+  echo
+  echo "--- re-adding the removed version with the SAME bytes (expect success) ---"
+  "$cf" catalog add echo-summarize@1 \
+    target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm
+
+  echo
+  echo "--- rm, then re-add with DIFFERENT bytes (expect RetiredWithDifferentContent, exit 1) ---"
+  "$cf" catalog rm echo-summarize@1
+  printf "\x00asm\x01\x00\x00\x00" > "$CUTTLEFISH_HOME/other.wasm"
+  set +e
+  "$cf" catalog add echo-summarize@1 "$CUTTLEFISH_HOME/other.wasm"
+  echo "exit=$?"
+  set -e
 '
