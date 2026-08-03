@@ -21,13 +21,16 @@
 //! documentation-lives-in-the-code convention).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// Current schema version of `index.json`'s own on-disk format — bumped only
 /// when the *shape* of the index changes, never tied to this crate's version.
-// Used starting in Task 6 (index read/write); unused until then.
+// Only reachable through `read_index`/`with_locked_index`, which are
+// themselves only called from tests until Task 9 wires `Catalog::add` in.
 #[allow(dead_code)]
 const INDEX_VERSION: u32 = 1;
 
@@ -60,7 +63,8 @@ pub struct Entry {
 }
 
 /// The whole on-disk `index.json`.
-// Used starting in Task 6 (index read/write); unused until then.
+// Only reachable through `read_index`/`with_locked_index`, which are
+// themselves only called from tests until Task 9 wires `Catalog::add` in.
 #[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexFile {
@@ -69,7 +73,6 @@ struct IndexFile {
 }
 
 impl IndexFile {
-    // Used starting in Task 6 (index read/write); unused until then.
     #[allow(dead_code)]
     fn empty() -> Self {
         Self {
@@ -244,6 +247,93 @@ fn sniff_artifact_kind(bytes: &[u8]) -> Option<ArtifactKind> {
     }
 }
 
+// Only called from tests and from `with_locked_index` until Task 9 wires
+// `Catalog::add` (and later tasks wire `list`/`show`/`rm`) in.
+#[allow(dead_code)]
+fn index_path(root: &Path) -> PathBuf {
+    root.join("index.json")
+}
+
+// Only called from `with_locked_index` until Task 9 wires `Catalog::add` in.
+#[allow(dead_code)]
+fn lock_path(root: &Path) -> PathBuf {
+    root.join("index.json.lock")
+}
+
+/// Read `index.json`. A missing file is a brand-new, empty catalog — not an
+/// error. A file that exists but fails to parse, or whose `version` this
+/// build doesn't understand, is `CatalogError::CorruptIndex` — loud, never
+/// silently treated as empty (an empty-looking catalog after real entries
+/// were written would make every subsequent `add` "work" while quietly
+/// discarding everything that came before it).
+// Only called from tests and from `with_locked_index` until Task 9 wires
+// `Catalog::add` (and later tasks wire `list`/`show`/`rm`) in.
+#[allow(dead_code)]
+fn read_index(root: &Path) -> Result<IndexFile, CatalogError> {
+    let path = index_path(root);
+    if !path.exists() {
+        return Ok(IndexFile::empty());
+    }
+
+    let bytes = fs::read(&path)?;
+    let index: IndexFile =
+        serde_json::from_slice(&bytes).map_err(|e| CatalogError::CorruptIndex {
+            path: path.clone(),
+            reason: e.to_string(),
+        })?;
+
+    if index.version != INDEX_VERSION {
+        return Err(CatalogError::CorruptIndex {
+            path,
+            reason: format!(
+                "index format version {} is not supported by this build (expected {INDEX_VERSION})",
+                index.version
+            ),
+        });
+    }
+
+    Ok(index)
+}
+
+/// Acquire the exclusive lock on `index.json.lock`, read-modify-write
+/// `index.json` atomically (write to a temp file, `fsync`, then rename), and
+/// return. The temp-file-then-rename means a reader racing this write always
+/// sees either the fully-old or fully-new file, never a partial one — reads
+/// (`list`/`show`) never need to take the lock at all.
+///
+/// The lock is released by `lock_file` simply going out of scope (an
+/// OS-level advisory lock is tied to the open file handle) on every return
+/// path, including the early return from `f(&mut index)?` below — there is
+/// no separate `unlock()` call to forget on an error path.
+// Only called from tests until Task 9 wires `Catalog::add` in.
+#[allow(dead_code)]
+fn with_locked_index<T>(
+    root: &Path,
+    f: impl FnOnce(&mut IndexFile) -> Result<T, CatalogError>,
+) -> Result<T, CatalogError> {
+    fs::create_dir_all(root)?;
+    let lock_file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path(root))?;
+    lock_file.lock()?;
+
+    let mut index = read_index(root)?;
+    let result = f(&mut index)?;
+
+    let tmp_path = root.join("index.json.tmp");
+    let bytes = serde_json::to_vec_pretty(&index).expect("IndexFile always serializes");
+    {
+        let mut tmp = File::create(&tmp_path)?;
+        tmp.write_all(&bytes)?;
+        tmp.sync_all()?;
+    }
+    fs::rename(&tmp_path, index_path(root))?;
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +490,86 @@ mod tests {
     #[test]
     fn unrecognised_bytes_sniff_to_none_not_a_guess() {
         assert_eq!(sniff_artifact_kind(b"whatever-this-is"), None);
+    }
+
+    #[test]
+    fn writing_then_reading_the_index_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        with_locked_index(dir.path(), |index| {
+            index
+                .entries
+                .insert("a@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+            Ok::<_, CatalogError>(())
+        })
+        .unwrap();
+
+        let index = read_index(dir.path()).unwrap();
+        assert!(index.entries.contains_key("a@1"));
+    }
+
+    #[test]
+    fn reading_an_index_that_does_not_exist_yet_is_an_empty_catalog_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = read_index(dir.path()).expect("no index.json yet is not corruption");
+        assert!(index.entries.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_index_is_a_corrupt_index_error_not_an_empty_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("index.json"), b"{\"version\": 1, \"ent").unwrap();
+
+        let err = read_index(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptIndex { .. }),
+            "a truncated index must be a loud CorruptIndex, not treated as empty: {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_index_version_is_a_corrupt_index_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            br#"{"version": 999, "entries": {}}"#,
+        )
+        .unwrap();
+
+        let err = read_index(dir.path()).unwrap_err();
+        assert!(matches!(err, CatalogError::CorruptIndex { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn concurrent_writes_from_two_threads_both_land_and_the_index_stays_parseable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_a = dir.path().to_path_buf();
+        let root_b = dir.path().to_path_buf();
+
+        let t1 = std::thread::spawn(move || {
+            with_locked_index(&root_a, |index| {
+                index
+                    .entries
+                    .insert("a@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+                Ok::<_, CatalogError>(())
+            })
+            .unwrap();
+        });
+        let t2 = std::thread::spawn(move || {
+            with_locked_index(&root_b, |index| {
+                index
+                    .entries
+                    .insert("b@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+                Ok::<_, CatalogError>(())
+            })
+            .unwrap();
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let index = read_index(dir.path()).expect("the index must still parse after contention");
+        assert!(index.entries.contains_key("a@1"));
+        assert!(index.entries.contains_key("b@1"));
     }
 }
