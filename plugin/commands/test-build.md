@@ -40,7 +40,7 @@ Specifically:
      declared input isn't satisfied by the first's declared output (you can
      compile a tiny throwaway block crate against `cuttlefish-sdk`
      declaring whatever `Signature` you want — see
-     `crates/cuttlefish-host/tests/support.rs`'s `block_with` for the
+     `crates/cuttlefish-host/tests/support/mod.rs`'s `block_with` for the
      minimal shape of such a crate, or just write one by hand). Confirm the
      error names *both* blocks and *both* types, not a generic type error.
    - Try to build a spec pointed at a spec file that doesn't exist, and one
