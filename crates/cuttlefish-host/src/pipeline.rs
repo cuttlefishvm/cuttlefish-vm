@@ -22,8 +22,9 @@
 //! but a linear chain covers the pipelines that exist today, and the type
 //! discipline established here is what a DAG would extend rather than replace.
 
+use crate::catalog::{Catalog, ResolutionContext, Resolved};
 use cuttlefish_abi::{Signature, Ty};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use wasmtime::Engine;
 
 /// One stage of a checked pipeline.
@@ -46,6 +47,7 @@ pub struct Stage {
 /// One pipeline entry's bytes, already resolved and loaded — from disk or
 /// from the catalog's blob store. `check()`'s input; see resolve_and_load
 /// (added in a later change) for how one of these gets built.
+#[derive(Debug)]
 pub struct ResolvedInput {
     /// Display name, same convention as [`Stage::name`].
     pub name: String,
@@ -202,4 +204,95 @@ pub fn check(engine: &Engine, inputs: &[ResolvedInput]) -> Result<Checked, Pipel
     }
 
     Ok(Checked { stages })
+}
+
+/// Turn one pipeline-entry string from a spec into a loaded, kind-tagged
+/// [`ResolvedInput`], ready for [`check`]. Shared by `cuttlefishd`'s run
+/// path and `cuttlefish build` — the only two callers, and both need the
+/// same resolve-then-load behavior.
+///
+/// A path-like entry (contains `/`, or ends in `.wasm`/`.cfbundle`) is
+/// joined against `spec_dir` before resolution — matching the join every
+/// other spec-relative reference (`capabilities`) already gets, so a
+/// relative block path means the same thing regardless of the process's
+/// working directory. A bare `name@version` (or unqualified name) has no
+/// directory to join against and is passed to [`Catalog::resolve`]
+/// unmodified — joining it would turn `name@version` into
+/// `<spec_dir>/name@version`, which matches neither an index key nor a real
+/// file.
+pub fn resolve_and_load(
+    catalog: &Catalog,
+    spec_dir: &Path,
+    entry: &str,
+    context: ResolutionContext,
+) -> Result<ResolvedInput, PipelineError> {
+    let looks_path_like =
+        entry.contains('/') || entry.ends_with(".wasm") || entry.ends_with(".cfbundle");
+    let joined;
+    let s: &str = if looks_path_like {
+        joined = spec_dir.join(entry).to_string_lossy().into_owned();
+        &joined
+    } else {
+        entry
+    };
+
+    match catalog.resolve(s, context)? {
+        Resolved::Direct(path) => {
+            if path.is_dir() {
+                return Err(PipelineError::Uninspectable {
+                    name: path.display().to_string(),
+                    message: "this is a directory. A pipeline names compiled \
+                              `.wasm`/`.cfbundle` artifacts, not block source \
+                              directories — build the block first and point at \
+                              the compiled artifact."
+                        .into(),
+                });
+            }
+            let bytes = std::fs::read(&path).map_err(|source| PipelineError::Unreadable {
+                path: path.clone(),
+                source,
+            })?;
+            let kind = crate::catalog::sniff_artifact_kind(&bytes).ok_or_else(|| {
+                PipelineError::Uninspectable {
+                    name: path.display().to_string(),
+                    message: "not a recognized artifact (neither wasm nor .cfbundle magic \
+                              bytes)"
+                        .into(),
+                }
+            })?;
+            Ok(ResolvedInput {
+                name: name_of(&path),
+                kind,
+                resolved: None,
+                bytes,
+            })
+        }
+        Resolved::Cataloged {
+            name_version,
+            entry,
+        } => {
+            let bytes = catalog.read_blob(&entry)?;
+            let name = name_version
+                .split_once('@')
+                .map(|(n, _)| n)
+                .unwrap_or(&name_version)
+                .to_string();
+            Ok(ResolvedInput {
+                name,
+                kind: entry.kind,
+                resolved: Some(name_version),
+                bytes,
+            })
+        }
+    }
+}
+
+/// A short name for error messages and manifest output — the file stem, or
+/// the whole path when there isn't one (`Path::file_stem(".wasm")` returns
+/// `Some(".wasm")` under the leading-dot rule, so this never panics or
+/// empties out on a no-real-basename path).
+fn name_of(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }

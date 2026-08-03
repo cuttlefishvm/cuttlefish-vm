@@ -12,8 +12,8 @@
 
 mod support;
 
-use cuttlefish_host::catalog::ArtifactKind;
-use cuttlefish_host::pipeline::{check, PipelineError, ResolvedInput};
+use cuttlefish_host::catalog::{ArtifactKind, Catalog, ResolutionContext};
+use cuttlefish_host::pipeline::{check, resolve_and_load, PipelineError, ResolvedInput};
 use std::path::PathBuf;
 use support::block_with;
 use wasmtime::Engine;
@@ -342,4 +342,103 @@ async fn a_failing_stage_ends_the_job_and_names_the_stage() {
         "the failing stage must be named: {message}"
     );
     assert!(envelope.result.is_none());
+}
+
+// -- resolve_and_load ---------------------------------------------------------
+
+#[test]
+fn a_relative_direct_entry_resolves_against_spec_dir_not_cwd() {
+    let spec_dir = tempfile::tempdir().unwrap();
+    let wasm = block_with(spec_dir.path(), "rel_a", "text", "text");
+    // The entry as it would appear in a spec file: relative to the spec,
+    // not to wherever `cuttlefish` happens to be run from.
+    let relative_entry = "rel_a/target/wasm32-unknown-unknown/debug/rel_a.wasm".to_string();
+    let catalog = Catalog::open(spec_dir.path().join("unused-catalog"));
+
+    let resolved = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        &relative_entry,
+        ResolutionContext::Interactive,
+    )
+    .unwrap();
+
+    assert_eq!(resolved.bytes, std::fs::read(&wasm).unwrap());
+    assert_eq!(resolved.resolved, None);
+}
+
+#[test]
+fn a_bare_catalog_name_is_not_joined_against_spec_dir() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let catalog_dir = tempfile::tempdir().unwrap();
+    let wasm = block_with(src_dir.path(), "cat_a", "text", "text");
+    let catalog = Catalog::open(catalog_dir.path());
+    catalog.add("cat-a@1", &wasm, &Engine::default()).unwrap();
+
+    // spec_dir deliberately does not contain anything named "cat-a@1" — if
+    // the join were applied unconditionally this would fail to resolve.
+    let empty_spec_dir = tempfile::tempdir().unwrap();
+    let resolved = resolve_and_load(
+        &catalog,
+        empty_spec_dir.path(),
+        "cat-a@1",
+        ResolutionContext::Interactive,
+    )
+    .unwrap();
+
+    assert_eq!(resolved.resolved, Some("cat-a@1".to_string()));
+    assert_eq!(resolved.bytes, std::fs::read(&wasm).unwrap());
+}
+
+#[test]
+fn an_unqualified_name_in_durable_context_is_rejected() {
+    let catalog_dir = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(catalog_dir.path());
+    let spec_dir = tempfile::tempdir().unwrap();
+
+    let err = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        "no-version",
+        ResolutionContext::Durable,
+    )
+    .unwrap_err();
+    assert!(matches!(err, PipelineError::Resolution(_)));
+}
+
+#[test]
+fn a_source_directory_is_rejected_with_a_friendly_message() {
+    let spec_dir = tempfile::tempdir().unwrap();
+    let block_src_dir = spec_dir.path().join("some-block-src");
+    std::fs::create_dir(&block_src_dir).unwrap();
+    let catalog = Catalog::open(spec_dir.path().join("unused-catalog"));
+
+    // Must contain a `/` so `resolve_and_load`'s own `looks_path_like` rule
+    // joins it against `spec_dir` — a bare `"some-block-src"` (no slash, no
+    // .wasm/.cfbundle suffix) is treated as a catalog name instead and would
+    // return NotFound, not the directory message this test checks for.
+    let err = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        "./some-block-src",
+        ResolutionContext::Interactive,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("directory"), "{msg}");
+}
+
+#[test]
+fn a_missing_direct_path_names_the_path() {
+    let spec_dir = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(spec_dir.path().join("unused-catalog"));
+
+    let err = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        "no/such/block.wasm",
+        ResolutionContext::Interactive,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("block.wasm"), "{err}");
 }

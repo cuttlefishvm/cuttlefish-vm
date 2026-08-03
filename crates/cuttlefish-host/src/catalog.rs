@@ -129,7 +129,13 @@ pub enum CatalogError {
     /// anything).
     #[error("{path}: {reason}")]
     UninspectableArtifact {
-        /// The path that was handed to `add`.
+        /// The path that was handed to `add`, or a synthetic label standing
+        /// in for one — `read_bundle_signature` takes a `label: &str` that
+        /// need not be a real filesystem path. `add` always passes a real
+        /// on-disk path, but `pipeline::check` calls it with a stage's
+        /// display name, which for a `Cataloged` stage (built by
+        /// `pipeline::resolve_and_load` from a bare catalog name, not a
+        /// filesystem path) is just that bare name.
         path: PathBuf,
         /// What went wrong reading past the magic bytes.
         reason: String,
