@@ -155,6 +155,68 @@ fn format_did_you_mean(names: &[String]) -> String {
     }
 }
 
+/// Levenshtein edit distance between two strings, by character.
+// Wired into Catalog::show/resolve starting in Task 10; used in tests until then.
+#[allow(dead_code)]
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+
+    for i in 1..=a.len() {
+        curr[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Pick up to 5 catalogued names within edit distance 2 of `target_name`
+/// (compared as bare names, with any `@version` stripped from both sides),
+/// closest first, ties broken by `created_at` ascending (oldest first). A
+/// prefix match misses common real typos (`summarise`/`summarize` share no
+/// prefix relationship); edit distance catches them.
+// Wired into Catalog::show/rm/resolve starting in Task 10; used in tests until then.
+#[allow(dead_code)]
+fn pick_did_you_mean(target_name: &str, entries: &BTreeMap<String, Entry>) -> Vec<String> {
+    const MAX_DISTANCE: usize = 2;
+    const LIMIT: usize = 5;
+
+    // Suggest the newest version of each close name, not every version of it.
+    let mut by_name: BTreeMap<&str, (&str, &str)> = BTreeMap::new();
+    for (name_version, entry) in entries {
+        let name = name_version.split('@').next().unwrap_or(name_version);
+        if levenshtein(target_name, name) > MAX_DISTANCE {
+            continue;
+        }
+        by_name
+            .entry(name)
+            .and_modify(|(nv, created)| {
+                if entry.created_at.as_str() > *created {
+                    *nv = name_version;
+                    *created = entry.created_at.as_str();
+                }
+            })
+            .or_insert((name_version, entry.created_at.as_str()));
+    }
+
+    let mut candidates: Vec<(usize, &str, &str)> = by_name
+        .into_iter()
+        .map(|(name, (nv, created))| (levenshtein(target_name, name), nv, created))
+        .collect();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(b.2)));
+
+    candidates
+        .into_iter()
+        .take(LIMIT)
+        .map(|(_, nv, _)| nv.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +274,56 @@ mod tests {
             did_you_mean: vec![],
         };
         assert_eq!(err.to_string(), "no such catalog entry: xyz@1");
+    }
+
+    fn entry_fixture(created_at: &str) -> Entry {
+        Entry {
+            hash: "sha256:deadbeef".to_string(),
+            kind: ArtifactKind::Block,
+            signature: "json -> json".to_string(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn levenshtein_matches_known_distances() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("summarize", "summarise"), 1);
+        assert_eq!(levenshtein("same", "same"), 0);
+    }
+
+    #[test]
+    fn did_you_mean_catches_a_one_character_typo_a_prefix_match_would_miss() {
+        // "summarise" and "summarize" share no prefix relationship (they diverge
+        // at the 8th character) — a starts-with prefix match would silently
+        // produce zero suggestions on exactly this typo.
+        let mut entries = BTreeMap::new();
+        entries.insert("summarize@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            pick_did_you_mean("summarise", &entries),
+            vec!["summarize@1".to_string()]
+        );
+    }
+
+    #[test]
+    fn did_you_mean_is_empty_when_nothing_registered_is_close() {
+        let mut entries = BTreeMap::new();
+        entries.insert("summarize@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+        assert!(pick_did_you_mean("completely-unrelated-name", &entries).is_empty());
+    }
+
+    #[test]
+    fn did_you_mean_is_capped_at_five_closest_ordered_by_distance() {
+        let mut entries = BTreeMap::new();
+        // All within edit distance 1 of "cat" by construction (each swaps one
+        // letter), so the cap — not the distance threshold — is what's under test.
+        for (i, name) in ["bat", "cot", "car", "cap", "can", "cad"].iter().enumerate() {
+            entries.insert(
+                format!("{name}@1"),
+                entry_fixture(&format!("2026-01-0{}T00:00:00Z", i + 1)),
+            );
+        }
+        let suggestions = pick_did_you_mean("cat", &entries);
+        assert_eq!(suggestions.len(), 5, "capped at 5: {suggestions:?}");
     }
 }
