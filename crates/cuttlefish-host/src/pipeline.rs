@@ -47,7 +47,6 @@ pub struct Stage {
 /// One pipeline entry's bytes, already resolved and loaded — from disk or
 /// from the catalog's blob store. `check()`'s input; see resolve_and_load
 /// (added in a later change) for how one of these gets built.
-#[derive(Debug)]
 pub struct ResolvedInput {
     /// Display name, same convention as [`Stage::name`].
     pub name: String,
@@ -58,6 +57,20 @@ pub struct ResolvedInput {
     pub resolved: Option<String>,
     /// The raw bytes.
     pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for ResolvedInput {
+    /// Hand-written so a `Debug`-formatted `ResolvedInput` (e.g. from a
+    /// panic or failed assertion) never dumps a multi-megabyte wasm module
+    /// as a wall of numbers — `bytes` is reported by length only.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedInput")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("resolved", &self.resolved)
+            .field("bytes", &format!("<{} bytes>", self.bytes.len()))
+            .finish()
+    }
 }
 
 /// A pipeline whose seams have been checked.
@@ -211,26 +224,37 @@ pub fn check(engine: &Engine, inputs: &[ResolvedInput]) -> Result<Checked, Pipel
 /// path and `cuttlefish build` — the only two callers, and both need the
 /// same resolve-then-load behavior.
 ///
-/// A path-like entry (contains `/`, or ends in `.wasm`/`.cfbundle`) is
-/// joined against `spec_dir` before resolution — matching the join every
-/// other spec-relative reference (`capabilities`) already gets, so a
-/// relative block path means the same thing regardless of the process's
-/// working directory. A bare `name@version` (or unqualified name) has no
-/// directory to join against and is passed to [`Catalog::resolve`]
-/// unmodified — joining it would turn `name@version` into
-/// `<spec_dir>/name@version`, which matches neither an index key nor a real
-/// file.
+/// An entry that resolves to a real path once joined against `spec_dir` is
+/// treated as that path — matching the join every other spec-relative
+/// reference (`capabilities`) already gets, so a relative block path means
+/// the same thing regardless of the process's working directory. This
+/// mirrors [`Catalog::resolve`]'s own Direct-vs-Cataloged decision (`s.ends_with(".wasm")
+/// || Path::new(s).exists()`), just relative to `spec_dir` instead of the
+/// process's CWD, rather than guessing from the raw string's shape (`entry`
+/// containing `/`) before `resolve` ever gets a look — a catalog name is
+/// free to contain `/` (a namespaced convention like `"team/cat-a@1"`), and
+/// joining on shape alone would corrupt such a name into a bogus path before
+/// the catalog's own index lookup ever sees it.
+///
+/// A `.wasm`/`.cfbundle` suffix is still always treated as a path reference
+/// even when the joined candidate doesn't exist on disk, so a genuinely
+/// missing compiled artifact still names the expected file in its error
+/// instead of silently falling back to a catalog lookup on a string that
+/// happens to contain that suffix. Anything else that doesn't resolve to a
+/// real file is passed to [`Catalog::resolve`] unmodified — joining it would
+/// turn `name@version` into `<spec_dir>/name@version`, which matches neither
+/// an index key nor a real file.
 pub fn resolve_and_load(
     catalog: &Catalog,
     spec_dir: &Path,
     entry: &str,
     context: ResolutionContext,
 ) -> Result<ResolvedInput, PipelineError> {
-    let looks_path_like =
-        entry.contains('/') || entry.ends_with(".wasm") || entry.ends_with(".cfbundle");
+    let candidate = spec_dir.join(entry);
+    let use_joined = candidate.exists() || entry.ends_with(".wasm") || entry.ends_with(".cfbundle");
     let joined;
-    let s: &str = if looks_path_like {
-        joined = spec_dir.join(entry).to_string_lossy().into_owned();
+    let s: &str = if use_joined {
+        joined = candidate.to_string_lossy().into_owned();
         &joined
     } else {
         entry
