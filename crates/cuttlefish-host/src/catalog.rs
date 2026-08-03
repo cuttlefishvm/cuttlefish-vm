@@ -221,6 +221,29 @@ fn pick_did_you_mean(target_name: &str, entries: &BTreeMap<String, Entry>) -> Ve
         .collect()
 }
 
+// Wired into Catalog::add starting in Task 9.
+#[allow(dead_code)]
+const WASM_MAGIC: &[u8] = b"\0asm";
+// Wired into Catalog::add starting in Task 9.
+#[allow(dead_code)]
+const BUNDLE_MAGIC: &[u8] = b"CFBD";
+
+/// Identify an artifact by its magic bytes, never by file extension — the
+/// same "classify by content" rule `handles::classify` already applies to
+/// input files. `None` means neither magic matched; the caller turns that
+/// into `CatalogError::UnrecognizedArtifact`, naming the path.
+// Wired into Catalog::add starting in Task 9.
+#[allow(dead_code)]
+fn sniff_artifact_kind(bytes: &[u8]) -> Option<ArtifactKind> {
+    if bytes.starts_with(WASM_MAGIC) {
+        Some(ArtifactKind::Block)
+    } else if bytes.starts_with(BUNDLE_MAGIC) {
+        Some(ArtifactKind::Bundle)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +379,26 @@ mod tests {
             vec!["summarize@2".to_string()],
             "must suggest the newest version of a matching name, not every version"
         );
+    }
+
+    #[test]
+    fn wasm_magic_bytes_sniff_as_a_block() {
+        assert_eq!(
+            sniff_artifact_kind(b"\0asm\x01\x00\x00\x00"),
+            Some(ArtifactKind::Block)
+        );
+    }
+
+    #[test]
+    fn bundle_magic_bytes_sniff_as_a_bundle() {
+        assert_eq!(
+            sniff_artifact_kind(b"CFBD\x00\x00\x00\x00\x00\x00\x00\x00"),
+            Some(ArtifactKind::Bundle)
+        );
+    }
+
+    #[test]
+    fn unrecognised_bytes_sniff_to_none_not_a_guess() {
+        assert_eq!(sniff_artifact_kind(b"whatever-this-is"), None);
     }
 }
