@@ -485,7 +485,7 @@ impl Catalog {
                     output: cuttlefish_abi::Ty::Json,
                 };
                 let is_permissive = sig == permissive;
-                (format!("{} -> {}", sig.input, sig.output), is_permissive)
+                (sig.to_string(), is_permissive)
             }
             ArtifactKind::Bundle => {
                 let sig = read_bundle_signature(&bytes, artifact_path)?;
