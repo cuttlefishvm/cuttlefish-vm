@@ -631,6 +631,12 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    /// Enough threads to genuinely contend for the index lock on any machine
+    /// this runs on, without making the test slow.
+    const WRITERS: usize = 16;
 
     #[test]
     fn index_file_serializes_to_the_shape_the_spec_documents() {
@@ -875,6 +881,218 @@ mod tests {
         let index = read_index(dir.path()).expect("the index must still parse after contention");
         assert!(index.entries.contains_key("a@1"));
         assert!(index.entries.contains_key("b@1"));
+    }
+
+    /// `add`'s duplicate check runs *inside* the locked section, so a pack of
+    /// writers racing for one key must resolve to exactly one winner — the
+    /// "versions are immutable once published" promise only holds under
+    /// contention if the check-then-insert is genuinely atomic. Every thread
+    /// is held at a barrier so they collide on the lock rather than politely
+    /// serializing.
+    #[test]
+    fn racing_inserts_of_the_same_key_leave_exactly_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(WRITERS));
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    with_locked_index(&root, |index| {
+                        if index.entries.contains_key("race@1") {
+                            return Err(CatalogError::AlreadyExists {
+                                name_version: "race@1".to_string(),
+                            });
+                        }
+                        index
+                            .entries
+                            .insert("race@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let winners = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one racing writer may claim a key; got {winners}"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|r| r.is_ok() || matches!(r, Err(CatalogError::AlreadyExists { .. }))),
+            "every loser must lose with AlreadyExists, not an io or corruption error: {results:?}"
+        );
+
+        let index = read_index(&root).expect("the index must still parse after contention");
+        assert_eq!(index.entries.len(), 1);
+    }
+
+    /// The two-thread test above proves the lock exists; this proves it holds
+    /// up under real contention. Without a barrier, two threads usually finish
+    /// one after another and never touch the lock at the same time, so a
+    /// read-modify-write that lost updates could still pass.
+    #[test]
+    fn many_racing_writers_of_distinct_keys_all_land_with_no_lost_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(WRITERS));
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    with_locked_index(&root, |index| {
+                        index.entries.insert(
+                            format!("writer-{w}@1"),
+                            entry_fixture("2026-01-01T00:00:00Z"),
+                        );
+                        Ok::<_, CatalogError>(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let index = read_index(&root).expect("the index must still parse after contention");
+        assert_eq!(
+            index.entries.len(),
+            WRITERS,
+            "every writer's entry must survive; a lost update means the \
+             read-modify-write escaped the lock: {:?}",
+            index.entries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `with_locked_index` documents that readers need no lock because a
+    /// writer only ever publishes via rename, so a reader sees the wholly-old
+    /// or wholly-new file and never a half-written one. Nothing asserted it:
+    /// this hammers lock-free readers against writers and fails if any read
+    /// ever comes back corrupt.
+    #[test]
+    fn lock_free_readers_never_observe_a_partial_index_while_writers_hammer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // Seed first so index.json exists before any reader starts — a
+        // missing index is legitimately empty, which would mask a torn read.
+        seed(&root, "seed@1", "2026-01-01T00:00:00Z");
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..60 {
+                        with_locked_index(&root, |index| {
+                            index.entries.insert(
+                                format!("w{w}-{i}@1"),
+                                entry_fixture("2026-01-01T00:00:00Z"),
+                            );
+                            Ok::<_, CatalogError>(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let root = root.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut reads = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        let index = read_index(&root)
+                            .expect("a lock-free reader must never see a partial or corrupt index");
+                        // A torn read that still parsed would most likely show
+                        // up as losing the seed entry that is only ever added.
+                        assert!(
+                            index.entries.contains_key("seed@1"),
+                            "an entry that is never removed vanished from a concurrent read"
+                        );
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let total: u32 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(
+            total > 0,
+            "the readers must have actually observed the index"
+        );
+    }
+
+    /// Every other concurrency test here races `add` against `add`. Removals
+    /// take the same lock and rewrite the same file, so a mixed workload is
+    /// where an asymmetry would show up — e.g. a removal path that wrote the
+    /// index outside the locked section. Each thread owns a disjoint key and
+    /// adds then removes it, so the end state is exactly the untouched
+    /// keep-alive entries regardless of interleaving.
+    #[test]
+    fn adds_and_removals_racing_on_one_index_leave_exactly_the_expected_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        seed(&root, "keep@1", "2026-01-01T00:00:00Z");
+        seed(&root, "keep@2", "2026-01-01T00:00:00Z");
+
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let key = format!("churn-{w}@1");
+                    barrier.wait();
+                    for _ in 0..10 {
+                        with_locked_index(&root, |index| {
+                            index
+                                .entries
+                                .insert(key.clone(), entry_fixture("2026-01-01T00:00:00Z"));
+                            Ok::<_, CatalogError>(())
+                        })
+                        .unwrap();
+                        with_locked_index(&root, |index| {
+                            index.entries.remove(&key).expect(
+                                "a key only this thread ever touches must still be present",
+                            );
+                            Ok::<_, CatalogError>(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let index = read_index(&root).expect("the index must still parse after mixed contention");
+        let names: Vec<_> = index.entries.keys().cloned().collect();
+        assert_eq!(
+            names,
+            vec!["keep@1".to_string(), "keep@2".to_string()],
+            "churn keys must all be gone and the untouched entries must survive"
+        );
     }
 
     #[test]
