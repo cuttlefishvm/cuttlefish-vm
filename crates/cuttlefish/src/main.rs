@@ -130,29 +130,22 @@ mod cli {
         match action {
             CatalogCmd::Add { name_version, path } => {
                 let engine = wasmtime::Engine::default();
-                match catalog.add(&name_version, &path, &engine) {
-                    Ok(outcome) => {
-                        println!(
-                            "catalogued {}  ({})",
-                            outcome.name_version, outcome.signature
-                        );
-                        if outcome.is_permissive_default {
-                            println!(
-                                "warning: {} did not declare a signature (no cf_signature export \
-                                 present) — cached as the permissive default, which means \
-                                 pipeline::check will accept it next to almost anything. Add a \
-                                 signature() impl (see cuttlefish-sdk's Block trait) if this block \
-                                 has a real input/output shape.",
-                                outcome.name_version
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
+                let outcome = catalog.add(&name_version, &path, &engine)?;
+                println!(
+                    "catalogued {}  ({})",
+                    outcome.name_version, outcome.signature
+                );
+                if outcome.is_permissive_default {
+                    println!(
+                        "warning: {} did not declare a signature (no cf_signature export \
+                         present) — cached as the permissive default, which means \
+                         pipeline::check will accept it next to almost anything. Add a \
+                         signature() impl (see cuttlefish-sdk's Block trait) if this block \
+                         has a real input/output shape.",
+                        outcome.name_version
+                    );
                 }
+                Ok(())
             }
             CatalogCmd::List => {
                 for (name_version, entry) in catalog.list()? {
@@ -160,30 +153,20 @@ mod cli {
                 }
                 Ok(())
             }
-            CatalogCmd::Show { name_version } => match catalog.show(&name_version) {
-                Ok(entry) => {
-                    println!("{name_version}");
-                    println!("  kind:      {:?}", entry.kind);
-                    println!("  signature: {}", entry.signature);
-                    println!("  hash:      {}", entry.hash);
-                    println!("  created:   {}", entry.created_at);
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            },
-            CatalogCmd::Rm { name_version } => match catalog.rm(&name_version) {
-                Ok(()) => {
-                    println!("removed {name_version}");
-                    Ok(())
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            },
+            CatalogCmd::Show { name_version } => {
+                let entry = catalog.show(&name_version)?;
+                println!("{name_version}");
+                println!("  kind:      {:?}", entry.kind);
+                println!("  signature: {}", entry.signature);
+                println!("  hash:      {}", entry.hash);
+                println!("  created:   {}", entry.created_at);
+                Ok(())
+            }
+            CatalogCmd::Rm { name_version } => {
+                catalog.rm(&name_version)?;
+                println!("removed {name_version}");
+                Ok(())
+            }
         }
     }
 
