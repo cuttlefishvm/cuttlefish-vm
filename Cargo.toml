@@ -78,6 +78,7 @@ sha2 = "0.10"
 # string for ordering, never parsed back, so `parsing` isn't needed.
 time = { version = "0.3", features = ["formatting"] }
 # Cross-platform home-directory lookup for the default catalog root
-# (~/.cuttlefish/catalog), used by both cuttlefish (the CLI) and
-# cuttlefish-host (cuttlefishd's run path resolves catalog names too).
+# (~/.cuttlefish/catalog). Only cuttlefish-host calls it directly
+# (catalog::default_root); cuttlefish (the CLI) reaches it transitively.
+# cuttlefishd will too, once its run path resolves catalog names.
 dirs = "6"
