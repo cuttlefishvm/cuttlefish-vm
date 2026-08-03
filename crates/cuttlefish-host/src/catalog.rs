@@ -1351,6 +1351,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_a_dot_cfbundle_suffix_is_direct_even_if_the_file_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let resolved = catalog
+            .resolve(
+                "/nonexistent/bundle.cfbundle",
+                ResolutionContext::Interactive,
+            )
+            .unwrap();
+        assert!(matches!(resolved, Resolved::Direct(_)));
+    }
+
+    #[test]
     fn resolve_an_existing_filesystem_path_is_direct_no_catalog_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let real_file = tempfile::NamedTempFile::new().unwrap();
