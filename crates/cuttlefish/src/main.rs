@@ -5,9 +5,11 @@
 //! a human can drive the same thing without writing a client, and so that
 //! anything awkward to do by hand shows up as awkward here too.
 //!
-//! `catalog` is the one exception: it's a purely local filesystem operation
-//! (see `cuttlefish_host::catalog`) with no daemon involved at all, since the
-//! block catalog is designed to work standalone.
+//! `catalog` and `build` are the exceptions: both are purely local
+//! filesystem operations (see `cuttlefish_host::catalog` and
+//! `cuttlefish_host::bundle`) with no daemon involved at all, since the
+//! block catalog and the pipeline linker are both designed to work
+//! standalone.
 //!
 //! Exit status is the machine-readable result: `0` completed, `1` failed, `2`
 //! cancelled. A shell script or an agent can branch on that without parsing
@@ -70,6 +72,16 @@ mod cli {
             #[command(subcommand)]
             action: CatalogCmd,
         },
+        /// Link and verify a spec's pipeline into a distributable .cfbundle.
+        /// Purely local — no running daemon required.
+        Build {
+            /// The .cuttlefish spec to build.
+            spec: PathBuf,
+            /// Where to write the bundle. Defaults to the spec's own path
+            /// with its extension replaced by .cfbundle.
+            #[arg(short, long)]
+            output: Option<PathBuf>,
+        },
     }
 
     /// `cuttlefish catalog` subcommands.
@@ -106,6 +118,7 @@ mod cli {
                 input,
             } => run(&socket, &spec, &input).await,
             Cmd::Catalog { action } => catalog_cmd(action),
+            Cmd::Build { spec, output } => build_cmd(&spec, output),
         }
     }
 
@@ -157,6 +170,57 @@ mod cli {
                 Ok(())
             }
         }
+    }
+
+    fn build_cmd(spec_path: &Path, output: Option<PathBuf>) -> anyhow::Result<()> {
+        let src = std::fs::read_to_string(spec_path)
+            .with_context(|| format!("reading {}", spec_path.display()))?;
+        let spec = cuttlefish_core::spec::parse_spec(&src)
+            .with_context(|| format!("parsing {}", spec_path.display()))?;
+        let spec_dir = spec_path.parent().unwrap_or_else(|| Path::new("."));
+
+        let catalog_root = cuttlefish_host::catalog::default_root()
+            .context("could not determine home directory; set CUTTLEFISH_HOME")?;
+        let catalog = cuttlefish_host::catalog::Catalog::open(catalog_root);
+        let engine = wasmtime::Engine::default();
+
+        let resolved: Vec<_> = spec
+            .pipeline
+            .iter()
+            .map(|entry| {
+                cuttlefish_host::pipeline::resolve_and_load(
+                    &catalog,
+                    spec_dir,
+                    &entry.to_string_lossy(),
+                    cuttlefish_host::catalog::ResolutionContext::Interactive,
+                )
+            })
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("resolving the pipeline for `{}`", spec.name))?;
+
+        let checked = cuttlefish_host::pipeline::check(&engine, &resolved)
+            .with_context(|| format!("checking the pipeline for `{}`", spec.name))?;
+
+        for stage in checked.stages() {
+            println!(
+                "checking node `{}`      ... ok  ({})",
+                stage.name, stage.signature
+            );
+        }
+
+        let bytes = cuttlefish_host::bundle::build(&checked);
+        let out_path = output.unwrap_or_else(|| spec_path.with_extension("cfbundle"));
+        std::fs::write(&out_path, &bytes)
+            .with_context(|| format!("writing {}", out_path.display()))?;
+
+        println!(
+            "built: {}  ({} nodes, accepts {}, produces {})",
+            out_path.display(),
+            checked.stages().len(),
+            checked.input(),
+            checked.output()
+        );
+        Ok(())
     }
 
     /// Build a client bound to a unix socket.
