@@ -43,6 +43,8 @@ async-trait = "0.1"
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
+# sha2: content-hashing for the catalog's blob store, wired in starting in Task 7.
+# time: RFC 3339 timestamps for the catalog's created_at field, wired in starting in Task 9.
 sha2 = { workspace = true }
 time = { workspace = true }
 base64 = "0.22"
