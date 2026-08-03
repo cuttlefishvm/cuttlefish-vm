@@ -391,35 +391,37 @@ fn a_bare_catalog_name_is_not_joined_against_spec_dir() {
 }
 
 #[test]
-fn a_hierarchical_catalog_name_containing_a_slash_still_resolves() {
-    // Regression test: `resolve_and_load` used to join *any* entry containing
-    // `/` against `spec_dir` before ever calling `catalog.resolve`, which
-    // corrupted a hierarchically-namespaced catalog name like
-    // "team/cat-a@1" into a bogus path and made it permanently
-    // unreferenceable from a pipeline. Nothing in this codebase forbids `/`
-    // in a catalog name, so this must resolve through the catalog's own
-    // index lookup instead.
+fn a_dotted_catalog_name_still_resolves_through_the_catalog_not_a_join() {
+    // Regression test: `resolve_and_load` used to decide whether to join an
+    // entry against `spec_dir` from the entry's *shape* alone, which could
+    // corrupt a catalog name that merely looked path-like into a bogus path
+    // before `catalog.resolve` ever got a chance to look it up. A catalog
+    // name may legally contain `.` (only `/` is rejected, by
+    // `validate_name_version`'s character-class check), so a name like
+    // "team.cat-a" is exactly the kind of not-quite-a-filename string this
+    // must still resolve correctly, via the catalog's own index lookup
+    // rather than a filesystem join.
     let src_dir = tempfile::tempdir().unwrap();
     let catalog_dir = tempfile::tempdir().unwrap();
     let wasm = block_with(src_dir.path(), "team_cat_a", "text", "text");
     let catalog = Catalog::open(catalog_dir.path());
     catalog
-        .add("team/cat-a@1", &wasm, &Engine::default())
+        .add("team.cat-a@1", &wasm, &Engine::default())
         .unwrap();
 
-    // spec_dir deliberately has nothing at "team/cat-a@1" (or any part of
-    // that path) — if the entry were joined against it regardless, there'd
-    // be no file there and the bug would be masked rather than reproduced.
+    // spec_dir deliberately has nothing at "team.cat-a@1" — if the entry
+    // were joined against it regardless, there'd be no file there and the
+    // bug would be masked rather than reproduced.
     let empty_spec_dir = tempfile::tempdir().unwrap();
     let resolved = resolve_and_load(
         &catalog,
         empty_spec_dir.path(),
-        "team/cat-a@1",
+        "team.cat-a@1",
         ResolutionContext::Interactive,
     )
     .unwrap();
 
-    assert_eq!(resolved.resolved, Some("team/cat-a@1".to_string()));
+    assert_eq!(resolved.resolved, Some("team.cat-a@1".to_string()));
     assert_eq!(resolved.bytes, std::fs::read(&wasm).unwrap());
 }
 
