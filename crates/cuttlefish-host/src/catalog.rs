@@ -446,7 +446,7 @@ impl Catalog {
                 let sig = crate::runner::read_signature(engine, &bytes).map_err(|e| {
                     CatalogError::UninspectableArtifact {
                         path: artifact_path.to_path_buf(),
-                        reason: e.to_string(),
+                        reason: format!("{e:#}"),
                     }
                 })?;
                 let permissive = cuttlefish_abi::Signature {
