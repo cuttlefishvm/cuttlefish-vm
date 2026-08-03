@@ -91,7 +91,10 @@ pub enum CatalogError {
         name_version: String,
     },
     /// No entry matches the requested `name@version`.
-    #[error("no such catalog entry: {name_version}{}", format_did_you_mean(did_you_mean))]
+    #[error(
+        "no such catalog entry: {name_version}{}",
+        format_did_you_mean(did_you_mean)
+    )]
     NotFound {
         /// The name@version that was requested.
         name_version: String,
@@ -183,6 +186,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 // Wired into Catalog::show/rm/resolve starting in Task 10; used in tests until then.
 #[allow(dead_code)]
 fn pick_did_you_mean(target_name: &str, entries: &BTreeMap<String, Entry>) -> Vec<String> {
+    let target_name = target_name.split('@').next().unwrap_or(target_name);
     const MAX_DISTANCE: usize = 2;
     const LIMIT: usize = 5;
 
@@ -298,7 +302,10 @@ mod tests {
         // at the 8th character) — a starts-with prefix match would silently
         // produce zero suggestions on exactly this typo.
         let mut entries = BTreeMap::new();
-        entries.insert("summarize@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+        entries.insert(
+            "summarize@1".to_string(),
+            entry_fixture("2026-01-01T00:00:00Z"),
+        );
         assert_eq!(
             pick_did_you_mean("summarise", &entries),
             vec!["summarize@1".to_string()]
@@ -308,7 +315,10 @@ mod tests {
     #[test]
     fn did_you_mean_is_empty_when_nothing_registered_is_close() {
         let mut entries = BTreeMap::new();
-        entries.insert("summarize@1".to_string(), entry_fixture("2026-01-01T00:00:00Z"));
+        entries.insert(
+            "summarize@1".to_string(),
+            entry_fixture("2026-01-01T00:00:00Z"),
+        );
         assert!(pick_did_you_mean("completely-unrelated-name", &entries).is_empty());
     }
 
@@ -317,7 +327,10 @@ mod tests {
         let mut entries = BTreeMap::new();
         // All within edit distance 1 of "cat" by construction (each swaps one
         // letter), so the cap — not the distance threshold — is what's under test.
-        for (i, name) in ["bat", "cot", "car", "cap", "can", "cad"].iter().enumerate() {
+        for (i, name) in ["bat", "cot", "car", "cap", "can", "cad"]
+            .iter()
+            .enumerate()
+        {
             entries.insert(
                 format!("{name}@1"),
                 entry_fixture(&format!("2026-01-0{}T00:00:00Z", i + 1)),
@@ -325,5 +338,23 @@ mod tests {
         }
         let suggestions = pick_did_you_mean("cat", &entries);
         assert_eq!(suggestions.len(), 5, "capped at 5: {suggestions:?}");
+    }
+
+    #[test]
+    fn did_you_mean_suggests_the_newest_version_when_multiple_versions_of_a_close_name_exist() {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "summarize@1".to_string(),
+            entry_fixture("2026-01-01T00:00:00Z"),
+        );
+        entries.insert(
+            "summarize@2".to_string(),
+            entry_fixture("2026-06-01T00:00:00Z"),
+        );
+        assert_eq!(
+            pick_did_you_mean("summarise", &entries),
+            vec!["summarize@2".to_string()],
+            "must suggest the newest version of a matching name, not every version"
+        );
     }
 }
