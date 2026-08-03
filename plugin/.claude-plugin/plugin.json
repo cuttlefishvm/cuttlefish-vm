@@ -1,0 +1,12 @@
+{
+  "name": "cuttlefish-agent-tools",
+  "description": "Skill and adversarial test harness for the cuttlefish block catalog CLI",
+  "version": "0.1.0",
+  "author": {
+    "name": "cuttlefishvm"
+  },
+  "homepage": "https://cuttlefishvm.github.io/",
+  "repository": "https://github.com/cuttlefishvm/cuttlefish-vm",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["cuttlefish", "catalog", "wasm", "agent-tooling"]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "cuttlefish-vm",
+  "owner": {
+    "name": "cuttlefishvm",
+    "url": "https://github.com/cuttlefishvm/cuttlefish-vm"
+  },
+  "description": "Agent tooling for driving the Cuttlefish block catalog",
+  "plugins": [
+    {
+      "name": "cuttlefish-agent-tools",
+      "source": "./plugin",
+      "description": "Skill and adversarial test harness for the cuttlefish block catalog CLI"
+    }
+  ]
+}
