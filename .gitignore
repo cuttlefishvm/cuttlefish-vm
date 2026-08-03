@@ -11,3 +11,6 @@ lcov.info
 # See AGENTS.md. Anything in here that turns out to be worth keeping should be
 # moved into module docs rather than committed as a separate file.
 /docs/
+
+# Local git worktrees for isolated feature work (superpowers:using-git-worktrees).
+/.worktrees/

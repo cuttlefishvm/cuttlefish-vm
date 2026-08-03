@@ -174,6 +174,31 @@ token — CI publishes the resulting percentage as a small JSON file alongside t
 API docs, and the badge above renders from it. Coverage data never leaves the
 build.
 
+## Agent tools (Claude Code)
+
+This repo carries its own Claude Code plugin marketplace
+(`.claude-plugin/marketplace.json`), so an agent working in a checkout of
+this repo can install a `cuttlefish-catalog` skill (exact CLI syntax for
+`cuttlefish catalog add/list/show/rm`) and a
+`/cuttlefish-agent-tools:test-catalog` command that drives an independent,
+adversarial exercise of the catalog CLI:
+
+```
+/plugin marketplace add ./
+/plugin install cuttlefish-agent-tools@cuttlefish-vm
+/reload-plugins
+```
+
+Once this lands on `main`, the same thing works from anywhere without a
+local checkout, using the GitHub shorthand instead of a local path:
+
+```
+/plugin marketplace add cuttlefishvm/cuttlefish-vm
+/plugin install cuttlefish-agent-tools@cuttlefish-vm
+```
+
+See [`plugin/README.md`](./plugin/README.md) for what the plugin provides.
+
 ## Contributing
 
 Contributions are welcome. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) for

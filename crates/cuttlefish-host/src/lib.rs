@@ -21,12 +21,19 @@
 //! OpenAI-compatible endpoint, an embedded llama.cpp — is additive rather than a
 //! change to the runner, the parser, or the daemon. [`ollama`] is the first real
 //! one.
+//!
+//! [`catalog`] is a separate concern from the job-execution path above: a
+//! local, content-addressed store mapping `name@version` to a cataloged wasm
+//! block or bundle, so a pipeline can reference a block by name instead of a
+//! filesystem path. Purely local filesystem operations — no daemon
+//! involvement, no network.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod backend;
 pub mod caps;
+pub mod catalog;
 pub mod documents;
 pub mod handles;
 pub mod infer;

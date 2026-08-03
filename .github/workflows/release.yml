@@ -113,3 +113,112 @@ jobs:
             sleep 15
             echo "::endgroup::"
           done
+
+  # Cuts the GitHub Release once, before any binary uploads race to create it.
+  # Binary jobs below only ever upload assets to an already-existing release.
+  create-release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release if it does not already exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+
+  # Prebuilt `cuttlefish` (CLI) and `cuttlefishd` (daemon) binaries, so using
+  # this project doesn't require a Rust toolchain. Built without the
+  # `llamacpp`/`pdf-render` features: both pull in a native C/C++ toolchain
+  # (cmake, clang, or a pinned libpdfium) that isn't uniformly available
+  # across this matrix's runners — the same default-feature build the `test`
+  # job above already exercises on all three OSes.
+  #
+  # Every target here is a *native* build on its runner's own architecture
+  # except x86_64-apple-darwin, cross-compiled from the arm64 macos-latest
+  # runner — the standard way to produce an Intel Mac binary today, using the
+  # x86_64 slice of the same Xcode SDK already on the runner.
+  release-binaries:
+    name: Build release binaries (${{ matrix.target }})
+    needs: create-release
+    # By default a job with `needs:` is skipped when the needed job is
+    # skipped, not only when it fails — so on a workflow_dispatch dry run
+    # (create-release skips itself via its own `if:`), this job would skip
+    # too and never actually prove the cross-compilation matrix builds. This
+    # `if:` explicitly allows both outcomes: proceed when create-release
+    # succeeded (real tag push) or was skipped (dry run) — only propagate an
+    # actual failure. The upload step below is separately gated to real tag
+    # pushes, so a dry run still builds and packages every target without
+    # uploading anything.
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p cuttlefish -p cuttlefishd
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="cuttlefish-${version}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/cuttlefish" "$name/"
+          cp "target/${{ matrix.target }}/release/cuttlefishd" "$name/"
+          cp README.md LICENSE_MIT.md LICENSE_APACHE.md "$name/"
+          tar czf "${name}.tar.gz" "$name"
+          echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="cuttlefish-${version}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/cuttlefish.exe" "$name/"
+          cp "target/${{ matrix.target }}/release/cuttlefishd.exe" "$name/"
+          cp README.md LICENSE_MIT.md LICENSE_APACHE.md "$name/"
+          7z a "${name}.zip" "$name" >/dev/null
+          echo "ASSET=${name}.zip" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
