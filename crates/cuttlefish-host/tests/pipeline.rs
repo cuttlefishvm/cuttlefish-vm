@@ -13,7 +13,9 @@
 mod support;
 
 use cuttlefish_host::catalog::{ArtifactKind, Catalog, ResolutionContext};
-use cuttlefish_host::pipeline::{check, resolve_and_load, PipelineError, ResolvedInput};
+use cuttlefish_host::pipeline::{
+    check, read_stage_signature, resolve_and_load, PipelineError, ResolvedInput,
+};
 use std::path::PathBuf;
 use support::block_with;
 use wasmtime::Engine;
@@ -207,6 +209,27 @@ fn an_empty_pipeline_is_rejected() {
         .err()
         .expect("nothing to run");
     assert!(matches!(err, PipelineError::Empty));
+}
+
+#[test]
+fn read_stage_signature_matches_what_check_already_produced_for_a_block() {
+    // `read_stage_signature` must be the exact same per-node lookup `check`
+    // already runs — pinning it against a real compiled block, not a mock,
+    // is the whole point (a mocked signature would test the extraction
+    // against a fiction rather than the artifact that will actually run).
+    let dir = tempfile::tempdir().unwrap();
+    let block = block_with(dir.path(), "read_sig_a", "text", "text");
+
+    let input = ResolvedInput {
+        name: "x".into(),
+        kind: ArtifactKind::Block,
+        resolved: None,
+        bytes: std::fs::read(&block).unwrap(),
+    };
+
+    let sig = read_stage_signature(&Engine::default(), &input).unwrap();
+    assert_eq!(sig.input.describe(), "text");
+    assert_eq!(sig.output.describe(), "text");
 }
 
 // -- execution --------------------------------------------------------------
