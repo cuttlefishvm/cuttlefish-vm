@@ -233,7 +233,15 @@ fn pick_did_you_mean(target_name: &str, entries: &BTreeMap<String, Entry>) -> Ve
 }
 
 const WASM_MAGIC: &[u8] = b"\0asm";
-const BUNDLE_MAGIC: &[u8] = b"CFBD";
+/// The one source of truth for the `.cfbundle` container's magic bytes —
+/// shared with `bundle::build` (the writer) so the two can never drift
+/// apart the way `manifest_len`'s endianness once had to be pinned down
+/// after the fact.
+pub(crate) const BUNDLE_MAGIC: &[u8; 4] = b"CFBD";
+/// `.cfbundle`'s fixed header size: `BUNDLE_MAGIC` (4 bytes) + `manifest_len`
+/// as a little-endian `u64` (8 bytes). Shared with `bundle::build`, which
+/// writes exactly this many bytes before the manifest.
+pub(crate) const BUNDLE_HEADER_LEN: usize = BUNDLE_MAGIC.len() + 8;
 
 /// Identify an artifact by its magic bytes, never by file extension — the
 /// same "classify by content" rule `handles::classify` already applies to
@@ -355,9 +363,7 @@ fn is_well_formed_sha256_hex(hex: &str) -> bool {
 /// (which doesn't exist as code yet) must write `manifest_len` little-endian
 /// to match what this reader expects, not native-endian.
 pub(crate) fn read_bundle_signature(bytes: &[u8], label: &str) -> Result<String, CatalogError> {
-    const HEADER_LEN: usize = 4 + 8; // b"CFBD" + manifest_len as u64 LE
-
-    if bytes.len() < HEADER_LEN {
+    if bytes.len() < BUNDLE_HEADER_LEN {
         return Err(CatalogError::UninspectableArtifact {
             path: PathBuf::from(label),
             reason: "shorter than the bundle header".to_string(),
@@ -365,10 +371,10 @@ pub(crate) fn read_bundle_signature(bytes: &[u8], label: &str) -> Result<String,
     }
 
     let manifest_len =
-        u64::from_le_bytes(bytes[4..HEADER_LEN].try_into().expect("8 bytes")) as usize;
-    let manifest_bytes = HEADER_LEN
+        u64::from_le_bytes(bytes[4..BUNDLE_HEADER_LEN].try_into().expect("8 bytes")) as usize;
+    let manifest_bytes = BUNDLE_HEADER_LEN
         .checked_add(manifest_len)
-        .and_then(|end| bytes.get(HEADER_LEN..end))
+        .and_then(|end| bytes.get(BUNDLE_HEADER_LEN..end))
         .ok_or_else(|| CatalogError::UninspectableArtifact {
             path: PathBuf::from(label),
             reason: format!("manifest_len {manifest_len} exceeds the file's actual length"),
@@ -1062,7 +1068,7 @@ mod tests {
 
     #[test]
     fn an_overflowing_manifest_len_is_uninspectable_not_a_panic() {
-        // manifest_len near u64::MAX must not panic when added to HEADER_LEN —
+        // manifest_len near u64::MAX must not panic when added to BUNDLE_HEADER_LEN —
         // regression test for the checked_add fix (a bare `+` here panics with
         // "attempt to add with overflow" in debug builds, turning a crafted
         // bundle file into a crash instead of a clean error).
