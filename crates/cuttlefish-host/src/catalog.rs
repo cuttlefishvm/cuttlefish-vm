@@ -1128,11 +1128,37 @@ mod tests {
         })
         .unwrap();
 
-        Catalog::open(dir.path()).rm("a@1").unwrap();
+        let catalog = Catalog::open(dir.path());
+        catalog.rm("a@1").unwrap();
 
+        assert!(
+            matches!(catalog.show("a@1"), Err(CatalogError::NotFound { .. })),
+            "rm must actually remove the index entry, not silently no-op"
+        );
         assert!(
             dir.path().join("blobs").join(hex).exists(),
             "rm is index-only; the blob must remain"
+        );
+    }
+
+    #[test]
+    fn list_returns_multiple_entries_sorted_by_name_at_version() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "b@1", "2026-01-01T00:00:00Z");
+        seed(dir.path(), "a@1", "2026-01-01T00:00:00Z");
+        seed(dir.path(), "c@1", "2026-01-01T00:00:00Z");
+
+        let catalog = Catalog::open(dir.path());
+        let names: Vec<String> = catalog
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|(name_version, _)| name_version)
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["a@1".to_string(), "b@1".to_string(), "c@1".to_string()]
         );
     }
 }
