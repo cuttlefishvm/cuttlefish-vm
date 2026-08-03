@@ -918,6 +918,7 @@ dependencies = [
  "base64",
  "cuttlefish-abi",
  "cuttlefish-core",
+ "dirs",
  "encoding_rs",
  "futures-util",
  "image",

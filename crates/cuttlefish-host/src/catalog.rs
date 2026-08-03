@@ -659,6 +659,18 @@ impl Catalog {
     }
 }
 
+/// Where the catalog lives when the caller doesn't say otherwise:
+/// `$CUTTLEFISH_HOME/catalog` if set, else `~/.cuttlefish/catalog`. `None`
+/// when neither is available — this library never exits the process on a
+/// caller's behalf, so reporting that is the caller's job (both `cuttlefish`
+/// and `cuttlefishd` already have their own error-reporting convention).
+pub fn default_root() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("CUTTLEFISH_HOME") {
+        return Some(PathBuf::from(home).join("catalog"));
+    }
+    dirs::home_dir().map(|home| home.join(".cuttlefish").join("catalog"))
+}
+
 /// The current UTC time, truncated to whole seconds and formatted as RFC
 /// 3339 (`2026-08-02T18:03:00Z`). Truncating avoids variable-width fractional
 /// seconds, so `created_at` strings sort correctly with plain string
@@ -675,6 +687,19 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_root_honors_cuttlefish_home() {
+        // No other test in this process mutates CUTTLEFISH_HOME, and
+        // catalog.rs's own tests never read it — set/remove is confined to
+        // this one test. (This toolchain's std::env::set_var/remove_var are
+        // safe fns, not unsafe — the crate forbids unsafe_code entirely, so
+        // an unsafe wrapper isn't an option regardless.)
+        std::env::set_var("CUTTLEFISH_HOME", "/tmp/cf-test-home");
+        let root = default_root();
+        std::env::remove_var("CUTTLEFISH_HOME");
+        assert_eq!(root, Some(PathBuf::from("/tmp/cf-test-home/catalog")));
+    }
 
     #[test]
     fn index_file_serializes_to_the_shape_the_spec_documents() {

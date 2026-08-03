@@ -77,6 +77,7 @@ sha2 = "0.10"
 # `formatting` feature — `created_at` is written once and compared as a plain
 # string for ordering, never parsed back, so `parsing` isn't needed.
 time = { version = "0.3", features = ["formatting"] }
-# Cross-platform home-directory lookup for the CLI's default catalog root
-# (~/.cuttlefish/catalog). Only used by crates/cuttlefish, not cuttlefish-host.
+# Cross-platform home-directory lookup for the default catalog root
+# (~/.cuttlefish/catalog), used by both cuttlefish (the CLI) and
+# cuttlefish-host (cuttlefishd's run path resolves catalog names too).
 dirs = "6"

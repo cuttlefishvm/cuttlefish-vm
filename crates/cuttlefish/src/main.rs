@@ -109,23 +109,12 @@ mod cli {
         }
     }
 
-    /// Where the catalog lives when the caller doesn't say otherwise:
-    /// `$CUTTLEFISH_HOME/catalog` if set, else `~/.cuttlefish/catalog`.
-    fn default_catalog_root() -> PathBuf {
-        if let Ok(home) = std::env::var("CUTTLEFISH_HOME") {
-            return PathBuf::from(home).join("catalog");
-        }
-        let home = dirs::home_dir().unwrap_or_else(|| {
-            eprintln!("error: could not determine home directory; set CUTTLEFISH_HOME");
-            std::process::exit(1);
-        });
-        home.join(".cuttlefish").join("catalog")
-    }
-
     fn catalog_cmd(action: CatalogCmd) -> anyhow::Result<()> {
         use cuttlefish_host::catalog::Catalog;
 
-        let catalog = Catalog::open(default_catalog_root());
+        let catalog_root = cuttlefish_host::catalog::default_root()
+            .context("could not determine home directory; set CUTTLEFISH_HOME")?;
+        let catalog = Catalog::open(catalog_root);
 
         match action {
             CatalogCmd::Add { name_version, path } => {

@@ -47,6 +47,7 @@ serde = { workspace = true }
 # time: RFC 3339 timestamps for the catalog's created_at field, wired in starting in Task 9.
 sha2 = { workspace = true }
 time = { workspace = true }
+dirs = { workspace = true }
 base64 = "0.22"
 # Document reading. Pure Rust and always on — extraction is the cheap path that
 # works with any text model.
