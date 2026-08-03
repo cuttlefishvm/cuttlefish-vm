@@ -2,13 +2,10 @@
 //!
 //! See the library docs for the transport design and job lifecycle.
 //!
-//! The daemon serves over a unix domain socket, so it runs on unix only for now.
-//! The rest of the workspace is cross-platform; a Windows build produces a
-//! binary that explains itself and exits, rather than one that silently does
-//! nothing. Adding a TCP listener would lift this — see the transport notes in
-//! the library docs.
+//! The daemon serves over a machine-local, OS-permission-gated transport: a
+//! unix domain socket on unix, a named pipe on Windows. See `serve` for why
+//! that pairing rather than a TCP listener.
 
-#[cfg(unix)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use anyhow::Context;
@@ -23,11 +20,14 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "pdf-render")]
     cuttlefish_host::render_worker::run_if_worker();
 
-    let usage = "usage: cuttlefishd <spec> <block.wasm> [socket]";
+    let usage = "usage: cuttlefishd <spec> <block.wasm> [endpoint]";
     let mut args = std::env::args().skip(1);
     let spec_path = PathBuf::from(args.next().context(usage)?);
     let wasm_path = args.next().context(usage)?;
-    let sock_path = PathBuf::from(args.next().unwrap_or_else(|| "/tmp/cuttlefish.sock".into()));
+    let endpoint = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(cuttlefish_core::endpoint::default_endpoint);
 
     let mut spec = cuttlefish_core::spec::parse_spec(
         &std::fs::read_to_string(&spec_path)
@@ -132,15 +132,5 @@ async fn main() -> anyhow::Result<()> {
         }),
     };
 
-    serve::serve_unix(api::router(state), &sock_path).await
-}
-
-#[cfg(not(unix))]
-fn main() {
-    eprintln!(
-        "cuttlefishd serves over a unix domain socket and does not run on this \
-         platform yet. The library crates are cross-platform; only the transport \
-         is unix-only."
-    );
-    std::process::exit(1);
+    serve::serve(api::router(state), &endpoint).await
 }
