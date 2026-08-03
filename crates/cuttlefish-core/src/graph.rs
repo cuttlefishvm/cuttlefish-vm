@@ -179,11 +179,7 @@ impl<'a> GraphParser<'a> {
                 "in" => input = Some(self.input_expr()?),
                 "repeat_until" => repeat_until = Some(self.string_or_field()?),
                 "max_iterations" => max_iterations = Some(self.number()?),
-                other => {
-                    return Err(SpecError::Malformed(format!(
-                        "unknown node field `{other}`"
-                    )))
-                }
+                other => return Err(SpecError::UnknownField(other.to_string())),
             }
             self.skip_semi();
         }

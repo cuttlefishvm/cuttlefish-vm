@@ -139,3 +139,15 @@ fn a_bare_ident_not_ending_in_dot_out_is_rejected_as_an_input() {
     .node_graph()
     .is_err());
 }
+
+#[test]
+fn an_unknown_node_field_is_rejected_as_unknown_not_malformed() {
+    use cuttlefish_core::spec::SpecError;
+    let tokens = lex(r#"{ chunk = { block = "chunker@1"; frobnicate = "x"; }; }"#).unwrap();
+    let result = GraphParser {
+        tokens: &tokens,
+        at: 0,
+    }
+    .node_graph();
+    assert!(matches!(result, Err(SpecError::UnknownField(f)) if f == "frobnicate"));
+}
