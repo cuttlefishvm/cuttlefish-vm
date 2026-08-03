@@ -340,6 +340,55 @@ fn blobs_dir(root: &Path) -> PathBuf {
     root.join("blobs")
 }
 
+/// Read just enough of a `.cfbundle` container (magic already confirmed by
+/// the caller) to recover its cached `signature` field — never touching the
+/// stage blobs that follow the manifest, since the catalog only ever needs
+/// the signature.
+///
+/// `manifest_len` is **little-endian** — the build spike documents it only
+/// as `u64`, with no endianness stated, so this is the first concrete
+/// commitment to a byte order for the container format. Pinned here rather
+/// than left ambiguous a second time: whoever implements `cuttlefish build`
+/// (which doesn't exist as code yet) must write `manifest_len` little-endian
+/// to match what this reader expects, not native-endian.
+// Only called from its own tests until Task 9 wires `Catalog::add` in.
+#[allow(dead_code)]
+fn read_bundle_signature(bytes: &[u8], path: &Path) -> Result<String, CatalogError> {
+    const HEADER_LEN: usize = 4 + 8; // b"CFBD" + manifest_len as u64 LE
+
+    if bytes.len() < HEADER_LEN {
+        return Err(CatalogError::UninspectableArtifact {
+            path: path.to_path_buf(),
+            reason: "shorter than the bundle header".to_string(),
+        });
+    }
+
+    let manifest_len =
+        u64::from_le_bytes(bytes[4..HEADER_LEN].try_into().expect("8 bytes")) as usize;
+    let manifest_bytes = bytes
+        .get(HEADER_LEN..HEADER_LEN + manifest_len)
+        .ok_or_else(|| CatalogError::UninspectableArtifact {
+            path: path.to_path_buf(),
+            reason: format!("manifest_len {manifest_len} exceeds the file's actual length"),
+        })?;
+
+    let manifest: serde_json::Value = serde_json::from_slice(manifest_bytes).map_err(|e| {
+        CatalogError::UninspectableArtifact {
+            path: path.to_path_buf(),
+            reason: format!("manifest is not valid JSON: {e}"),
+        }
+    })?;
+
+    manifest
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| CatalogError::UninspectableArtifact {
+            path: path.to_path_buf(),
+            reason: "manifest has no string field \"signature\"".to_string(),
+        })
+}
+
 /// Write `bytes` into the content-addressed blob store, deduplicating by
 /// hash (two names cataloging identical bytes cost nothing extra), and
 /// return the hash as `sha256:<hex>` — self-describing in the index even
@@ -667,6 +716,62 @@ mod tests {
         assert_eq!(
             blob_bytes, content,
             "the published blob must be exactly the input bytes, not truncated or corrupted by a racing writer"
+        );
+    }
+
+    fn make_bundle(manifest_json: &[u8]) -> Vec<u8> {
+        let mut bytes = b"CFBD".to_vec();
+        bytes.extend_from_slice(&(manifest_json.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(manifest_json);
+        bytes
+    }
+
+    #[test]
+    fn reads_the_signature_field_out_of_a_valid_bundle_manifest() {
+        let bundle = make_bundle(
+            br#"{"nodes":[],"edges":[],"signature":"{path: text} -> {summary: text}"}"#,
+        );
+        let sig = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap();
+        assert_eq!(sig, "{path: text} -> {summary: text}");
+    }
+
+    #[test]
+    fn a_manifest_len_exceeding_the_actual_bytes_is_uninspectable() {
+        let mut bundle = make_bundle(br#"{"nodes":[],"edges":[],"signature":"x -> x"}"#);
+        bundle.truncate(bundle.len() - 5); // manifest_len now overshoots what's left
+        let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UninspectableArtifact { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_json_is_uninspectable() {
+        let bundle = make_bundle(b"not valid json at all");
+        let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UninspectableArtifact { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_missing_the_signature_field_is_uninspectable() {
+        let bundle = make_bundle(br#"{"nodes":[],"edges":[]}"#);
+        let err = read_bundle_signature(&bundle, Path::new("test.cfbundle")).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UninspectableArtifact { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_shorter_than_the_header_is_uninspectable() {
+        let err = read_bundle_signature(b"CFBD", Path::new("test.cfbundle")).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UninspectableArtifact { .. }),
+            "{err:?}"
         );
     }
 }
