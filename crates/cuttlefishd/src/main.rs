@@ -54,8 +54,23 @@ async fn main() -> anyhow::Result<()> {
     // of any one job, so it should stop startup rather than fail every job
     // identically once traffic arrives.
     let engine = Arc::new(wasmtime::Engine::default());
-    let blocks: Vec<PathBuf> = spec.pipeline.iter().map(|b| spec_dir.join(b)).collect();
-    let checked = cuttlefish_host::pipeline::check(&engine, &blocks)
+    let catalog_root = cuttlefish_host::catalog::default_root()
+        .context("could not determine home directory; set CUTTLEFISH_HOME")?;
+    let catalog = cuttlefish_host::catalog::Catalog::open(catalog_root);
+    let resolved: Vec<_> = spec
+        .pipeline
+        .iter()
+        .map(|entry| {
+            cuttlefish_host::pipeline::resolve_and_load(
+                &catalog,
+                spec_dir,
+                &entry.to_string_lossy(),
+                cuttlefish_host::catalog::ResolutionContext::Interactive,
+            )
+        })
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("resolving the pipeline for `{}`", spec.name))?;
+    let checked = cuttlefish_host::pipeline::check(&engine, &resolved)
         .with_context(|| format!("checking the pipeline for `{}`", spec.name))?;
     eprintln!(
         "cuttlefishd pipeline `{}`: {} accepting {} producing {}",
