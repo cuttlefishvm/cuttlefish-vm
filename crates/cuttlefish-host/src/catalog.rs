@@ -29,9 +29,6 @@ use serde::{Deserialize, Serialize};
 
 /// Current schema version of `index.json`'s own on-disk format — bumped only
 /// when the *shape* of the index changes, never tied to this crate's version.
-// Only reachable through `read_index`/`with_locked_index`, which are
-// themselves only called from tests until Task 9 wires `Catalog::add` in.
-#[allow(dead_code)]
 const INDEX_VERSION: u32 = 1;
 
 /// Whether a cataloged artifact is a single wasm block or a multi-node bundle.
@@ -63,9 +60,6 @@ pub struct Entry {
 }
 
 /// The whole on-disk `index.json`.
-// Only reachable through `read_index`/`with_locked_index`, which are
-// themselves only called from tests until Task 9 wires `Catalog::add` in.
-#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexFile {
     version: u32,
@@ -73,7 +67,6 @@ struct IndexFile {
 }
 
 impl IndexFile {
-    #[allow(dead_code)]
     fn empty() -> Self {
         Self {
             version: INDEX_VERSION,
@@ -84,8 +77,6 @@ impl IndexFile {
 
 /// Something went wrong reading, writing, or resolving through the catalog.
 #[derive(Debug, thiserror::Error)]
-// Constructed for real starting in Task 6 onward (index read/write, resolution).
-#[allow(dead_code)]
 pub enum CatalogError {
     /// `name@version` was already catalogued; versions are immutable once published.
     #[error("{name_version} is already catalogued; versions are immutable once published")]
@@ -151,8 +142,6 @@ pub enum CatalogError {
 
 /// Render `did_you_mean` as a message suffix, or nothing if it's empty —
 /// never a dangling "(did you mean: ?)" for a genuinely unmatched name.
-// Used by CatalogError::NotFound; constructed for real starting in Task 6 onward.
-#[allow(dead_code)]
 fn format_did_you_mean(names: &[String]) -> String {
     if names.is_empty() {
         String::new()
@@ -224,19 +213,13 @@ fn pick_did_you_mean(target_name: &str, entries: &BTreeMap<String, Entry>) -> Ve
         .collect()
 }
 
-// Wired into Catalog::add starting in Task 9.
-#[allow(dead_code)]
 const WASM_MAGIC: &[u8] = b"\0asm";
-// Wired into Catalog::add starting in Task 9.
-#[allow(dead_code)]
 const BUNDLE_MAGIC: &[u8] = b"CFBD";
 
 /// Identify an artifact by its magic bytes, never by file extension — the
 /// same "classify by content" rule `handles::classify` already applies to
 /// input files. `None` means neither magic matched; the caller turns that
 /// into `CatalogError::UnrecognizedArtifact`, naming the path.
-// Wired into Catalog::add starting in Task 9.
-#[allow(dead_code)]
 fn sniff_artifact_kind(bytes: &[u8]) -> Option<ArtifactKind> {
     if bytes.starts_with(WASM_MAGIC) {
         Some(ArtifactKind::Block)
@@ -247,15 +230,10 @@ fn sniff_artifact_kind(bytes: &[u8]) -> Option<ArtifactKind> {
     }
 }
 
-// Only called from tests and from `with_locked_index` until Task 9 wires
-// `Catalog::add` (and later tasks wire `list`/`show`/`rm`) in.
-#[allow(dead_code)]
 fn index_path(root: &Path) -> PathBuf {
     root.join("index.json")
 }
 
-// Only called from `with_locked_index` until Task 9 wires `Catalog::add` in.
-#[allow(dead_code)]
 fn lock_path(root: &Path) -> PathBuf {
     root.join("index.json.lock")
 }
@@ -266,9 +244,6 @@ fn lock_path(root: &Path) -> PathBuf {
 /// silently treated as empty (an empty-looking catalog after real entries
 /// were written would make every subsequent `add` "work" while quietly
 /// discarding everything that came before it).
-// Only called from tests and from `with_locked_index` until Task 9 wires
-// `Catalog::add` (and later tasks wire `list`/`show`/`rm`) in.
-#[allow(dead_code)]
 fn read_index(root: &Path) -> Result<IndexFile, CatalogError> {
     let path = index_path(root);
     if !path.exists() {
@@ -305,8 +280,6 @@ fn read_index(root: &Path) -> Result<IndexFile, CatalogError> {
 /// OS-level advisory lock is tied to the open file handle) on every return
 /// path, including the early return from `f(&mut index)?` below — there is
 /// no separate `unlock()` call to forget on an error path.
-// Only called from tests until Task 9 wires `Catalog::add` in.
-#[allow(dead_code)]
 fn with_locked_index<T>(
     root: &Path,
     f: impl FnOnce(&mut IndexFile) -> Result<T, CatalogError>,
@@ -334,8 +307,6 @@ fn with_locked_index<T>(
     Ok(result)
 }
 
-// Only called from tests until Task 9 wires `Catalog::add` in.
-#[allow(dead_code)]
 fn blobs_dir(root: &Path) -> PathBuf {
     root.join("blobs")
 }
@@ -351,8 +322,6 @@ fn blobs_dir(root: &Path) -> PathBuf {
 /// than left ambiguous a second time: whoever implements `cuttlefish build`
 /// (which doesn't exist as code yet) must write `manifest_len` little-endian
 /// to match what this reader expects, not native-endian.
-// Only called from its own tests until Task 9 wires `Catalog::add` in.
-#[allow(dead_code)]
 fn read_bundle_signature(bytes: &[u8], path: &Path) -> Result<String, CatalogError> {
     const HEADER_LEN: usize = 4 + 8; // b"CFBD" + manifest_len as u64 LE
 
@@ -395,8 +364,6 @@ fn read_bundle_signature(bytes: &[u8], path: &Path) -> Result<String, CatalogErr
 /// return the hash as `sha256:<hex>` — self-describing in the index even
 /// though the on-disk filename is bare hex (it's already inside a directory
 /// named `blobs`; a prefix there would be redundant).
-// Only called from tests until Task 9 wires `Catalog::add` in.
-#[allow(dead_code)]
 fn write_blob(root: &Path, bytes: &[u8]) -> Result<String, CatalogError> {
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -425,6 +392,118 @@ fn write_blob(root: &Path, bytes: &[u8]) -> Result<String, CatalogError> {
     }
 
     Ok(format!("sha256:{hex}"))
+}
+
+/// A local block catalog rooted at a directory. This type has no opinion
+/// about environment variables or home directories — the caller (the CLI)
+/// decides where `root` points.
+pub struct Catalog {
+    root: PathBuf,
+}
+
+/// What `add` actually did, for a caller to report.
+#[derive(Debug, Clone)]
+pub struct AddOutcome {
+    /// The name@version now cataloged.
+    pub name_version: String,
+    /// Block or bundle.
+    pub kind: ArtifactKind,
+    /// The cached signature string.
+    pub signature: String,
+    /// True when `signature` is the permissive `json -> json` default — the
+    /// caller should print a warning, not fail; the permissive fallback
+    /// itself is existing, intentional behavior, unchanged by the catalog.
+    pub is_permissive_default: bool,
+}
+
+impl Catalog {
+    /// Open (without yet creating on disk) a catalog rooted at `root`.
+    pub fn open(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Catalog the artifact at `artifact_path` under `name_version`.
+    ///
+    /// `engine` is only used if the artifact turns out to be a wasm block —
+    /// a bundle's signature is read straight from its own manifest, never
+    /// wasm-instantiated (bundle bytes are a custom container, not a wasm
+    /// module; instantiating them would simply fail to parse).
+    pub fn add(
+        &self,
+        name_version: &str,
+        artifact_path: &Path,
+        engine: &wasmtime::Engine,
+    ) -> Result<AddOutcome, CatalogError> {
+        let bytes = fs::read(artifact_path)?;
+        let kind =
+            sniff_artifact_kind(&bytes).ok_or_else(|| CatalogError::UnrecognizedArtifact {
+                path: artifact_path.to_path_buf(),
+                header: bytes.iter().take(8).copied().collect(),
+            })?;
+
+        let (signature, is_permissive_default) = match kind {
+            ArtifactKind::Block => {
+                let sig = crate::runner::read_signature(engine, &bytes).map_err(|e| {
+                    CatalogError::UninspectableArtifact {
+                        path: artifact_path.to_path_buf(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                let permissive = cuttlefish_abi::Signature {
+                    input: cuttlefish_abi::Ty::Json,
+                    output: cuttlefish_abi::Ty::Json,
+                };
+                let is_permissive = sig == permissive;
+                (format!("{} -> {}", sig.input, sig.output), is_permissive)
+            }
+            ArtifactKind::Bundle => {
+                let sig = read_bundle_signature(&bytes, artifact_path)?;
+                (sig, false)
+            }
+        };
+
+        let hash = write_blob(&self.root, &bytes)?;
+        let created_at = now_rfc3339();
+        let name_version = name_version.to_string();
+
+        with_locked_index(&self.root, |index| {
+            if index.entries.contains_key(&name_version) {
+                return Err(CatalogError::AlreadyExists {
+                    name_version: name_version.clone(),
+                });
+            }
+            index.entries.insert(
+                name_version.clone(),
+                Entry {
+                    hash,
+                    kind,
+                    signature: signature.clone(),
+                    created_at,
+                },
+            );
+            Ok(())
+        })?;
+
+        Ok(AddOutcome {
+            name_version,
+            kind,
+            signature,
+            is_permissive_default,
+        })
+    }
+}
+
+/// The current UTC time, truncated to whole seconds and formatted as RFC
+/// 3339 (`2026-08-02T18:03:00Z`). Truncating avoids variable-width fractional
+/// seconds, so `created_at` strings sort correctly with plain string
+/// comparison (used for "give me the latest" and did-you-mean tie-breaking)
+/// without ever needing to be parsed back.
+fn now_rfc3339() -> String {
+    let now = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("0 is always a valid nanosecond value");
+    now.format(&time::format_description::well_known::Rfc3339)
+        .expect("Rfc3339 formatting cannot fail for a valid OffsetDateTime")
 }
 
 #[cfg(test)]
@@ -806,5 +885,146 @@ mod tests {
             }
             other => panic!("expected UninspectableArtifact, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn adding_a_wasm_block_with_no_cf_signature_export_caches_the_permissive_default_and_flags_it()
+    {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm_path = wasm_dir.path().join("no_sig.wasm");
+        std::fs::write(
+            &wasm_path,
+            wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap(),
+        )
+        .unwrap();
+
+        let catalog = Catalog::open(catalog_dir.path());
+        let outcome = catalog
+            .add("no-sig@1", &wasm_path, &wasmtime::Engine::default())
+            .expect("a block missing cf_signature is not an add-time error");
+
+        assert_eq!(outcome.signature, "json -> json");
+        assert!(
+            outcome.is_permissive_default,
+            "a block with no cf_signature export must be flagged, not silently accepted"
+        );
+    }
+
+    #[test]
+    fn adding_wasm_magic_bytes_with_an_invalid_module_body_is_uninspectable() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm_path = wasm_dir.path().join("broken.wasm");
+        // Real wasm magic, garbage after it: passes the magic-byte sniff, fails
+        // Module::new — the "recognised header, unreadable contents" case.
+        std::fs::write(
+            &wasm_path,
+            b"\0asm\x01\x00\x00\x00garbage-not-a-real-module",
+        )
+        .unwrap();
+
+        let catalog = Catalog::open(catalog_dir.path());
+        let err = catalog
+            .add("broken@1", &wasm_path, &wasmtime::Engine::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UninspectableArtifact { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_cf_signature_export_that_exists_but_returns_unparseable_bytes_is_uninspectable_not_permissive(
+    ) {
+        // Distinct from both prior tests: the module instantiates fine and
+        // cf_signature exists with the right callable shape (() -> u32) — this
+        // is the "present but broken" case, which must NOT be folded into the
+        // "absent" case's permissive-default fallback. The descriptor it returns
+        // points at zeroed memory (no data segment): reading it back yields an
+        // empty buffer, which fails to parse as a Signature — read_signature
+        // returns Err, and that must surface as UninspectableArtifact.
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm_path = wasm_dir.path().join("broken_sig.wasm");
+        std::fs::write(
+            &wasm_path,
+            wat::parse_str(
+                r#"(module
+                     (memory (export "memory") 1)
+                     (func (export "cf_signature") (result i32) i32.const 0)
+                   )"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let catalog = Catalog::open(catalog_dir.path());
+        let err = catalog
+            .add("broken-sig@1", &wasm_path, &wasmtime::Engine::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UninspectableArtifact { .. }),
+            "present-but-unparseable cf_signature must be a hard failure, not the permissive default: {err:?}"
+        );
+    }
+
+    #[test]
+    fn adding_a_bundle_reads_its_signature_from_the_manifest_never_instantiating_wasm() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let bundle_path = bundle_dir.path().join("digest.cfbundle");
+        std::fs::write(
+            &bundle_path,
+            make_bundle(
+                br#"{"nodes":[],"edges":[],"signature":"{path: text} -> {summary: text}"}"#,
+            ),
+        )
+        .unwrap();
+
+        let catalog = Catalog::open(catalog_dir.path());
+        let outcome = catalog
+            .add("digest@1", &bundle_path, &wasmtime::Engine::default())
+            .unwrap();
+
+        assert_eq!(outcome.kind, ArtifactKind::Bundle);
+        assert_eq!(outcome.signature, "{path: text} -> {summary: text}");
+        assert!(!outcome.is_permissive_default);
+    }
+
+    #[test]
+    fn adding_a_file_with_neither_magic_is_unrecognized_not_a_silent_guess() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let junk_dir = tempfile::tempdir().unwrap();
+        let junk_path = junk_dir.path().join("junk.bin");
+        std::fs::write(&junk_path, b"not a wasm or bundle").unwrap();
+
+        let catalog = Catalog::open(catalog_dir.path());
+        let err = catalog
+            .add("junk@1", &junk_path, &wasmtime::Engine::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UnrecognizedArtifact { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn re_adding_the_same_name_version_is_rejected() {
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let wasm_dir = tempfile::tempdir().unwrap();
+        let wasm_path = wasm_dir.path().join("a.wasm");
+        std::fs::write(
+            &wasm_path,
+            wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap(),
+        )
+        .unwrap();
+
+        let catalog = Catalog::open(catalog_dir.path());
+        let engine = wasmtime::Engine::default();
+        catalog.add("dup@1", &wasm_path, &engine).unwrap();
+
+        let err = catalog.add("dup@1", &wasm_path, &engine).unwrap_err();
+        assert!(matches!(err, CatalogError::AlreadyExists { .. }), "{err:?}");
     }
 }
