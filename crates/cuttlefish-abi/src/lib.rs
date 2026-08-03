@@ -222,6 +222,11 @@ fn split_fields(body: &str) -> Vec<String> {
 /// and nothing forces anyone to notice; a declaration compiled into the module
 /// travels with it, cannot go stale, and leaves one artifact to ship rather than
 /// two to keep in step.
+///
+/// `Display`/`FromStr` render and parse it as `"{input} -> {output}"` —
+/// each side is a [`Ty`], and this is the compact form the catalog caches
+/// and a bundle manifest embeds. Splitting on `" -> "` is unambiguous only
+/// because `Ty::describe()` never produces that substring itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Signature {
     /// What the block needs as input.
