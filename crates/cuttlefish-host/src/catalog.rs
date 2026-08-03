@@ -412,6 +412,41 @@ pub struct AddOutcome {
     pub is_permissive_default: bool,
 }
 
+/// Where a pipeline entry string is being resolved from — determines whether
+/// an unqualified name (no `@version`) is legal. The dividing line is
+/// source-spec-text vs. compiled-artifact-reference, not "which command
+/// invoked it": `cuttlefish build` resolves an unqualified name from the
+/// spec it was given exactly once, at build time, and records the exact
+/// resolution in the manifest it emits — the unqualified form itself never
+/// survives into that manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionContext {
+    /// Resolving a reference found directly in a source `.cuttlefish` spec,
+    /// on behalf of a top-level interactive command (`cuttlefish run`, or
+    /// `cuttlefish build` pointed at that spec file). Unqualified names are
+    /// legal here.
+    Interactive,
+    /// Resolving a node reference already recorded inside a bundle's
+    /// manifest. Unqualified names are illegal here.
+    Durable,
+}
+
+/// The result of resolving one pipeline entry string.
+#[derive(Debug, Clone)]
+pub enum Resolved {
+    /// `s` was a direct filesystem path or ended in `.wasm` — used as-is, no
+    /// catalog lookup at all.
+    Direct(PathBuf),
+    /// `s` resolved through the catalog to this entry.
+    Cataloged {
+        /// The exact name@version resolved to, even if `s` itself was
+        /// unqualified.
+        name_version: String,
+        /// The resolved entry.
+        entry: Entry,
+    },
+}
+
 impl Catalog {
     /// Open (without yet creating on disk) a catalog rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Self {
@@ -523,6 +558,59 @@ impl Catalog {
                     did_you_mean: pick_did_you_mean(name, &index.entries),
                 })
             }
+        })
+    }
+
+    /// Resolve one pipeline entry string per the catalog spec's three-step
+    /// algorithm: direct path/`.wasm` first, then an exact catalog lookup if
+    /// `@version` is present, then latest-by-`created_at` if it's not and
+    /// `context` allows an unqualified name.
+    pub fn resolve(&self, s: &str, context: ResolutionContext) -> Result<Resolved, CatalogError> {
+        if s.ends_with(".wasm") || Path::new(s).exists() {
+            return Ok(Resolved::Direct(PathBuf::from(s)));
+        }
+
+        let index = read_index(&self.root)?;
+
+        if let Some((name, version)) = s.rsplit_once('@') {
+            let name_version = format!("{name}@{version}");
+            let entry = index.entries.get(&name_version).cloned().ok_or_else(|| {
+                CatalogError::NotFound {
+                    name_version: name_version.clone(),
+                    did_you_mean: pick_did_you_mean(name, &index.entries),
+                }
+            })?;
+            return Ok(Resolved::Cataloged {
+                name_version,
+                entry,
+            });
+        }
+
+        if context == ResolutionContext::Durable {
+            return Err(CatalogError::UnqualifiedName {
+                name: s.to_string(),
+            });
+        }
+
+        let mut versions: Vec<(&String, &Entry)> = index
+            .entries
+            .iter()
+            .filter(|(nv, _)| nv.rsplit_once('@').map(|(n, _)| n) == Some(s))
+            .collect();
+        versions.sort_by(|a, b| a.1.created_at.cmp(&b.1.created_at));
+
+        let (name_version, entry) =
+            versions
+                .last()
+                .copied()
+                .ok_or_else(|| CatalogError::NotFound {
+                    name_version: s.to_string(),
+                    did_you_mean: pick_did_you_mean(s, &index.entries),
+                })?;
+
+        Ok(Resolved::Cataloged {
+            name_version: name_version.clone(),
+            entry: entry.clone(),
         })
     }
 }
@@ -1160,5 +1248,103 @@ mod tests {
             names,
             vec!["a@1".to_string(), "b@1".to_string(), "c@1".to_string()]
         );
+    }
+
+    #[test]
+    fn resolve_a_dot_wasm_suffix_is_direct_even_if_the_file_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let resolved = catalog
+            .resolve("/nonexistent/block.wasm", ResolutionContext::Interactive)
+            .unwrap();
+        assert!(matches!(resolved, Resolved::Direct(_)));
+    }
+
+    #[test]
+    fn resolve_an_existing_filesystem_path_is_direct_no_catalog_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_file = tempfile::NamedTempFile::new().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let resolved = catalog
+            .resolve(
+                real_file.path().to_str().unwrap(),
+                ResolutionContext::Interactive,
+            )
+            .unwrap();
+        assert!(matches!(resolved, Resolved::Direct(_)));
+    }
+
+    #[test]
+    fn resolve_exact_name_at_version_hits_case_sensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "summarize@1", "2026-01-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+
+        assert!(catalog
+            .resolve("summarize@1", ResolutionContext::Interactive)
+            .is_ok());
+
+        let err = catalog
+            .resolve("Summarize@1", ResolutionContext::Interactive)
+            .unwrap_err();
+        let CatalogError::NotFound { did_you_mean, .. } = &err else {
+            panic!("expected NotFound (case-sensitive miss), got {err:?}")
+        };
+        assert!(
+            did_you_mean.contains(&"summarize@1".to_string()),
+            "case-sensitivity rejects the hit, but edit distance 1 should still suggest it: {did_you_mean:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_unqualified_name_picks_the_latest_by_created_at() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "a@1", "2026-01-01T00:00:00Z");
+        seed(dir.path(), "a@2", "2026-06-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+
+        let resolved = catalog
+            .resolve("a", ResolutionContext::Interactive)
+            .unwrap();
+        let Resolved::Cataloged { name_version, .. } = resolved else {
+            panic!("expected a cataloged resolution")
+        };
+        assert_eq!(name_version, "a@2");
+    }
+
+    #[test]
+    fn resolve_unqualified_name_is_legal_from_an_interactive_context() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "a@1", "2026-01-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+        assert!(catalog.resolve("a", ResolutionContext::Interactive).is_ok());
+    }
+
+    #[test]
+    fn resolve_unqualified_name_is_rejected_in_a_durable_context() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "a@1", "2026-01-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+        let err = catalog
+            .resolve("a", ResolutionContext::Durable)
+            .unwrap_err();
+        assert!(
+            matches!(err, CatalogError::UnqualifiedName { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_not_found_suggests_a_close_typo() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "summarize@1", "2026-01-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+        let err = catalog
+            .resolve("summarise@1", ResolutionContext::Interactive)
+            .unwrap_err();
+        let CatalogError::NotFound { did_you_mean, .. } = &err else {
+            panic!("expected NotFound, got {err:?}")
+        };
+        assert_eq!(did_you_mean, &vec!["summarize@1".to_string()]);
     }
 }
