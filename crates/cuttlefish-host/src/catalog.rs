@@ -334,6 +334,40 @@ fn with_locked_index<T>(
     Ok(result)
 }
 
+// Only called from tests until Task 9 wires `Catalog::add` in.
+#[allow(dead_code)]
+fn blobs_dir(root: &Path) -> PathBuf {
+    root.join("blobs")
+}
+
+/// Write `bytes` into the content-addressed blob store, deduplicating by
+/// hash (two names cataloging identical bytes cost nothing extra), and
+/// return the hash as `sha256:<hex>` — self-describing in the index even
+/// though the on-disk filename is bare hex (it's already inside a directory
+/// named `blobs`; a prefix there would be redundant).
+// Only called from tests until Task 9 wires `Catalog::add` in.
+#[allow(dead_code)]
+fn write_blob(root: &Path, bytes: &[u8]) -> Result<String, CatalogError> {
+    use sha2::{Digest, Sha256};
+
+    let hex = format!("{:x}", Sha256::digest(bytes));
+    let dir = blobs_dir(root);
+    fs::create_dir_all(&dir)?;
+
+    let blob_path = dir.join(&hex);
+    if !blob_path.exists() {
+        let tmp_path = dir.join(format!("{hex}.tmp"));
+        {
+            let mut tmp = File::create(&tmp_path)?;
+            tmp.write_all(bytes)?;
+            tmp.sync_all()?;
+        }
+        fs::rename(&tmp_path, &blob_path)?;
+    }
+
+    Ok(format!("sha256:{hex}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +605,32 @@ mod tests {
         let index = read_index(dir.path()).expect("the index must still parse after contention");
         assert!(index.entries.contains_key("a@1"));
         assert!(index.entries.contains_key("b@1"));
+    }
+
+    #[test]
+    fn identical_bytes_under_two_writes_produce_exactly_one_blob_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash1 = write_blob(dir.path(), b"hello world").unwrap();
+        let hash2 = write_blob(dir.path(), b"hello world").unwrap();
+
+        assert_eq!(hash1, hash2);
+        assert!(hash1.starts_with("sha256:"));
+
+        let blob_count = std::fs::read_dir(dir.path().join("blobs")).unwrap().count();
+        assert_eq!(
+            blob_count, 1,
+            "identical bytes must dedupe to a single blob file"
+        );
+    }
+
+    #[test]
+    fn the_blob_filename_on_disk_is_bare_hex_no_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = write_blob(dir.path(), b"hello world").unwrap();
+        let hex = hash
+            .strip_prefix("sha256:")
+            .expect("index field is prefixed");
+
+        assert!(dir.path().join("blobs").join(hex).exists());
     }
 }
