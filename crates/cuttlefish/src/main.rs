@@ -78,7 +78,7 @@ mod cli {
             /// The .cuttlefish spec to build.
             spec: PathBuf,
             /// Where to write the bundle. Defaults to the spec's own path
-            /// with its extension replaced by .cfbundle.
+            /// with its extension set to .cfbundle.
             #[arg(short, long)]
             output: Option<PathBuf>,
         },
@@ -210,6 +210,19 @@ mod cli {
 
         let bytes = cuttlefish_host::bundle::build(&checked);
         let out_path = output.unwrap_or_else(|| spec_path.with_extension("cfbundle"));
+
+        // A spec that already ends in `.cfbundle` (or an explicit `-o`
+        // pointing back at it) would otherwise have its own source
+        // overwritten with the build output — `out_path` can't be the same
+        // already-existing file as `spec_path` unless `canonicalize`
+        // resolves both to it, since a not-yet-existing `out_path` cannot be
+        // the file we just read.
+        if std::fs::canonicalize(&out_path).ok() == std::fs::canonicalize(spec_path).ok() {
+            bail!(
+                "refusing to build: output path {} is the same file as the spec being built",
+                out_path.display()
+            );
+        }
         std::fs::write(&out_path, &bytes)
             .with_context(|| format!("writing {}", out_path.display()))?;
 
