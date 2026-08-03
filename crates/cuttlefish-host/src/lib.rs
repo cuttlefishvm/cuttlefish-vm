@@ -22,11 +22,13 @@
 //! change to the runner, the parser, or the daemon. [`ollama`] is the first real
 //! one.
 //!
-//! [`catalog`] is a separate concern from the job-execution path above: a
-//! local, content-addressed store mapping `name@version` to a cataloged wasm
-//! block or bundle, so a pipeline can reference a block by name instead of a
-//! filesystem path. Purely local filesystem operations — no daemon
-//! involvement, no network.
+//! [`catalog`] is a local, content-addressed store mapping `name@version` to
+//! a cataloged wasm block or bundle, so a pipeline can reference a block by
+//! name instead of a filesystem path. Purely local filesystem operations —
+//! no network. The daemon does consult it (resolving a spec's pipeline
+//! entries at startup, via [`pipeline::resolve_and_load`]), but the catalog
+//! itself has no daemon-specific logic: the same resolution runs identically
+//! from `cuttlefish build`.
 //!
 //! [`bundle`] packages a [`pipeline::Checked`] pipeline into the `.cfbundle`
 //! container `cuttlefish build` emits — the write side of what

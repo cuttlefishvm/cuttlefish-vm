@@ -79,6 +79,7 @@ sha2 = "0.10"
 time = { version = "0.3", features = ["formatting"] }
 # Cross-platform home-directory lookup for the default catalog root
 # (~/.cuttlefish/catalog). Only cuttlefish-host calls it directly
-# (catalog::default_root); cuttlefish (the CLI) reaches it transitively.
-# cuttlefishd will too, once its run path resolves catalog names.
+# (catalog::default_root); cuttlefish (the CLI) and cuttlefishd (whose run
+# path resolves pipeline entries through the catalog) both reach it
+# transitively.
 dirs = "6"

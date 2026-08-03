@@ -618,11 +618,20 @@ impl Catalog {
     }
 
     /// Resolve one pipeline entry string per the catalog spec's three-step
-    /// algorithm: direct path/`.wasm` first, then an exact catalog lookup if
-    /// `@version` is present, then latest-by-`created_at` if it's not and
-    /// `context` allows an unqualified name.
+    /// algorithm: direct path/`.wasm`/`.cfbundle` first, then an exact
+    /// catalog lookup if `@version` is present, then latest-by-`created_at`
+    /// if it's not and `context` allows an unqualified name.
+    ///
+    /// A compiled-artifact suffix (`.wasm` or `.cfbundle`) is always treated
+    /// as Direct, even when nothing actually exists at that path — a
+    /// genuinely missing artifact should fail with a clear "no such file",
+    /// not be silently reinterpreted as a catalog name that happens to
+    /// contain a `.` in it. Both suffixes get identical treatment here:
+    /// `pipeline::resolve_and_load`'s own decision to prefer a joined path
+    /// for one of these suffixes (even before checking existence) is only
+    /// correct if this function honors the same suffixes the same way.
     pub fn resolve(&self, s: &str, context: ResolutionContext) -> Result<Resolved, CatalogError> {
-        if s.ends_with(".wasm") || Path::new(s).exists() {
+        if s.ends_with(".wasm") || s.ends_with(".cfbundle") || Path::new(s).exists() {
             return Ok(Resolved::Direct(PathBuf::from(s)));
         }
 
