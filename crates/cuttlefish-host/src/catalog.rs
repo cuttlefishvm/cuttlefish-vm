@@ -134,6 +134,23 @@ pub enum CatalogError {
         /// What went wrong reading past the magic bytes.
         reason: String,
     },
+    /// An entry's `hash` came back from `index.json` in a shape that isn't a
+    /// well-formed sha256 digest (64 lowercase hex digits, optionally
+    /// prefixed with `sha256:`) — the exact shape `write_blob` always
+    /// produces. `index.json` is never format-validated on read, so a
+    /// hand-edited or maliciously crafted index could otherwise smuggle
+    /// `../` traversal or an absolute path into a filesystem join; this is
+    /// the guard that rejects it before that ever happens. Distinct from
+    /// `CorruptIndex` (that's `index.json` failing to *parse* as JSON at
+    /// all; this is JSON that parses fine but whose `hash` field is
+    /// nonsense).
+    #[error(
+        "catalog entry has a malformed hash {hash:?}: expected sha256:<64 lowercase hex digits>"
+    )]
+    MalformedHash {
+        /// The invalid hash value, exactly as found in the entry.
+        hash: String,
+    },
     /// Underlying I/O failure — a plain failure to open/read/write a path,
     /// before any catalog-specific logic ever inspects the bytes.
     #[error(transparent)]
@@ -305,6 +322,19 @@ fn with_locked_index<T>(
 
 fn blobs_dir(root: &Path) -> PathBuf {
     root.join("blobs")
+}
+
+/// Whether `hex` is exactly 64 lowercase hex digits — the exact shape
+/// `write_blob` always produces via `format!("{:x}", Sha256::digest(bytes))`.
+/// This is the sole guard between an `Entry`'s `hash` field (read straight
+/// out of `index.json`, never format-validated elsewhere) and a filesystem
+/// path: without it, a hash like `../../../etc/passwd` or an absolute path
+/// would `Path::join` straight through to arbitrary files outside `blobs/`.
+fn is_well_formed_sha256_hex(hex: &str) -> bool {
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Read just enough of a `.cfbundle` container (magic already confirmed by
@@ -550,6 +580,11 @@ impl Catalog {
     /// `write_blob`.
     pub fn read_blob(&self, entry: &Entry) -> Result<Vec<u8>, CatalogError> {
         let hex = entry.hash.strip_prefix("sha256:").unwrap_or(&entry.hash);
+        if !is_well_formed_sha256_hex(hex) {
+            return Err(CatalogError::MalformedHash {
+                hash: entry.hash.clone(),
+            });
+        }
         Ok(fs::read(blobs_dir(&self.root).join(hex))?)
     }
 
@@ -1381,10 +1416,59 @@ mod tests {
         let fake = Entry {
             hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
-            kind: ArtifactKind::Block,
-            signature: "json -> json".to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+            ..entry_fixture("2026-01-01T00:00:00Z")
         };
-        assert!(catalog.read_blob(&fake).is_err());
+        let err = catalog.read_blob(&fake).unwrap_err();
+        match err {
+            CatalogError::Io(ref io_err) => {
+                assert_eq!(
+                    io_err.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "a well-formed hash with no matching blob file must surface as a plain \
+                     not-found I/O error: {err:?}"
+                );
+            }
+            other => {
+                panic!("a well-formed but absent hash must be a plain Io(NotFound), not {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn read_blob_rejects_a_path_traversal_hash_instead_of_touching_the_filesystem() {
+        // A hand-edited (or maliciously crafted) index.json is never
+        // format-validated on read anywhere else in this module — read_blob
+        // is the last line of defense before a hash string becomes a
+        // filesystem path. A well-formed sha256 digest is always exactly 64
+        // lowercase hex digits (see write_blob's `format!("{:x}", ...)`), so
+        // anything else — especially `../` traversal or an absolute path —
+        // must be rejected before Path::join ever sees it.
+        let dir = tempfile::tempdir().unwrap();
+        // Plant a marker file outside blobs/ that a traversal would reach if
+        // the guard were missing.
+        std::fs::write(dir.path().join("outside.txt"), b"do not leak this").unwrap();
+
+        let catalog = Catalog::open(dir.path());
+        let traversal = Entry {
+            hash: "sha256:../outside.txt".to_string(),
+            ..entry_fixture("2026-01-01T00:00:00Z")
+        };
+        let err = catalog.read_blob(&traversal).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::MalformedHash { .. }),
+            "a path-traversal hash must be rejected as MalformedHash before any path is \
+             constructed, got {err:?}"
+        );
+
+        let absolute = Entry {
+            hash: "sha256:/etc/passwd".to_string(),
+            ..entry_fixture("2026-01-01T00:00:00Z")
+        };
+        let err = catalog.read_blob(&absolute).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::MalformedHash { .. }),
+            "an absolute-path-like hash must be rejected as MalformedHash before any path is \
+             constructed, got {err:?}"
+        );
     }
 }
