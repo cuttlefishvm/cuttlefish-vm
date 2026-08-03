@@ -27,11 +27,16 @@
 //! block or bundle, so a pipeline can reference a block by name instead of a
 //! filesystem path. Purely local filesystem operations — no daemon
 //! involvement, no network.
+//!
+//! [`bundle`] packages a [`pipeline::Checked`] pipeline into the `.cfbundle`
+//! container `cuttlefish build` emits — the write side of what
+//! `catalog`'s `read_bundle_signature` reads.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod backend;
+pub mod bundle;
 pub mod caps;
 pub mod catalog;
 pub mod documents;
