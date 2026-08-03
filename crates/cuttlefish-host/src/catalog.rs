@@ -642,4 +642,31 @@ mod tests {
 
         assert!(dir.path().join("blobs").join(hex).exists());
     }
+
+    #[test]
+    fn many_concurrent_writers_of_identical_bytes_never_corrupt_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let content = b"identical content raced by many concurrent writers";
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || write_blob(&root, content).unwrap())
+            })
+            .collect();
+
+        let hashes: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            hashes.iter().all(|h| h == &hashes[0]),
+            "every writer must compute and report the same hash: {hashes:?}"
+        );
+
+        let hex = hashes[0].strip_prefix("sha256:").unwrap();
+        let blob_bytes = std::fs::read(root.join("blobs").join(hex)).unwrap();
+        assert_eq!(
+            blob_bytes, content,
+            "the published blob must be exactly the input bytes, not truncated or corrupted by a racing writer"
+        );
+    }
 }
