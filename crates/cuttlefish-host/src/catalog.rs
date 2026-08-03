@@ -151,8 +151,6 @@ fn format_did_you_mean(names: &[String]) -> String {
 }
 
 /// Levenshtein edit distance between two strings, by character.
-// Wired into Catalog::show/resolve starting in Task 10; used in tests until then.
-#[allow(dead_code)]
 fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
@@ -175,8 +173,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// closest first, ties broken by `created_at` ascending (oldest first). A
 /// prefix match misses common real typos (`summarise`/`summarize` share no
 /// prefix relationship); edit distance catches them.
-// Wired into Catalog::show/rm/resolve starting in Task 10; used in tests until then.
-#[allow(dead_code)]
 fn pick_did_you_mean(target_name: &str, entries: &BTreeMap<String, Entry>) -> Vec<String> {
     let target_name = target_name.split('@').next().unwrap_or(target_name);
     const MAX_DISTANCE: usize = 2;
@@ -491,6 +487,44 @@ impl Catalog {
             is_permissive_default,
         })
     }
+
+    /// List every cataloged entry, in deterministic (sorted-by-name@version)
+    /// order.
+    pub fn list(&self) -> Result<Vec<(String, Entry)>, CatalogError> {
+        let index = read_index(&self.root)?;
+        Ok(index.entries.into_iter().collect())
+    }
+
+    /// Look up one entry's cached `Entry` by exact, case-sensitive
+    /// `name@version` — a catalog name is an opaque string, like a version is;
+    /// no case-folding, no normalization.
+    pub fn show(&self, name_version: &str) -> Result<Entry, CatalogError> {
+        let index = read_index(&self.root)?;
+        index.entries.get(name_version).cloned().ok_or_else(|| {
+            let name = name_version.split('@').next().unwrap_or(name_version);
+            CatalogError::NotFound {
+                name_version: name_version.to_string(),
+                did_you_mean: pick_did_you_mean(name, &index.entries),
+            }
+        })
+    }
+
+    /// Remove a `name@version` from the index. The blob it pointed at is left on
+    /// disk — no garbage collection in v1 (an orphaned blob is wasted space, not
+    /// a correctness problem; see the design doc).
+    pub fn rm(&self, name_version: &str) -> Result<(), CatalogError> {
+        with_locked_index(&self.root, |index| {
+            if index.entries.remove(name_version).is_some() {
+                Ok(())
+            } else {
+                let name = name_version.split('@').next().unwrap_or(name_version);
+                Err(CatalogError::NotFound {
+                    name_version: name_version.to_string(),
+                    did_you_mean: pick_did_you_mean(name, &index.entries),
+                })
+            }
+        })
+    }
 }
 
 /// The current UTC time, truncated to whole seconds and formatted as RFC
@@ -572,6 +606,16 @@ mod tests {
             signature: "json -> json".to_string(),
             created_at: created_at.to_string(),
         }
+    }
+
+    fn seed(root: &Path, name_version: &str, created_at: &str) {
+        with_locked_index(root, |index| {
+            index
+                .entries
+                .insert(name_version.to_string(), entry_fixture(created_at));
+            Ok::<_, CatalogError>(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1026,5 +1070,69 @@ mod tests {
 
         let err = catalog.add("dup@1", &wasm_path, &engine).unwrap_err();
         assert!(matches!(err, CatalogError::AlreadyExists { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn list_show_rm_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "a@1", "2026-01-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+
+        assert_eq!(catalog.list().unwrap().len(), 1);
+        let shown = catalog
+            .show("a@1")
+            .expect("just-seeded entry must be visible");
+        assert_eq!(shown.signature, "json -> json");
+
+        catalog.rm("a@1").unwrap();
+        assert!(catalog.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn showing_a_missing_entry_reports_not_found_with_a_suggestion() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "summarize@1", "2026-01-01T00:00:00Z");
+        let catalog = Catalog::open(dir.path());
+
+        let err = catalog.show("summarise@1").unwrap_err();
+        let CatalogError::NotFound { did_you_mean, .. } = &err else {
+            panic!("expected NotFound, got {err:?}")
+        };
+        assert_eq!(did_you_mean, &vec!["summarize@1".to_string()]);
+    }
+
+    #[test]
+    fn removing_a_missing_entry_is_not_found_not_a_silent_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path());
+        let err = catalog.rm("nothing@1").unwrap_err();
+        assert!(matches!(err, CatalogError::NotFound { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn removing_an_entry_leaves_its_blob_on_disk_v1_has_no_garbage_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = write_blob(dir.path(), b"some block bytes").unwrap();
+        let hex = hash.strip_prefix("sha256:").unwrap();
+        with_locked_index(dir.path(), |index| {
+            index.entries.insert(
+                "a@1".to_string(),
+                Entry {
+                    hash: hash.clone(),
+                    kind: ArtifactKind::Block,
+                    signature: "json -> json".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+            );
+            Ok::<_, CatalogError>(())
+        })
+        .unwrap();
+
+        Catalog::open(dir.path()).rm("a@1").unwrap();
+
+        assert!(
+            dir.path().join("blobs").join(hex).exists(),
+            "rm is index-only; the blob must remain"
+        );
     }
 }
