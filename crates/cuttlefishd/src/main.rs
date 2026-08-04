@@ -20,12 +20,27 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "pdf-render")]
     cuttlefish_host::render_worker::run_if_worker();
 
-    let usage = "usage: cuttlefishd <spec> <block.wasm> [endpoint]";
+    let usage = "usage: cuttlefishd <spec> [--wasm <path>] [endpoint]";
     let mut args = std::env::args().skip(1);
     let spec_path = PathBuf::from(args.next().context(usage)?);
-    let wasm_path = args.next().context(usage)?;
-    let endpoint = args
-        .next()
+
+    // `--wasm` lives behind a flag rather than a second required positional
+    // so that a later, optional `endpoint` positional never has to share a
+    // slot with it — two adjacent optional positionals would be structurally
+    // ambiguous (which one did the caller mean?), whereas a flag can never be
+    // confused with a bare value no matter what that value looks like.
+    let mut wasm_path: Option<String> = None;
+    let mut endpoint_arg: Option<String> = None;
+    while let Some(arg) = args.next() {
+        if arg == "--wasm" {
+            wasm_path = Some(args.next().context("--wasm requires a path")?);
+        } else if endpoint_arg.is_none() {
+            endpoint_arg = Some(arg);
+        } else {
+            anyhow::bail!(usage);
+        }
+    }
+    let endpoint = endpoint_arg
         .map(PathBuf::from)
         .unwrap_or_else(cuttlefish_core::endpoint::default_endpoint);
 
@@ -129,11 +144,19 @@ async fn main() -> anyhow::Result<()> {
         spec: Arc::new(spec),
         checked_nodes: Arc::new({
             let mut nodes = checked.nodes;
-            // The positional wasm argument overrides the FIRST node in
-            // topological order — same convention as before (it used to
-            // override stage index 0), an operator can still point at a
-            // freshly built block without editing the spec.
-            if let Ok(bytes) = std::fs::read(&wasm_path) {
+            // `--wasm` overrides the FIRST node in topological order — same
+            // convention as when this was a required positional — so an
+            // operator can still point at a freshly built block without
+            // editing the spec. A path that fails to read is reported rather
+            // than silently ignored: swallowing it would mean a typo'd
+            // `--wasm` path quietly serves the spec's original node with no
+            // indication the flag was ever seen, which is exactly the kind of
+            // silent misconfiguration this codebase's other startup checks
+            // (the bundle-stage check above, the home-directory checks) treat
+            // as loud, early failures rather than something to paper over.
+            if let Some(wasm_path) = &wasm_path {
+                let bytes = std::fs::read(wasm_path)
+                    .with_context(|| format!("reading --wasm path {wasm_path}"))?;
                 if let Some(first) = nodes.first_mut() {
                     first.module_bytes = bytes;
                 }
