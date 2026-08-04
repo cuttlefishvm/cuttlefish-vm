@@ -65,6 +65,22 @@ mod cli {
             #[arg(long)]
             input: String,
         },
+        /// Submit a job without waiting for it to finish. Prints the job_id.
+        Submit {
+            /// Where the daemon listens: a unix socket path, or a named
+            /// pipe on Windows. Defaults per platform.
+            ///
+            /// `--socket` is kept as an alias so existing scripts and docs
+            /// keep working; the name is simply wrong on Windows.
+            #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
+            endpoint: PathBuf,
+            /// Which spec to run.
+            #[arg(long)]
+            spec: String,
+            /// Job input, as a JSON object.
+            #[arg(long)]
+            input: String,
+        },
         /// List what the daemon can run.
         Specs {
             /// Where the daemon listens: a unix socket path, or a named
@@ -126,6 +142,11 @@ mod cli {
                 spec,
                 input,
             } => crate::daemon::run(&endpoint, &spec, &input).await,
+            Cmd::Submit {
+                endpoint,
+                spec,
+                input,
+            } => crate::daemon::submit(&endpoint, &spec, &input).await,
             Cmd::Catalog { action } => catalog_cmd(action),
             Cmd::Build { spec, output } => build_cmd(&spec, output),
         }
@@ -320,10 +341,19 @@ mod daemon {
         Ok(())
     }
 
-    pub async fn run(socket: &Path, spec: &str, input: &str) -> anyhow::Result<()> {
+    /// Post a job and return its `job_id`, without waiting for it to finish.
+    ///
+    /// Shared by `run` and `submit`: both need exactly this — submit the job,
+    /// surface a rejection clearly, extract the id — and differ only in what
+    /// they do once they have it (poll to completion vs. print and return).
+    async fn submit_job(
+        client: &reqwest::Client,
+        socket: &Path,
+        spec: &str,
+        input: &str,
+    ) -> anyhow::Result<String> {
         let input: serde_json::Value =
             serde_json::from_str(input).context("--input must be JSON")?;
-        let client = client(socket)?;
 
         let submitted = client
             .post("http://localhost/jobs")
@@ -340,10 +370,25 @@ mod daemon {
             );
         }
 
-        let job_id = submitted.json::<serde_json::Value>().await?["job_id"]
+        Ok(submitted.json::<serde_json::Value>().await?["job_id"]
             .as_str()
             .context("daemon response had no job_id")?
-            .to_string();
+            .to_string())
+    }
+
+    /// Submit a job and print its `job_id` immediately, without waiting for
+    /// it to finish. Unlike `run`, this never polls: a caller that wants the
+    /// result later can poll `GET /jobs/{job_id}` (or watch `/events`) on its
+    /// own schedule.
+    pub async fn submit(socket: &Path, spec: &str, input: &str) -> anyhow::Result<()> {
+        let job_id = submit_job(&client(socket)?, socket, spec, input).await?;
+        println!("{job_id}");
+        Ok(())
+    }
+
+    pub async fn run(socket: &Path, spec: &str, input: &str) -> anyhow::Result<()> {
+        let client = client(socket)?;
+        let job_id = submit_job(&client, socket, spec, input).await?;
 
         loop {
             let body: serde_json::Value = client
