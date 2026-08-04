@@ -157,8 +157,8 @@ $ nix develop --command bash -c '
   '
 ```
 
-The daemon serves over a unix domain socket, so it is unix-only for now; the
-library crates are cross-platform and tested on Windows too.
+The daemon serves over a unix domain socket on unix and a named pipe on
+Windows — see [Windows](#windows) below.
 
 Running `cargo` outside that shell will pick up whatever toolchain happens to be on your `PATH`, which is a reliable source of confusing errors. If you'd rather not use Nix, check `flake.nix` for the pinned versions and match them yourself.
 
@@ -173,6 +173,91 @@ That is the same command CI runs. There is no coverage service and no upload
 token — CI publishes the resulting percentage as a small JSON file alongside the
 API docs, and the badge above renders from it. Coverage data never leaves the
 build.
+
+## Windows
+
+Both binaries run on Windows. The transport is the only thing that ever
+differed, and it now has a native implementation on each platform:
+
+| Platform | Transport | Default endpoint |
+|---|---|---|
+| unix | unix domain socket | `/tmp/cuttlefish.sock` |
+| Windows | named pipe | `\\.\pipe\cuttlefish` |
+
+Pass `--endpoint` to change it (`--socket` still works as an alias).
+
+Named pipes rather than a TCP listener on purpose: the daemon's access control
+*is* the endpoint's own permissions. It executes wasm and drives local models,
+so "any process on this machine may connect" would be a materially weaker
+posture than "whoever can open this endpoint may connect". A loopback port has
+no such gate and would need an auth token bolted on just to get back to where a
+socket already is. A named pipe is the Windows analogue, not a workaround.
+
+CI is the authority: `Compile and Test (windows-latest)` builds both binaries
+and runs the full suite, including cross-process tests that spawn the real
+`cuttlefish` binary.
+
+### Building and running Windows binaries from macOS or Linux
+
+Useful for a fast local loop instead of waiting ~8-10 minutes for CI. The
+`x86_64-pc-windows-gnu` target is in `flake.nix`, but the C dependencies in the
+graph (`zstd-sys`, `ittapi-sys`, and two wasmtime build scripts) need a mingw
+cross-toolchain, which is not in the dev shell — supply it per-invocation:
+
+```console
+$ MINGW=$(nix build --no-link --print-out-paths nixpkgs#pkgsCross.mingwW64.stdenv.cc)
+$ PTHREADS=$(nix build --no-link --print-out-paths \
+    nixpkgs#pkgsCross.mingwW64.windows.mingw_w64_pthreads)
+$ nix develop --command bash -c "
+    export PATH=\"$MINGW/bin:\$PATH\"
+    export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc
+    export AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar
+    export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+    export RUSTFLAGS=\"-L native=$PTHREADS/lib\"
+    cargo build -p cuttlefishd -p cuttlefish --target x86_64-pc-windows-gnu
+  "
+```
+
+Two traps worth knowing, both of which cost an hour to find:
+
+- **Use `windows-gnu`, not `windows-msvc`.** The msvc target needs the MSVC
+  linker, and its C dependencies fail on a host clang with `unsupported option
+  '-fPIC' for target 'x86_64-pc-windows-msvc'`. The gnu target builds cleanly
+  with mingw.
+- **`RUSTFLAGS=-L native=…/lib` is not optional.** Without it the link fails
+  with `cannot find -l:libpthread.a`: nixpkgs keeps mingw's winpthreads in a
+  package separate from the compiler, so it is not on the search path by
+  default.
+
+The binaries then run under [CrossOver][crossover] or plain Wine:
+
+```console
+$ cxbottle --create --bottle cuttlefish --template win10_64   # once
+$ export CX_BOTTLE=cuttlefish WINEDEBUG=-all
+$ cp target/x86_64-pc-windows-gnu/debug/*.exe \
+    ~/Library/Application\ Support/CrossOver/Bottles/cuttlefish/drive_c/
+$ wine 'c:\cuttlefishd.exe' 'c:\specs\summarize.cuttlefish' "" '\\.\pipe\cuttlefish' &
+$ wine 'c:\cuttlefish.exe' specs --endpoint '\\.\pipe\cuttlefish'
+```
+
+That much genuinely works: the daemon binds the pipe, the client connects over
+it, and `catalog add/list/show` round-trips with byte-identical hashes to a
+native run.
+
+**Treat Wine as a smoke test, not a gate.** It reimplements the Win32 API on
+unix primitives, so a pass is evidence rather than proof, and a failure may be
+a Wine gap rather than a real bug. In particular it cannot validate the pipe's
+access control, which is the property the transport was chosen for — Wine does
+not meaningfully enforce Windows ACLs. Anything load-bearing still has to go
+through the Windows CI job.
+
+One known open question, found exactly this way: running a job under Wine fails
+with `capability_denied` on a path that a native unix run accepts. That may be
+Wine's path semantics or a real bug in how capability roots are resolved on
+Windows; it has not been chased down yet, and a Windows CI test that submits a
+job would settle it.
+
+[crossover]: https://www.codeweavers.com/crossover
 
 ## Agent tools (Claude Code)
 
