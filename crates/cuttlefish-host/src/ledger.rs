@@ -67,18 +67,19 @@ impl Ledger {
     /// The recorded output of `node_name`, if it completed successfully.
     /// `None` for a node that never ran, is still pending, or was skipped.
     pub fn get_completed(&self, node_name: &str) -> rusqlite::Result<Option<serde_json::Value>> {
-        let result: Option<(String, Option<String>)> = self
-            .conn
-            .query_row(
-                "SELECT status, output_json FROM checkpoints WHERE node_name = ?1",
-                [node_name],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok();
+        let result: Option<(String, Option<String>)> = match self.conn.query_row(
+            "SELECT status, output_json FROM checkpoints WHERE node_name = ?1",
+            [node_name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
         match result {
-            Some((status, Some(json))) if status == "completed" => {
-                Ok(Some(serde_json::from_str(&json).expect("ledger never stores invalid JSON")))
-            }
+            Some((status, Some(json))) if status == "completed" => Ok(Some(
+                serde_json::from_str(&json).expect("ledger never stores invalid JSON"),
+            )),
             _ => Ok(None),
         }
     }
@@ -86,20 +87,25 @@ impl Ledger {
     /// Whether `node_name` was recorded as skipped (e.g. excluded by a
     /// branch decision).
     pub fn is_skipped(&self, node_name: &str) -> rusqlite::Result<bool> {
-        let status: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT status FROM checkpoints WHERE node_name = ?1",
-                [node_name],
-                |r| r.get(0),
-            )
-            .ok();
+        let status: Option<String> = match self.conn.query_row(
+            "SELECT status FROM checkpoints WHERE node_name = ?1",
+            [node_name],
+            |r| r.get(0),
+        ) {
+            Ok(status) => Some(status),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
         Ok(status.as_deref() == Some("skipped"))
     }
 
     /// Record `node_name` as completed with `output`, overwriting any prior
     /// checkpoint for that node.
-    pub fn write_completed(&self, node_name: &str, output: &serde_json::Value) -> rusqlite::Result<()> {
+    pub fn write_completed(
+        &self,
+        node_name: &str,
+        output: &serde_json::Value,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO checkpoints (node_name, status, output_json, completed_at)
              VALUES (?1, 'completed', ?2, ?3)",
@@ -122,14 +128,17 @@ impl Ledger {
     /// The job's own terminal status. `Running` until [`Ledger::finish`] is
     /// called.
     pub fn job_status(&self) -> rusqlite::Result<LedgerJobStatus> {
-        let s: String = self.conn.query_row("SELECT status FROM job_status", [], |r| r.get(0))?;
+        let s: String = self
+            .conn
+            .query_row("SELECT status FROM job_status", [], |r| r.get(0))?;
         Ok(LedgerJobStatus::from_str(&s))
     }
 
     /// Record the job's terminal status (e.g. `"completed"`, `"failed"`,
     /// `"cancelled"`).
     pub fn finish(&self, status: &str) -> rusqlite::Result<()> {
-        self.conn.execute("UPDATE job_status SET status = ?1", [status])?;
+        self.conn
+            .execute("UPDATE job_status SET status = ?1", [status])?;
         Ok(())
     }
 }
