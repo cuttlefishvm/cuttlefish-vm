@@ -45,6 +45,7 @@ pub mod dag;
 pub mod documents;
 pub mod handles;
 pub mod infer;
+pub mod ledger;
 #[cfg(feature = "llamacpp")]
 pub mod llamacpp;
 pub mod ollama;

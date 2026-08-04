@@ -83,3 +83,7 @@ time = { version = "0.3", features = ["formatting"] }
 # path resolves pipeline entries through the catalog) both reach it
 # transitively.
 dirs = "6"
+# Per-job checkpoint ledger (crates/cuttlefish-host/src/ledger.rs). `bundled`
+# compiles SQLite's C source directly into the binary — no system sqlite3,
+# no separate install step, works with ordinary Rust cross-compilation.
+rusqlite = { version = "0.32", features = ["bundled"] }

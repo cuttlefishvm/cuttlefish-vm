@@ -836,7 +836,7 @@ pub fn default_root() -> Option<PathBuf> {
 /// seconds, so `created_at` strings sort correctly with plain string
 /// comparison (used for "give me the latest" and did-you-mean tie-breaking)
 /// without ever needing to be parsed back.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     let now = time::OffsetDateTime::now_utc()
         .replace_nanosecond(0)
         .expect("0 is always a valid nanosecond value");
