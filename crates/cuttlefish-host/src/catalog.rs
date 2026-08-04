@@ -834,7 +834,7 @@ pub(crate) fn cuttlefish_home() -> Option<PathBuf> {
 
 /// Where the catalog lives when the caller doesn't say otherwise:
 /// `$CUTTLEFISH_HOME/catalog` if set, else `~/.cuttlefish/catalog`. `None`
-/// when neither is available — see [`cuttlefish_home`].
+/// when neither is available — see `cuttlefish_home` (private).
 pub fn default_root() -> Option<PathBuf> {
     cuttlefish_home().map(|h| h.join("catalog"))
 }
