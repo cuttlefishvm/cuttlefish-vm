@@ -40,7 +40,7 @@
         # plus `-Z build-std=std,panic_abort` on the guest build, and 64-bit
         # memories lose wasmtime's guard-page bounds-check elision.
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          targets = [ "wasm32-unknown-unknown" ];
+          targets = [ "wasm32-unknown-unknown" "x86_64-pc-windows-gnu" ];
           extensions = [ "rust-src" "rust-analyzer" "llvm-tools-preview" ];
         };
       in

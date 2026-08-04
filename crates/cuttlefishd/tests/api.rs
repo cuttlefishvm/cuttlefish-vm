@@ -5,10 +5,11 @@
 //! because of the replay log — a broadcast-only implementation fails it every
 //! time, and would have shipped looking correct.
 //!
-//! Unix-only: the daemon serves over a unix domain socket, so there is nothing
-//! to exercise on Windows. The portable crates are still tested there.
-
-#![cfg(unix)]
+//! Runs on every platform. The daemon serves over a unix domain socket on unix
+//! and a named pipe on Windows, and both go through the same `serve::serve`, so
+//! these exercise the real transport wherever they run — including the job that
+//! reads a file through the capability check, which is the one most likely to
+//! differ across platforms.
 
 use cuttlefish_core::graph::{Branches, NodeGraph};
 use cuttlefish_core::spec::{DataPolicy, ModelRef, Spec};
@@ -85,6 +86,30 @@ fn ensure_test_cuttlefish_home() {
     });
 }
 
+/// A private endpoint for one test.
+///
+/// Tests run concurrently, so each needs its own. On unix that is a socket
+/// inside the test's own tempdir; on Windows a pipe name is not a filesystem
+/// path and has no tempdir to live in, so uniqueness comes from the process id
+/// plus a counter.
+fn unique_endpoint(dir: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        dir.join("cf.sock")
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let _ = dir;
+        std::path::PathBuf::from(format!(
+            r"\\.\pipe\cuttlefishd-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+}
+
 async fn start() -> Harness {
     start_with_nodes(&["block"]).await
 }
@@ -100,7 +125,7 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let doc = dir.path().join("doc.txt");
     std::fs::write(&doc, "some document text").unwrap();
-    let sock = dir.path().join("cf.sock");
+    let sock = unique_endpoint(dir.path());
 
     let spec = Spec {
         name: "summarize_docs".into(),
@@ -148,26 +173,39 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
 
     let sock_for_server = sock.clone();
     tokio::spawn(async move {
-        let _ = serve::serve_unix(api::router(state), &sock_for_server).await;
+        let _ = serve::serve(api::router(state), &sock_for_server).await;
     });
 
-    // Wait for the socket to appear rather than sleeping a fixed duration,
-    // which would be either flaky or slow depending on the machine.
-    for _ in 0..200 {
-        if sock.exists() {
+    // `as_path()`, not `&sock`: reqwest's sealed provider traits cover `&Path`
+    // and `PathBuf` but not `&PathBuf`.
+    let builder = reqwest::Client::builder();
+    #[cfg(unix)]
+    let builder = builder.unix_socket(sock.as_path());
+    #[cfg(windows)]
+    let builder = builder.windows_named_pipe(sock.as_path());
+    let client = builder.build().unwrap();
+
+    // Poll the endpoint rather than sleeping a fixed duration, which would be
+    // either flaky or slow depending on the machine. Waiting on the *endpoint*
+    // rather than a file is what makes this portable: a unix socket appears on
+    // the filesystem, a named pipe never does, so the only portable readiness
+    // signal is a request that succeeds.
+    let mut ready = false;
+    for _ in 0..300 {
+        if client.get("http://localhost/specs").send().await.is_ok() {
+            ready = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(sock.exists(), "daemon never bound its socket");
+    assert!(
+        ready,
+        "daemon never accepted a request on {}",
+        sock.display()
+    );
 
     Harness {
-        // `as_path()`, not `&sock`: the sealed UnixSocketProvider trait covers
-        // `&Path` and `PathBuf` but not `&PathBuf`.
-        client: reqwest::Client::builder()
-            .unix_socket(sock.as_path())
-            .build()
-            .unwrap(),
+        client,
         _dir: dir,
         doc,
         jobs,
