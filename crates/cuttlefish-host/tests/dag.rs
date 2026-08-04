@@ -10,7 +10,7 @@ mod support;
 
 use cuttlefish_core::graph::{Branches, InputExpr, Node, NodeGraph};
 use cuttlefish_host::catalog::ArtifactKind;
-use cuttlefish_host::dag::{check_graph, DagError};
+use cuttlefish_host::dag::{check_graph, BranchExclusivity, DagError};
 use cuttlefish_host::pipeline::ResolvedInput;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -78,7 +78,11 @@ fn a_linear_two_node_graph_typechecks() {
 
     assert_eq!(checked.nodes.len(), 2);
     assert_eq!(
-        checked.nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        checked
+            .nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["chunk", "summarize"],
         "topological order must run producer before consumer"
     );
@@ -263,11 +267,21 @@ fn mixed_branch_fan_in_is_a_build_time_error() {
     );
     resolved.insert(
         "handle_pdf".to_string(),
-        resolved_for(dir.path(), "handle_pdf_a", "{route: text}", "{result: text}"),
+        resolved_for(
+            dir.path(),
+            "handle_pdf_a",
+            "{route: text}",
+            "{result: text}",
+        ),
     );
     resolved.insert(
         "handle_scan".to_string(),
-        resolved_for(dir.path(), "handle_scan_a", "{route: text}", "{result: text}"),
+        resolved_for(
+            dir.path(),
+            "handle_scan_a",
+            "{route: text}",
+            "{result: text}",
+        ),
     );
     resolved.insert(
         "joined".to_string(),
@@ -333,7 +347,12 @@ fn a_node_combining_one_branch_output_with_one_unconditional_output_is_fine() {
     );
     resolved.insert(
         "handle_pdf".to_string(),
-        resolved_for(dir.path(), "handle_pdf_b", "{route: text}", "{result: text}"),
+        resolved_for(
+            dir.path(),
+            "handle_pdf_b",
+            "{route: text}",
+            "{result: text}",
+        ),
     );
     // `other` is unrelated to the classify decision entirely — an
     // independent entry point.
@@ -377,9 +396,12 @@ fn a_node_combining_one_branch_output_with_one_unconditional_output_is_fine() {
     );
 
     assert_eq!(
-        checked.exclusive_to.get("joined").map(String::as_str),
-        Some("pdf"),
-        "joined must be recorded as exclusive to the pdf label, transitively via handle_pdf"
+        checked.exclusive_to.get("joined"),
+        Some(&BranchExclusivity {
+            decision: "classify".to_string(),
+            label: "pdf".to_string(),
+        }),
+        "joined must be recorded as exclusive to classify's pdf label, transitively via handle_pdf"
     );
 }
 
@@ -421,6 +443,19 @@ fn two_different_decisions_labeling_the_same_node_is_not_a_conflict() {
             "{result: text}",
         ),
     );
+    // handle_scan and handle_low are the *other* label of each decision —
+    // never referenced by any other node's InputExpr, but a branch target
+    // must now name a real graph node (that's the target-validation fix
+    // this suite also covers), so each gets a trivial unconditional stub
+    // purely to exist.
+    resolved.insert(
+        "handle_scan".to_string(),
+        resolved_for(dir.path(), "handle_scan_c", "{}", "{}"),
+    );
+    resolved.insert(
+        "handle_low".to_string(),
+        resolved_for(dir.path(), "handle_low_c", "{}", "{}"),
+    );
     resolved.insert(
         "joined".to_string(),
         resolved_for(
@@ -437,6 +472,8 @@ fn two_different_decisions_labeling_the_same_node_is_not_a_conflict() {
             ("urgency".to_string(), node(None)),
             ("handle_pdf".to_string(), node(Some(from("classify")))),
             ("handle_high".to_string(), node(Some(from("urgency")))),
+            ("handle_scan".to_string(), node(None)),
+            ("handle_low".to_string(), node(None)),
             (
                 "joined".to_string(),
                 node(Some(record(&[
@@ -448,8 +485,9 @@ fn two_different_decisions_labeling_the_same_node_is_not_a_conflict() {
     };
     // Two independent decisions, each with two labels, so each genuinely has
     // more than one mutually-exclusive outcome — only one target per
-    // decision actually appears as a graph node; the other exists solely so
-    // "same decision" has real meaning to check against.
+    // decision actually feeds `joined`; the other exists solely so "same
+    // decision" has real meaning to check against (and, as a real graph
+    // node, satisfies branch-target validation).
     let branches = Branches {
         decisions: vec![
             (
@@ -472,9 +510,60 @@ fn two_different_decisions_labeling_the_same_node_is_not_a_conflict() {
     let checked = check_graph(&Engine::default(), &graph, &branches, &resolved).expect(
         "a node fed by one label each from two different decisions must not be treated as a conflict",
     );
-    assert_eq!(checked.nodes.len(), 5);
+    assert_eq!(checked.nodes.len(), 7);
     // The point of this test is that check_graph returns Ok — which of
     // "pdf"/"high" ends up as joined's exclusive_to value is an unspecified
     // tie-break of propagation order, not something this test should pin
     // down.
+}
+
+#[test]
+fn an_unknown_branch_target_is_rejected() {
+    // branches.classify's "pdf" label points at "handle_pdf_TYPO", which was
+    // never added as a node anywhere in the graph — the kind of typo that,
+    // without target validation, would silently leave the *real* node
+    // (handle_pdf) ungated and running unconditionally at execution time.
+    // This must be caught here, at build time, instead.
+    let dir = tempfile::tempdir().unwrap();
+    let mut resolved = HashMap::new();
+    resolved.insert(
+        "classify".to_string(),
+        resolved_for(dir.path(), "classify_typo", "text", "{route: text}"),
+    );
+    resolved.insert(
+        "handle_pdf".to_string(),
+        resolved_for(
+            dir.path(),
+            "handle_pdf_typo",
+            "{route: text}",
+            "{result: text}",
+        ),
+    );
+
+    let graph = NodeGraph {
+        nodes: vec![
+            ("classify".to_string(), node(None)),
+            ("handle_pdf".to_string(), node(Some(from("classify")))),
+        ],
+    };
+    let branches = Branches {
+        decisions: vec![(
+            "classify".to_string(),
+            vec![("pdf".to_string(), "handle_pdf_TYPO".to_string())],
+        )],
+    };
+
+    let err = check_graph(&Engine::default(), &graph, &branches, &resolved)
+        .err()
+        .expect("a branch target that names no real node must be rejected");
+    match err {
+        DagError::UnknownReference { node, referenced } => {
+            assert_eq!(node, "classify", "must name the branching decision");
+            assert_eq!(
+                referenced, "handle_pdf_TYPO",
+                "must name the bad target, not the real node it was meant to gate"
+            );
+        }
+        other => panic!("expected UnknownReference, got {other:?}"),
+    }
 }

@@ -46,7 +46,21 @@ pub struct CheckedGraph {
     pub nodes: Vec<CheckedNode>,
     /// Which nodes are exclusive to which branch label, keyed by the
     /// branching node's name — see "skip propagation" in `check_graph`.
-    pub exclusive_to: HashMap<String, String>,
+    pub exclusive_to: HashMap<String, BranchExclusivity>,
+}
+
+/// Which branch decision + label a node is exclusive to — a node is only
+/// executed when this decision's chosen route matches `label`. Carrying
+/// `decision` (not just `label`) is what lets two independent `branches`
+/// decisions that happen to reuse the same label string coexist without
+/// being confused for a conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchExclusivity {
+    /// The branching decision (key in `branches.decisions`) this exclusivity
+    /// belongs to.
+    pub decision: String,
+    /// The label within that decision.
+    pub label: String,
 }
 
 /// Why a graph was rejected.
@@ -150,7 +164,9 @@ pub fn check_graph(
     //    assignable_to against its own declared input.
     let mut nodes = Vec::with_capacity(order.len());
     for name in &order {
-        let node = graph.get(name).expect("topological_order only returns known nodes");
+        let node = graph
+            .get(name)
+            .expect("topological_order only returns known nodes");
         let input_resolved = resolved.get(name).expect("caller resolved every node");
         let signature = signatures.get(name).unwrap().clone();
 
@@ -179,7 +195,10 @@ pub fn check_graph(
         });
     }
 
-    Ok(CheckedGraph { nodes, exclusive_to })
+    Ok(CheckedGraph {
+        nodes,
+        exclusive_to,
+    })
 }
 
 /// Kahn's algorithm, with the repeat_until exception: an edge from `node`
@@ -296,13 +315,13 @@ fn evaluate_expr_ty(
             // fall through to a SeamMismatch if a later one disagrees. (A
             // more precise per-item error is a reasonable follow-up; this is
             // the minimal correct behavior for v1.)
-            let first = items
-                .first()
-                .ok_or_else(|| DagError::UnknownReference {
-                    node: "?".into(),
-                    referenced: "<empty list>".into(),
-                })?;
-            Ok(Ty::List(Box::new(evaluate_expr_ty(first, signatures, graph)?)))
+            let first = items.first().ok_or_else(|| DagError::UnknownReference {
+                node: "?".into(),
+                referenced: "<empty list>".into(),
+            })?;
+            Ok(Ty::List(Box::new(evaluate_expr_ty(
+                first, signatures, graph,
+            )?)))
         }
     }
 }
@@ -331,13 +350,29 @@ fn describe_expr(
 fn compute_branch_exclusivity(
     graph: &NodeGraph,
     branches: &Branches,
-) -> Result<HashMap<String, String>, DagError> {
-    let mut exclusive_to: HashMap<String, String> = HashMap::new();
+) -> Result<HashMap<String, BranchExclusivity>, DagError> {
+    let mut exclusive_to: HashMap<String, BranchExclusivity> = HashMap::new();
 
-    for (_decision, labels) in &branches.decisions {
-        // Seed: each label's own target is exclusive to that label.
+    // Validate every branch target actually names a real node before
+    // seeding anything — an undeclared target is a build-time error (the
+    // node it should have gated instead runs unconditionally, which is
+    // exactly the silent-wrong-behavior this typechecker exists to prevent),
+    // named against the decision (branching node) that references it.
+    for (decision, labels) in &branches.decisions {
         for (label, target) in labels {
-            exclusive_to.insert(target.clone(), label.clone());
+            if graph.get(target).is_none() {
+                return Err(DagError::UnknownReference {
+                    node: decision.clone(),
+                    referenced: target.clone(),
+                });
+            }
+            exclusive_to.insert(
+                target.clone(),
+                BranchExclusivity {
+                    decision: decision.clone(),
+                    label: label.clone(),
+                },
+            );
         }
     }
 
@@ -349,40 +384,27 @@ fn compute_branch_exclusivity(
         let mut changed = false;
         for (name, node) in &graph.nodes {
             let Some(expr) = &node.input else { continue };
-            let mut found: Option<(String, String)> = None; // (decision, label)
+            let mut found: Option<BranchExclusivity> = None;
             for referenced in referenced_nodes(expr) {
-                if let Some(label) = exclusive_to.get(referenced) {
-                    let decision = branches
-                        .decisions
-                        .iter()
-                        .find(|(_, labels)| labels.iter().any(|(l, _)| l == label))
-                        .map(|(d, _)| d.clone())
-                        .unwrap_or_default();
+                if let Some(ex) = exclusive_to.get(referenced) {
                     match &found {
-                        None => found = Some((decision, label.clone())),
-                        Some((_, existing_label)) if existing_label != label => {
-                            // Only a real conflict if both labels belong to
-                            // the *same* decision — see DagError's doc comment.
-                            let same_decision = branches.decisions.iter().any(|(d, labels)| {
-                                *d == decision
-                                    && labels.iter().any(|(l, _)| l == existing_label)
-                                    && labels.iter().any(|(l, _)| l == label)
+                        None => found = Some(ex.clone()),
+                        Some(existing)
+                            if existing.decision == ex.decision && existing.label != ex.label =>
+                        {
+                            return Err(DagError::ConflictingBranchFanIn {
+                                node: name.clone(),
+                                decision: ex.decision.clone(),
+                                label_a: existing.label.clone(),
+                                label_b: ex.label.clone(),
                             });
-                            if same_decision {
-                                return Err(DagError::ConflictingBranchFanIn {
-                                    node: name.clone(),
-                                    decision,
-                                    label_a: existing_label.clone(),
-                                    label_b: label.clone(),
-                                });
-                            }
                         }
                         _ => {}
                     }
                 }
             }
-            if let Some((_, label)) = found {
-                if exclusive_to.insert(name.clone(), label).is_none() {
+            if let Some(ex) = found {
+                if exclusive_to.insert(name.clone(), ex).is_none() {
                     changed = true;
                 }
             }
