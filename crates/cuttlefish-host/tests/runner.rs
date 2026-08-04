@@ -9,11 +9,15 @@
 mod support;
 
 use cuttlefish_abi::{error_codes, JobStatus};
+use cuttlefish_core::graph::InputExpr;
 use cuttlefish_host::{
     caps::Capabilities,
+    catalog::ArtifactKind,
+    dag::CheckedNode,
     infer::StubBackend,
     runner::{run_job, JobEvent, JobSpec},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -71,9 +75,29 @@ fn fixture(contents: &str) -> Fixture {
     }
 }
 
+/// Build a [`CheckedNode`] for a test, with every field beyond the two that
+/// actually vary here defaulted the way a plain, unconditional, non-looping
+/// node's would be — a permissive signature and no `input`/`repeat_until`.
+fn node(name: &str, module_bytes: Vec<u8>) -> CheckedNode {
+    CheckedNode {
+        name: name.to_string(),
+        kind: ArtifactKind::Block,
+        resolved: None,
+        module_bytes,
+        signature: cuttlefish_abi::Signature {
+            input: cuttlefish_abi::Ty::Json,
+            output: cuttlefish_abi::Ty::Json,
+        },
+        input: None,
+        repeat_until: None,
+        max_iterations: None,
+    }
+}
+
 fn spec(f: &Fixture, input: serde_json::Value) -> JobSpec {
     JobSpec {
-        stages: vec![example_block()],
+        nodes: vec![node("block", example_block())],
+        exclusive_to: HashMap::new(),
         input,
         caps: f.caps.clone(),
     }
@@ -224,7 +248,8 @@ async fn a_module_that_is_not_wasm_fails_as_a_trap() {
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         JobSpec {
-            stages: vec![b"definitely not wasm".to_vec()],
+            nodes: vec![node("block", b"definitely not wasm".to_vec())],
+            exclusive_to: HashMap::new(),
             input: serde_json::json!({ "path": f.doc.to_str().unwrap() }),
             caps: f.caps.clone(),
         },
@@ -368,4 +393,307 @@ fn a_module_without_a_signature_reports_the_permissive_default() {
         .expect("a module without cf_signature is not an error");
     assert_eq!(sig.input, cuttlefish_abi::Ty::Json);
     assert_eq!(sig.output, cuttlefish_abi::Ty::Json);
+}
+
+/// A block that ignores its input entirely and always returns the same fixed
+/// JSON value — used to give two entry nodes distinguishable outputs even
+/// though both receive the same job input.
+fn const_block_source(struct_name: &str, value_json: &str) -> String {
+    format!(
+        r#"use cuttlefish_sdk::{{export_block, Block, Command, Event}};
+
+#[derive(Default)]
+struct {struct_name};
+
+impl Block for {struct_name} {{
+    fn start(&mut self, _input: serde_json::Value) -> Command {{
+        Command::Done {{ result: serde_json::json!({value_json}) }}
+    }}
+    fn step(&mut self, _event: Event) -> Command {{
+        unreachable!("this block never issues a command that produces an event")
+    }}
+}}
+
+export_block!({struct_name});
+"#
+    )
+}
+
+/// A block that returns its input unchanged — lets a test observe exactly
+/// what composed input a fan-in node actually received.
+fn echo_block_source() -> String {
+    r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct Echo;
+
+impl Block for Echo {
+    fn start(&mut self, input: serde_json::Value) -> Command {
+        Command::Done { result: input }
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!("echo never issues a command that produces an event")
+    }
+}
+
+export_block!(Echo);
+"#
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_fan_in_node_receives_both_upstream_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    let emit_a = std::fs::read(support::block_with_source(
+        dir.path(),
+        "fanin_emit_a",
+        &const_block_source("EmitA", r#"{ "a": "from-a" }"#),
+    ))
+    .unwrap();
+    let emit_b = std::fs::read(support::block_with_source(
+        dir.path(),
+        "fanin_emit_b",
+        &const_block_source("EmitB", r#"{ "b": "from-b" }"#),
+    ))
+    .unwrap();
+    let echo = std::fs::read(support::block_with_source(
+        dir.path(),
+        "fanin_echo",
+        &echo_block_source(),
+    ))
+    .unwrap();
+
+    let mut merged = node("merged", echo);
+    merged.input = Some(InputExpr::Record(
+        [
+            ("x".to_string(), InputExpr::FromNode("node_a".to_string())),
+            ("y".to_string(), InputExpr::FromNode("node_b".to_string())),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+
+    let job = JobSpec {
+        nodes: vec![node("node_a", emit_a), node("node_b", emit_b), merged],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed);
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(
+        result["x"]["a"], "from-a",
+        "the fan-in node's input should carry node_a's output under `x`: {result}"
+    );
+    assert_eq!(
+        result["y"]["b"], "from-b",
+        "the fan-in node's input should carry node_b's output under `y`: {result}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeat_until_loop_stops_at_max_iterations_without_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    // Always reports "not-yet", carrying forward a counter purely so the
+    // failure message (and a human) can see how many times it ran.
+    let looping = std::fs::read(support::block_with_source(
+        dir.path(),
+        "loop_never_done",
+        r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct NeverDone;
+
+impl Block for NeverDone {
+    fn start(&mut self, input: serde_json::Value) -> Command {
+        let n = input.get("n").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+        Command::Done { result: serde_json::json!({ "done": "not-yet", "n": n }) }
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!("this block never issues a command that produces an event")
+    }
+}
+
+export_block!(NeverDone);
+"#,
+    ))
+    .unwrap();
+
+    let mut looping_node = node("looper", looping);
+    looping_node.repeat_until = Some("done".to_string());
+    looping_node.max_iterations = Some(3);
+
+    let job = JobSpec {
+        nodes: vec![looping_node],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        envelope.status,
+        JobStatus::Failed,
+        "a loop that never reaches done must fail loudly, not truncate silently"
+    );
+    assert_eq!(
+        envelope.error.unwrap().code,
+        error_codes::SCHEMA_VALIDATION_FAILED
+    );
+    assert!(envelope.result.is_none());
+}
+
+#[tokio::test]
+async fn a_repeat_until_loop_stops_early_on_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    // Reports "done" on its very first invocation. Its own output carries an
+    // incrementing counter, so if the runner kept looping past the first
+    // "done" the final `n` would be greater than 1.
+    let done_first = std::fs::read(support::block_with_source(
+        dir.path(),
+        "loop_done_first",
+        r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct DoneFirst;
+
+impl Block for DoneFirst {
+    fn start(&mut self, input: serde_json::Value) -> Command {
+        let n = input.get("n").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+        Command::Done { result: serde_json::json!({ "done": "done", "n": n }) }
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!("this block never issues a command that produces an event")
+    }
+}
+
+export_block!(DoneFirst);
+"#,
+    ))
+    .unwrap();
+
+    let mut looping_node = node("looper", done_first);
+    looping_node.repeat_until = Some("done".to_string());
+    looping_node.max_iterations = Some(5); // much larger than the 1 call expected
+
+    let job = JobSpec {
+        nodes: vec![looping_node],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed);
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(
+        result["n"], 1,
+        "a block reporting done on its first call must run exactly once, got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn a_node_exclusive_to_a_non_taken_branch_does_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    // Emits route "scan" — never "pdf".
+    let router = std::fs::read(support::block_with_source(
+        dir.path(),
+        "branch_router",
+        &const_block_source("Router", r#"{ "route": "scan" }"#),
+    ))
+    .unwrap();
+    // Must never actually execute: it traps as soon as the host tries to
+    // instantiate and call it, so the job would fail loudly if this ran.
+    let must_not_run = std::fs::read(support::block_with_source(
+        dir.path(),
+        "branch_must_not_run",
+        r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct MustNotRun;
+
+impl Block for MustNotRun {
+    fn start(&mut self, _input: serde_json::Value) -> Command {
+        panic!("this node is exclusive to a branch that was not taken and must not run");
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!()
+    }
+}
+
+export_block!(MustNotRun);
+"#,
+    ))
+    .unwrap();
+
+    let mut exclusive_to = HashMap::new();
+    exclusive_to.insert(
+        "pdf_only".to_string(),
+        cuttlefish_host::dag::BranchExclusivity {
+            decision: "router".to_string(),
+            label: "pdf".to_string(),
+        },
+    );
+
+    let job = JobSpec {
+        nodes: vec![node("router", router), node("pdf_only", must_not_run)],
+        exclusive_to,
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        envelope.status,
+        JobStatus::Completed,
+        "the job must complete: the gated node must be skipped, not run (envelope: {envelope:?})"
+    );
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["route"], "scan");
 }

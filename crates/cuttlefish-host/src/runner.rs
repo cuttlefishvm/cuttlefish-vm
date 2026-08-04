@@ -44,12 +44,14 @@ pub enum JobEvent {
 
 /// Everything needed to run one job.
 pub struct JobSpec {
-    /// The pipeline's compiled blocks, in execution order.
-    ///
-    /// Each block's result becomes the next one's input. A single-block
-    /// pipeline is the ordinary case, so most jobs have one element here.
-    pub stages: Vec<Vec<u8>>,
-    /// The job's input, handed to the guest's `init`.
+    /// The checked graph, in topological order — safe to execute
+    /// front-to-back, threading `outputs` forward.
+    pub nodes: Vec<crate::dag::CheckedNode>,
+    /// Which nodes are exclusive to which branch decision+label — see
+    /// `crate::dag::BranchExclusivity`.
+    pub exclusive_to: std::collections::HashMap<String, crate::dag::BranchExclusivity>,
+    /// The job's input, handed to every entry node (a node with no `input`
+    /// expression — `node.input.is_none()`).
     pub input: serde_json::Value,
     /// What this job is permitted to reach.
     pub caps: Capabilities,
@@ -246,6 +248,43 @@ fn fail(code: &str, message: impl Into<String>, usage: Usage) -> Envelope {
     }
 }
 
+/// Whether an `InputExpr` (transitively) references any node in `skipped`.
+fn references_any(
+    expr: &cuttlefish_core::graph::InputExpr,
+    skipped: &std::collections::HashSet<String>,
+) -> bool {
+    use cuttlefish_core::graph::InputExpr;
+    match expr {
+        InputExpr::FromNode(n) => skipped.contains(n),
+        InputExpr::Record(fields) => fields.values().any(|e| references_any(e, skipped)),
+        InputExpr::List(items) => items.iter().any(|e| references_any(e, skipped)),
+    }
+}
+
+/// Compose an `InputExpr` into an actual JSON value, by looking up each
+/// referenced node's already-produced output. Mirrors `dag::evaluate_expr_ty`
+/// (which does the same composition at the *type* level, at check time) —
+/// this is the runtime analogue.
+fn evaluate_input(
+    expr: &cuttlefish_core::graph::InputExpr,
+    outputs: &std::collections::HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    use cuttlefish_core::graph::InputExpr;
+    match expr {
+        InputExpr::FromNode(n) => outputs.get(n).cloned().unwrap_or(serde_json::Value::Null),
+        InputExpr::Record(fields) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in fields {
+                map.insert(k.clone(), evaluate_input(v, outputs));
+            }
+            serde_json::Value::Object(map)
+        }
+        InputExpr::List(items) => {
+            serde_json::Value::Array(items.iter().map(|e| evaluate_input(e, outputs)).collect())
+        }
+    }
+}
+
 fn cancelled(usage: Usage, message: &str) -> Envelope {
     Envelope {
         status: JobStatus::Cancelled,
@@ -285,56 +324,148 @@ pub async fn run_job(
     // security property rests on.
     let mut handles = Handles::default();
 
-    if job.stages.is_empty() {
+    if job.nodes.is_empty() {
         usage.duration_ms = started.elapsed().as_millis() as u64;
         return fail(
             error_codes::SCHEMA_VALIDATION_FAILED,
-            "this job has no blocks to run",
+            "this job has no nodes to run",
             usage,
         );
     }
 
-    let total = job.stages.len();
-    let mut value = job.input;
+    let total = job.nodes.len();
+    let mut outputs: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut route_taken: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
-    for (index, module_bytes) in job.stages.iter().enumerate() {
-        // Tell watchers which stage is running. A pipeline that stalls is much
+    for (index, node) in job.nodes.iter().enumerate() {
+        // Tell watchers which node is running. A pipeline that stalls is much
         // easier to diagnose when the stream says where.
         if total > 1 {
             let _ = events
                 .send(JobEvent::Progress(serde_json::json!({
                     "stage": index + 1,
                     "of": total,
+                    "node": node.name,
                 })))
                 .await;
         }
 
-        match run_stage(
-            &engine,
-            &backend,
-            module_bytes,
-            value,
-            &job.caps,
-            &mut handles,
-            &events,
-            &cancel,
-            &mut usage,
-            started,
-            index,
-        )
-        .await
-        {
-            Ok(result) => value = result,
-            Err(envelope) => return envelope,
+        // Branch-skip: this node is exclusive to a decision+label, and that
+        // decision's chosen route (already recorded earlier in this same
+        // loop, since the branching node is always topologically before the
+        // nodes exclusive to its labels) doesn't match.
+        if let Some(ex) = job.exclusive_to.get(&node.name) {
+            if let Some(taken) = route_taken.get(&ex.decision) {
+                if taken != &ex.label {
+                    skipped.insert(node.name.clone());
+                    continue;
+                }
+            }
         }
+        // Transitive skip: this node's input needs a skipped node's output.
+        if let Some(expr) = &node.input {
+            if references_any(expr, &skipped) {
+                skipped.insert(node.name.clone());
+                continue;
+            }
+        }
+
+        let node_input = match &node.input {
+            None => job.input.clone(),
+            Some(expr) => evaluate_input(expr, &outputs),
+        };
+
+        // Bounded loop: repeat_until re-invokes this node on its own prior
+        // output, up to max_iterations. A node without repeat_until runs
+        // exactly once (the loop's `None` arm breaks immediately).
+        let mut current_input = node_input;
+        let mut iterations: u32 = 0;
+        let result = loop {
+            let r = match run_stage(
+                &engine,
+                &backend,
+                &node.module_bytes,
+                current_input.clone(),
+                &job.caps,
+                &mut handles,
+                &events,
+                &cancel,
+                &mut usage,
+                started,
+                index,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(envelope) => return envelope,
+            };
+            match &node.repeat_until {
+                None => break r,
+                Some(field) => {
+                    iterations += 1;
+                    let done = r.get(field).and_then(|v| v.as_str()) == Some("done");
+                    if done {
+                        break r;
+                    }
+                    let max = node
+                        .max_iterations
+                        .expect("repeat_until requires max_iterations, enforced at parse time");
+                    if iterations >= max {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return fail(
+                            error_codes::SCHEMA_VALIDATION_FAILED,
+                            format!(
+                                "node `{}` did not reach repeat_until=\"done\" within max_iterations={max}",
+                                node.name
+                            ),
+                            usage,
+                        );
+                    }
+                    current_input = r;
+                }
+            }
+        };
+
+        // A branching node: read its `route` field and record the decision
+        // for later nodes' branch-skip check (top of this loop).
+        if let Some(route) = result.get("route").and_then(|v| v.as_str()) {
+            route_taken.insert(node.name.clone(), route.to_string());
+        }
+
+        outputs.insert(node.name.clone(), result);
     }
 
     usage.duration_ms = started.elapsed().as_millis() as u64;
-    Envelope {
-        status: JobStatus::Completed,
-        result: Some(value),
-        error: None,
-        usage,
+
+    // What is "the" job result for a graph? Convention: the output of the
+    // LAST node in topological order that wasn't skipped. This exactly
+    // matches today's linear-pipeline behavior in the degenerate case (a
+    // linear chain's last node in topo order is its sole sink), and
+    // generalizes sensibly to a branching graph (exactly one path executes,
+    // so there's still a well-defined "last node that actually ran") and to
+    // a fan-in graph without branches (the join/sink node is last in topo
+    // order, since nothing depends on it).
+    let result = job
+        .nodes
+        .iter()
+        .rev()
+        .find_map(|n| outputs.get(&n.name).cloned());
+
+    match result {
+        Some(value) => Envelope {
+            status: JobStatus::Completed,
+            result: Some(value),
+            error: None,
+            usage,
+        },
+        None => fail(
+            error_codes::SCHEMA_VALIDATION_FAILED,
+            "every node in this job was skipped; there is no result",
+            usage,
+        ),
     }
 }
 

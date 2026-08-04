@@ -10,6 +10,7 @@
 
 #![cfg(unix)]
 
+use cuttlefish_core::graph::{Branches, NodeGraph};
 use cuttlefish_core::spec::{DataPolicy, ModelRef, Spec};
 use cuttlefishd::{api, serve, state::JobStore};
 use futures_util::StreamExt;
@@ -62,7 +63,26 @@ async fn start() -> Harness {
         model: ModelRef::new("stub", ""),
         data_policy: DataPolicy::LocalOnly,
         read_roots: vec![dir.path().to_path_buf()],
-        pipeline: vec!["../blocks/echo-summarize".into()],
+        nodes: NodeGraph::single("../blocks/echo-summarize".into()),
+        branches: Branches::default(),
+    };
+
+    // `NodeGraph::single` names its sole node "block" — matched here so this
+    // stands in for what `dag::check_graph` would have produced, without
+    // going through the full resolve pipeline (this test builds `AppState`
+    // directly).
+    let checked_node = cuttlefish_host::dag::CheckedNode {
+        name: "block".to_string(),
+        kind: cuttlefish_host::catalog::ArtifactKind::Block,
+        resolved: None,
+        module_bytes: example_block(),
+        signature: cuttlefish_abi::Signature {
+            input: cuttlefish_abi::Ty::Json,
+            output: cuttlefish_abi::Ty::Json,
+        },
+        input: None,
+        repeat_until: None,
+        max_iterations: None,
     };
 
     let state = api::AppState {
@@ -70,7 +90,8 @@ async fn start() -> Harness {
         backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
         jobs: JobStore::default(),
         spec: Arc::new(spec),
-        stages: Arc::new(vec![example_block()]),
+        checked_nodes: Arc::new(vec![checked_node]),
+        exclusive_to: Arc::new(std::collections::HashMap::new()),
     };
 
     let sock_for_server = sock.clone();

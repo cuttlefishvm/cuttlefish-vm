@@ -293,8 +293,31 @@ export_block!(B);
         .join(format!("{}.wasm", name.replace('-', "_")))
 }
 
+/// A [`cuttlefish_host::dag::CheckedNode`] for a test, permissive-signature
+/// and non-looping, differing only in name, module bytes, and `input`.
+fn checked_node(
+    name: &str,
+    module_bytes: Vec<u8>,
+    input: Option<cuttlefish_core::graph::InputExpr>,
+) -> cuttlefish_host::dag::CheckedNode {
+    cuttlefish_host::dag::CheckedNode {
+        name: name.to_string(),
+        kind: ArtifactKind::Block,
+        resolved: None,
+        module_bytes,
+        signature: cuttlefish_abi::Signature {
+            input: cuttlefish_abi::Ty::Json,
+            output: cuttlefish_abi::Ty::Json,
+        },
+        input,
+        repeat_until: None,
+        max_iterations: None,
+    }
+}
+
 #[tokio::test]
 async fn a_pipeline_threads_each_result_into_the_next_block() {
+    use cuttlefish_core::graph::InputExpr;
     use cuttlefish_host::{
         caps::Capabilities,
         infer::StubBackend,
@@ -312,7 +335,12 @@ async fn a_pipeline_threads_each_result_into_the_next_block() {
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         JobSpec {
-            stages: vec![first, second, third],
+            nodes: vec![
+                checked_node("n0", first, None),
+                checked_node("n1", second, Some(InputExpr::FromNode("n0".to_string()))),
+                checked_node("n2", third, Some(InputExpr::FromNode("n1".to_string()))),
+            ],
+            exclusive_to: std::collections::HashMap::new(),
             input: serde_json::json!({}),
             caps: Capabilities::default(),
         },
@@ -332,6 +360,7 @@ async fn a_pipeline_threads_each_result_into_the_next_block() {
 
 #[tokio::test]
 async fn a_failing_stage_ends_the_job_and_names_the_stage() {
+    use cuttlefish_core::graph::InputExpr;
     use cuttlefish_host::{
         caps::Capabilities,
         infer::StubBackend,
@@ -349,7 +378,15 @@ async fn a_failing_stage_ends_the_job_and_names_the_stage() {
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         JobSpec {
-            stages: vec![good, b"not wasm".to_vec()],
+            nodes: vec![
+                checked_node("n0", good, None),
+                checked_node(
+                    "n1",
+                    b"not wasm".to_vec(),
+                    Some(InputExpr::FromNode("n0".to_string())),
+                ),
+            ],
+            exclusive_to: std::collections::HashMap::new(),
             input: serde_json::json!({}),
             caps: Capabilities::default(),
         },
