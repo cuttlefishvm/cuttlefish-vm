@@ -43,6 +43,12 @@ pub struct AppState {
     /// Which nodes are exclusive to which branch decision+label.
     pub exclusive_to:
         Arc<std::collections::HashMap<String, cuttlefish_host::dag::BranchExclusivity>>,
+    /// Notified once, by the `/shutdown` handler, to trigger axum's graceful
+    /// shutdown — see `serve::serve`. `Notify` (not a oneshot) because
+    /// `AppState` is `Clone` and cheaply shared across every handler; a
+    /// oneshot's single-consumption `Sender` doesn't fit a type that gets
+    /// cloned per-request.
+    pub shutdown: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// A job submission.
@@ -63,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/jobs/{id}/events", get(job_events))
         .route("/jobs/{id}/resume", post(resume_job))
+        .route("/shutdown", post(shutdown))
         .with_state(state)
 }
 
@@ -364,6 +371,17 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
     });
 
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Ask the daemon to stop accepting new connections and exit cleanly, once
+/// any in-flight request finishes. Portable graceful-stop primitive for
+/// `cuttlefish-run`'s "stop the old daemon, start a new one for a different
+/// spec" flow — deliberately an HTTP route rather than a `SIGTERM` handler,
+/// since Windows (which this daemon already supports via named pipes) has
+/// no signal `cuttlefishd` could portably install a handler for.
+async fn shutdown(State(st): State<AppState>) -> impl IntoResponse {
+    st.shutdown.notify_one();
+    StatusCode::ACCEPTED
 }
 
 /// Live event stream, replaying anything already emitted.

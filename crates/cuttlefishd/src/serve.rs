@@ -12,29 +12,40 @@
 use axum::Router;
 use std::path::Path;
 
-/// Serve `app` on `endpoint` until the process ends.
+/// Serve `app` on `endpoint` until `shutdown` resolves.
 ///
 /// `endpoint` is a socket path on unix and a pipe name (`\\.\pipe\...`) on
-/// Windows; see [`cuttlefish_core::endpoint::default_endpoint`].
-pub async fn serve(app: Router, endpoint: &Path) -> anyhow::Result<()> {
+/// Windows; see [`cuttlefish_core::endpoint::default_endpoint`]. `shutdown`
+/// is the portable stand-in for a `SIGTERM` handler — Windows has no signal
+/// this daemon could install one for, so graceful stop is instead triggered
+/// by the `POST /shutdown` route resolving this future; see `api::AppState`.
+pub async fn serve(
+    app: Router,
+    endpoint: &Path,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        serve_unix(app, endpoint).await
+        serve_unix(app, endpoint, shutdown).await
     }
     #[cfg(windows)]
     {
-        serve_named_pipe(app, endpoint).await
+        serve_named_pipe(app, endpoint, shutdown).await
     }
 }
 
-/// Serve `app` on a unix socket at `sock_path` until the process ends.
+/// Serve `app` on a unix socket at `sock_path` until `shutdown` resolves.
 ///
 /// axum 0.8's `serve` accepts any listener, so this is a handful of lines. On
 /// 0.7 it took a concrete `TcpListener` and a unix socket needed a hand-rolled
 /// hyper accept loop over `hyper-util` and `tower`; if you find yourself
 /// reintroducing that, check the axum version first.
 #[cfg(unix)]
-pub async fn serve_unix(app: Router, sock_path: &Path) -> anyhow::Result<()> {
+pub async fn serve_unix(
+    app: Router,
+    sock_path: &Path,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
 
     // A stale socket file from a previous run makes bind() fail with EADDRINUSE
@@ -43,16 +54,24 @@ pub async fn serve_unix(app: Router, sock_path: &Path) -> anyhow::Result<()> {
 
     let listener = UnixListener::bind(sock_path)?;
     eprintln!("cuttlefishd listening on {}", sock_path.display());
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 
-/// Serve `app` on a Windows named pipe until the process ends.
+/// Serve `app` on a Windows named pipe until `shutdown` resolves.
 #[cfg(windows)]
-pub async fn serve_named_pipe(app: Router, pipe_name: &Path) -> anyhow::Result<()> {
+pub async fn serve_named_pipe(
+    app: Router,
+    pipe_name: &Path,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let listener = windows_pipe::NamedPipeListener::bind(pipe_name)?;
     eprintln!("cuttlefishd listening on {}", pipe_name.display());
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
     Ok(())
 }
 

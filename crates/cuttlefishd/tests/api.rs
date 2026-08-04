@@ -169,11 +169,12 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
         spec: Arc::new(spec),
         checked_nodes: Arc::new(checked_nodes),
         exclusive_to: Arc::new(std::collections::HashMap::new()),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
     };
 
     let sock_for_server = sock.clone();
     tokio::spawn(async move {
-        let _ = serve::serve(api::router(state), &sock_for_server).await;
+        let _ = serve::serve(api::router(state), &sock_for_server, std::future::pending()).await;
     });
 
     // `as_path()`, not `&sock`: reqwest's sealed provider traits cover `&Path`
@@ -732,6 +733,101 @@ async fn resuming_a_job_whose_ledger_fingerprint_does_not_match_is_refused() {
         ledger.get_completed("block").unwrap().is_none(),
         "a fingerprint-mismatched job must not have run any node"
     );
+}
+
+#[tokio::test]
+async fn shutdown_causes_serve_to_return() {
+    // Same manual `AppState`/`serve::serve` setup `start_with_nodes` uses,
+    // but this test needs the `serve` future itself (not just the running
+    // task behind `start`'s helpers) so it can assert the *task* — not just
+    // a subsequent request — actually completes once `/shutdown` is called.
+    ensure_test_cuttlefish_home();
+    let dir = tempfile::tempdir().unwrap();
+    let sock = unique_endpoint(dir.path());
+
+    let spec = Spec {
+        name: "summarize_docs".into(),
+        description: "Use when a local file needs summarizing.".into(),
+        model: ModelRef::new("stub", ""),
+        data_policy: DataPolicy::LocalOnly,
+        read_roots: vec![dir.path().to_path_buf()],
+        nodes: NodeGraph::single("../blocks/echo-summarize".into()),
+        branches: Branches::default(),
+    };
+
+    let checked_nodes = vec![cuttlefish_host::dag::CheckedNode {
+        name: "block".to_string(),
+        kind: cuttlefish_host::catalog::ArtifactKind::Block,
+        resolved: None,
+        module_bytes: example_block(),
+        signature: cuttlefish_abi::Signature {
+            input: cuttlefish_abi::Ty::Json,
+            output: cuttlefish_abi::Ty::Json,
+        },
+        input: None,
+        repeat_until: None,
+        max_iterations: None,
+    }];
+
+    // A real `Notify`, distinct from the `std::future::pending()` every other
+    // test in this file uses — this is the one test that actually needs to
+    // trigger shutdown rather than merely tolerate the parameter existing.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let state = api::AppState {
+        engine: Arc::new(wasmtime::Engine::default()),
+        backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
+        jobs: JobStore::default(),
+        spec: Arc::new(spec),
+        checked_nodes: Arc::new(checked_nodes),
+        exclusive_to: Arc::new(std::collections::HashMap::new()),
+        shutdown: shutdown.clone(),
+    };
+
+    let sock_for_server = sock.clone();
+    let shutdown_for_serve = shutdown.clone();
+    let handle = tokio::spawn(async move {
+        serve::serve(api::router(state), &sock_for_server, async move {
+            shutdown_for_serve.notified().await
+        })
+        .await
+    });
+
+    let builder = reqwest::Client::builder();
+    #[cfg(unix)]
+    let builder = builder.unix_socket(sock.as_path());
+    #[cfg(windows)]
+    let builder = builder.windows_named_pipe(sock.as_path());
+    let client = builder.build().unwrap();
+
+    let mut ready = false;
+    for _ in 0..300 {
+        if client.get("http://localhost/specs").send().await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        ready,
+        "daemon never accepted a request on {}",
+        sock.display()
+    );
+
+    let resp = client
+        .post("http://localhost/shutdown")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    // The real assertion: the spawned `serve` task actually returns, rather
+    // than hanging forever — a timeout here means graceful shutdown never
+    // reached `axum::serve`'s `with_graceful_shutdown` future.
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve task did not complete after POST /shutdown")
+        .expect("serve task panicked")
+        .expect("serve returned an error");
 }
 
 #[tokio::test]

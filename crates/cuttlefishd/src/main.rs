@@ -120,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
     let current_fingerprint = cuttlefish_host::dag::graph_fingerprint(&checked.nodes);
     cuttlefishd::scan_for_interrupted_jobs(&jobs_root, &current_fingerprint, &jobs).await?;
 
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
     let state = api::AppState {
         engine,
         backend,
@@ -139,7 +141,12 @@ async fn main() -> anyhow::Result<()> {
             nodes
         }),
         exclusive_to: Arc::new(checked.exclusive_to),
+        shutdown: shutdown.clone(),
     };
 
-    serve::serve(api::router(state), &endpoint).await
+    let shutdown_signal = {
+        let shutdown = shutdown.clone();
+        async move { shutdown.notified().await }
+    };
+    serve::serve(api::router(state), &endpoint, shutdown_signal).await
 }
