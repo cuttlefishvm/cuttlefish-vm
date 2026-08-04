@@ -49,6 +49,19 @@ struct Harness {
     client: reqwest::Client,
     _dir: tempfile::TempDir,
     doc: std::path::PathBuf,
+    /// The same `JobStore` the running daemon's `AppState` holds — handed
+    /// back so resume tests can mark a job `Interrupted` directly (the same
+    /// hand-building pattern `tests/startup.rs` uses for its ledger tests),
+    /// without needing a real daemon crash to produce one.
+    jobs: JobStore,
+    /// Where `submit`/`resume_job` look for a job's on-disk directory —
+    /// `$CUTTLEFISH_HOME/jobs`, pointed at this test binary's shared tempdir
+    /// by `ensure_test_cuttlefish_home`.
+    jobs_root: std::path::PathBuf,
+    /// The graph fingerprint this harness's `AppState.checked_nodes`
+    /// produces — what a hand-built ledger's `graph_fingerprint` must match
+    /// for `resume_job` to accept it.
+    fingerprint: String,
 }
 
 /// `submit` now resolves a job directory through
@@ -73,6 +86,16 @@ fn ensure_test_cuttlefish_home() {
 }
 
 async fn start() -> Harness {
+    start_with_nodes(&["block"]).await
+}
+
+/// Same as [`start`], but the served spec's graph has one entry node per name
+/// in `names`, each running the same example block against the harness's
+/// shared `doc`. Every node has `input: None` (an entry node), so each one
+/// independently receives the job's raw input rather than another node's
+/// output — enough to build a multi-node graph without needing real
+/// inter-node data flow, which the resume tests below don't exercise.
+async fn start_with_nodes(names: &[&str]) -> Harness {
     ensure_test_cuttlefish_home();
     let dir = tempfile::tempdir().unwrap();
     let doc = dir.path().join("doc.txt");
@@ -89,30 +112,37 @@ async fn start() -> Harness {
         branches: Branches::default(),
     };
 
-    // `NodeGraph::single` names its sole node "block" — matched here so this
-    // stands in for what `dag::check_graph` would have produced, without
-    // going through the full resolve pipeline (this test builds `AppState`
-    // directly).
-    let checked_node = cuttlefish_host::dag::CheckedNode {
-        name: "block".to_string(),
-        kind: cuttlefish_host::catalog::ArtifactKind::Block,
-        resolved: None,
-        module_bytes: example_block(),
-        signature: cuttlefish_abi::Signature {
-            input: cuttlefish_abi::Ty::Json,
-            output: cuttlefish_abi::Ty::Json,
-        },
-        input: None,
-        repeat_until: None,
-        max_iterations: None,
-    };
+    // `NodeGraph::single` names its sole node "block"; for a multi-node
+    // harness the `nodes` field on `spec` above is unused (only
+    // `checked_nodes`/`exclusive_to` on `AppState` drive execution — see
+    // `start`'s original comment), so building several `CheckedNode`s
+    // directly here, without going through the full resolve pipeline, is
+    // consistent with that existing convention.
+    let checked_nodes: Vec<cuttlefish_host::dag::CheckedNode> = names
+        .iter()
+        .map(|name| cuttlefish_host::dag::CheckedNode {
+            name: name.to_string(),
+            kind: cuttlefish_host::catalog::ArtifactKind::Block,
+            resolved: None,
+            module_bytes: example_block(),
+            signature: cuttlefish_abi::Signature {
+                input: cuttlefish_abi::Ty::Json,
+                output: cuttlefish_abi::Ty::Json,
+            },
+            input: None,
+            repeat_until: None,
+            max_iterations: None,
+        })
+        .collect();
+    let fingerprint = cuttlefish_host::dag::graph_fingerprint(&checked_nodes);
 
+    let jobs = JobStore::default();
     let state = api::AppState {
         engine: Arc::new(wasmtime::Engine::default()),
         backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
-        jobs: JobStore::default(),
+        jobs: jobs.clone(),
         spec: Arc::new(spec),
-        checked_nodes: Arc::new(vec![checked_node]),
+        checked_nodes: Arc::new(checked_nodes),
         exclusive_to: Arc::new(std::collections::HashMap::new()),
     };
 
@@ -140,6 +170,9 @@ async fn start() -> Harness {
             .unwrap(),
         _dir: dir,
         doc,
+        jobs,
+        jobs_root: cuttlefish_host::ledger::jobs_root().expect("CUTTLEFISH_HOME set by test init"),
+        fingerprint,
     }
 }
 
@@ -417,4 +450,231 @@ async fn specs_are_discoverable() {
         .unwrap()
         .starts_with("Use when"));
     assert_eq!(body[0]["data_policy"], "local_only");
+}
+
+/// A job id unlikely to collide with any other test's, even though every
+/// test in this file shares one `CUTTLEFISH_HOME`/`jobs_root` tempdir (see
+/// `ensure_test_cuttlefish_home`) and tests run concurrently. `submit`
+/// itself mints ids from `uuid::Uuid::new_v4()`, which isn't reachable here
+/// (`uuid` is a normal, not dev, dependency of `cuttlefishd`) — a
+/// nanosecond timestamp is more than precise enough for hand-built job
+/// directories that never go through `submit`.
+fn unique_job_id(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{tag}-{nanos}")
+}
+
+#[tokio::test]
+async fn get_jobs_lists_a_submitted_job() {
+    let h = start().await;
+    let id = h
+        .submit_ok(serde_json::json!({ "path": h.doc.to_str().unwrap() }))
+        .await;
+    h.await_terminal(&id).await;
+
+    let body: serde_json::Value = h
+        .client
+        .get("http://localhost/jobs")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let jobs = body.as_array().expect("GET /jobs must return an array");
+    let found = jobs
+        .iter()
+        .find(|j| j["job_id"] == id)
+        .expect("the submitted job must appear in GET /jobs");
+    assert_eq!(found["status"], "completed");
+    assert_eq!(found["envelope"]["result"]["summary"], "a stub summary");
+}
+
+#[tokio::test]
+async fn get_jobs_surfaces_an_interrupted_job() {
+    let h = start().await;
+    let id = unique_job_id("interrupted");
+
+    // Hand-build a job directory whose ledger was never `finish`ed — the
+    // same "still running when the process died" state
+    // `tests/startup.rs`'s scan tests construct — then mark it interrupted
+    // directly on the harness's `JobStore` (which is the very `JobStore`
+    // the running daemon serves), standing in for what the startup scan
+    // would have done to a real crashed job.
+    let ledger_path = h.jobs_root.join(&id).join("ledger.sqlite");
+    {
+        let ledger = cuttlefish_host::ledger::Ledger::open(&ledger_path, &h.fingerprint).unwrap();
+        assert_eq!(
+            ledger.job_status().unwrap(),
+            cuttlefish_host::ledger::LedgerJobStatus::Running,
+            "sanity check: a freshly opened ledger must start out running"
+        );
+    }
+    h.jobs.mark_interrupted(id.clone()).await;
+
+    let body: serde_json::Value = h
+        .client
+        .get("http://localhost/jobs")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let jobs = body.as_array().expect("GET /jobs must return an array");
+    let found = jobs
+        .iter()
+        .find(|j| j["job_id"] == id)
+        .expect("the interrupted job must appear in GET /jobs");
+    assert_eq!(found["status"], "interrupted");
+    assert!(
+        found["envelope"].is_null(),
+        "an interrupted job has no envelope yet"
+    );
+}
+
+#[tokio::test]
+async fn resuming_a_non_interrupted_job_is_rejected() {
+    let h = start().await;
+    let id = h
+        .submit_ok(serde_json::json!({ "path": h.doc.to_str().unwrap() }))
+        .await;
+    let body = h.await_terminal(&id).await;
+    assert_eq!(body["status"], "completed");
+
+    let resp = h
+        .client
+        .post(format!("http://localhost/jobs/{id}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        409,
+        "resuming a non-Interrupted job must be rejected, not silently re-executed"
+    );
+}
+
+#[tokio::test]
+async fn resuming_an_interrupted_job_completes_remaining_nodes() {
+    // Two entry nodes, both fed the job's raw input directly (see
+    // `start_with_nodes`'s doc comment) — `n1` is pre-checkpointed with an
+    // obviously-fake output; `n2` is left uncheckpointed. The ledger's
+    // resume-aware loop (`runner::run_job`) skips `n1` by replaying the
+    // fake cached value, but `n2` has no checkpoint at all, so it can only
+    // reach a terminal state by actually invoking the wasm block — which
+    // the stub backend answers with a *specific*, known string
+    // ("a stub summary") that the hand-written fake value never contains.
+    // If resume were broken and just synthesized results for
+    // not-yet-checkpointed nodes instead of really running them, the final
+    // result would not carry that string.
+    let h = start_with_nodes(&["n1", "n2"]).await;
+    let id = unique_job_id("resume-complete");
+    let job_dir = h.jobs_root.join(&id);
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(
+        job_dir.join("input.json"),
+        serde_json::json!({ "path": h.doc.to_str().unwrap() }).to_string(),
+    )
+    .unwrap();
+
+    {
+        let ledger =
+            cuttlefish_host::ledger::Ledger::open(&job_dir.join("ledger.sqlite"), &h.fingerprint)
+                .unwrap();
+        ledger
+            .write_completed(
+                "n1",
+                &serde_json::json!({ "summary": "PRE-CACHED-STALE", "marker": "stale" }),
+            )
+            .unwrap();
+        // `n2` is deliberately left without a checkpoint, and the ledger is
+        // never `finish`ed — exactly the mid-flight state the startup scan
+        // exists to detect.
+    }
+    h.jobs.mark_interrupted(id.clone()).await;
+
+    let resp = h
+        .client
+        .post(format!("http://localhost/jobs/{id}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    let body = h.await_terminal(&id).await;
+    assert_eq!(body["status"], "completed");
+    // The job's result is the last node's output in topological order —
+    // `n2` here — so this can only be true if `n2` actually ran through the
+    // wasm block rather than being synthesized or skipped.
+    assert_eq!(
+        body["envelope"]["result"]["summary"], "a stub summary",
+        "n2 must have genuinely executed, not been replayed from a stale cache: {body}"
+    );
+    assert_ne!(
+        body["envelope"]["result"]["summary"], "PRE-CACHED-STALE",
+        "the final result must not be n1's stale cached value"
+    );
+}
+
+#[tokio::test]
+async fn resuming_a_job_whose_ledger_fingerprint_does_not_match_is_refused() {
+    let h = start().await;
+    let id = unique_job_id("bad-fingerprint");
+    let job_dir = h.jobs_root.join(&id);
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(
+        job_dir.join("input.json"),
+        serde_json::json!({ "path": h.doc.to_str().unwrap() }).to_string(),
+    )
+    .unwrap();
+
+    // A ledger whose recorded fingerprint deliberately does not match what
+    // `dag::graph_fingerprint(&st.checked_nodes)` computes for the spec
+    // this harness actually serves — standing in for a job that was
+    // started against a different version of the spec than the daemon is
+    // now running.
+    {
+        let ledger = cuttlefish_host::ledger::Ledger::open(
+            &job_dir.join("ledger.sqlite"),
+            "not-a-real-fingerprint",
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.job_status().unwrap(),
+            cuttlefish_host::ledger::LedgerJobStatus::Running
+        );
+    }
+    h.jobs.mark_interrupted(id.clone()).await;
+
+    let resp = h
+        .client
+        .post(format!("http://localhost/jobs/{id}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let msg = body["error"]
+        .as_str()
+        .expect("a rejection must explain itself")
+        .to_lowercase();
+    assert!(
+        msg.contains("fingerprint"),
+        "rejection must name the graph fingerprint mismatch: {msg}"
+    );
+
+    // No node must have run: the ledger still has no checkpoint at all.
+    let ledger = cuttlefish_host::ledger::Ledger::open(
+        &job_dir.join("ledger.sqlite"),
+        "not-a-real-fingerprint",
+    )
+    .unwrap();
+    assert!(
+        ledger.get_completed("block").unwrap().is_none(),
+        "a fingerprint-mismatched job must not have run any node"
+    );
 }

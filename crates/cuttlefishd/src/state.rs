@@ -137,6 +137,26 @@ impl JobStore {
         self.insert(Job::interrupted(id)).await;
     }
 
+    /// Snapshot every known job, in the same `{job_id, status, envelope}`
+    /// shape `get_job` returns for one — this is what makes an `Interrupted`
+    /// job (surfaced only via the startup scan, never streamed) actually
+    /// discoverable: an agent lists jobs, sees one sitting at `Interrupted`,
+    /// and only then decides whether to call resume.
+    pub async fn list(&self) -> Vec<serde_json::Value> {
+        self.jobs
+            .lock()
+            .await
+            .values()
+            .map(|job| {
+                serde_json::json!({
+                    "job_id": job.id,
+                    "status": job.status,
+                    "envelope": job.envelope,
+                })
+            })
+            .collect()
+    }
+
     /// Request cancellation. Returns whether the job existed.
     ///
     /// Best-effort by nature: a job that has already finished is reported as
