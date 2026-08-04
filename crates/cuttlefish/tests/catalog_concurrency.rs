@@ -10,14 +10,10 @@
 //! process boundaries — a lock taken too late, a lock scoped to the wrong
 //! file, a read-modify-write that escapes it — cannot pass unnoticed.
 //!
-//! Unix-only, because the binary under test is. `cuttlefish`'s whole `cli`
-//! module is `#[cfg(unix)]` — it speaks to the daemon over a unix domain
-//! socket — so on Windows it exits 1 with "does not run on this platform yet"
-//! before it ever parses an argument, and there is no CLI there to race.
-//! The catalog's locking itself is platform-independent and stays covered on
-//! Windows by the `with_locked_index` tests in `cuttlefish-host`, which are
-//! plain library calls.
-#![cfg(unix)]
+//! These run on every platform. They were briefly `#![cfg(unix)]`, because the
+//! whole CLI used to be — `catalog` was unreachable off unix only because it
+//! shared one `cfg` block with the socket commands. That split is fixed, so
+//! the tests that drive the real binary now guard the catalog everywhere.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

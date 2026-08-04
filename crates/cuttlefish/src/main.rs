@@ -15,25 +15,26 @@
 //! cancelled. A shell script or an agent can branch on that without parsing
 //! stdout, which stays pure JSON for the same reason.
 //!
-//! Unix-only for now, for the same reason as the daemon: it speaks to a unix
-//! domain socket, and `reqwest`'s `unix_socket` is `cfg(unix)`. Everything
-//! unix-specific lives in one gated module rather than being scattered through
-//! per-item `cfg` attributes, so a Windows build has no unused imports or dead
-//! types to warn about.
+//! `cli` holds the argument parsing and the commands that touch nothing but
+//! the filesystem (`catalog`, `build`); `daemon` holds the ones that talk to
+//! the daemon (`run`, `specs`). The split is by dependency, and it is no
+//! longer a platform boundary: both halves compile everywhere now that the
+//! transport has a named-pipe implementation on Windows.
+//!
+//! Argument parsing is deliberately not split: one `clap` derive covers every
+//! subcommand on every platform.
 
-#[cfg(unix)]
 mod cli {
     use anyhow::{bail, Context};
     use clap::{Parser, Subcommand};
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
 
-    /// How long to wait between status polls.
-    ///
-    /// Short enough to feel immediate, long enough not to spin. The daemon also
-    /// offers a streaming endpoint; this polls because a result is retained, so
-    /// watching the stream is not required in order to observe one.
-    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    /// The daemon's default endpoint, in the client's own words. Deliberately
+    /// delegates to the daemon crate rather than restating the path, so the
+    /// two can never drift apart.
+    fn cuttlefishd_endpoint() -> PathBuf {
+        cuttlefish_core::endpoint::default_endpoint()
+    }
 
     #[derive(Parser)]
     #[command(
@@ -50,9 +51,13 @@ mod cli {
     enum Cmd {
         /// Submit a job and wait for its result.
         Run {
-            /// Path to the daemon's unix socket.
-            #[arg(long, default_value = "/tmp/cuttlefish.sock")]
-            socket: PathBuf,
+            /// Where the daemon listens: a unix socket path, or a named
+            /// pipe on Windows. Defaults per platform.
+            ///
+            /// `--socket` is kept as an alias so existing scripts and docs
+            /// keep working; the name is simply wrong on Windows.
+            #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
+            endpoint: PathBuf,
             /// Which spec to run.
             #[arg(long)]
             spec: String,
@@ -62,9 +67,13 @@ mod cli {
         },
         /// List what the daemon can run.
         Specs {
-            /// Path to the daemon's unix socket.
-            #[arg(long, default_value = "/tmp/cuttlefish.sock")]
-            socket: PathBuf,
+            /// Where the daemon listens: a unix socket path, or a named
+            /// pipe on Windows. Defaults per platform.
+            ///
+            /// `--socket` is kept as an alias so existing scripts and docs
+            /// keep working; the name is simply wrong on Windows.
+            #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
+            endpoint: PathBuf,
         },
         /// Manage the local block catalog (~/.cuttlefish/catalog by default).
         /// Purely local filesystem operations — no running daemon required.
@@ -111,12 +120,12 @@ mod cli {
     /// Parse arguments and carry out the requested command.
     pub async fn main() -> anyhow::Result<()> {
         match Cli::parse().command {
-            Cmd::Specs { socket } => specs(&socket).await,
+            Cmd::Specs { endpoint } => crate::daemon::specs(&endpoint).await,
             Cmd::Run {
-                socket,
+                endpoint,
                 spec,
                 input,
-            } => run(&socket, &spec, &input).await,
+            } => crate::daemon::run(&endpoint, &spec, &input).await,
             Cmd::Catalog { action } => catalog_cmd(action),
             Cmd::Build { spec, output } => build_cmd(&spec, output),
         }
@@ -262,20 +271,41 @@ mod cli {
         );
         Ok(())
     }
+}
 
-    /// Build a client bound to a unix socket.
+/// Talking to the daemon over whichever machine-local transport this platform
+/// has: a unix socket, or a named pipe on Windows.
+mod daemon {
+    use anyhow::{bail, Context};
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// How long to wait between status polls.
     ///
-    /// `as_path()`, not `&socket`: reqwest's sealed `UnixSocketProvider` covers
-    /// `&Path` and `PathBuf` but not `&PathBuf`, and no deref coercion happens
-    /// at an `impl Trait` parameter.
-    fn client(socket: &Path) -> anyhow::Result<reqwest::Client> {
-        reqwest::Client::builder()
-            .unix_socket(socket)
-            .build()
-            .context("building the unix-socket client")
+    /// Short enough to feel immediate, long enough not to spin. The daemon also
+    /// offers a streaming endpoint; this polls because a result is retained, so
+    /// watching the stream is not required in order to observe one.
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    /// Build a client bound to the daemon's endpoint.
+    ///
+    /// reqwest gives both transports the same shape — `unix_socket` on unix,
+    /// `windows_named_pipe` on Windows — so this is a `cfg` over one builder
+    /// call rather than a second client implementation.
+    ///
+    /// Pass `endpoint` itself, not `&endpoint`: reqwest's sealed provider
+    /// traits cover `&Path` and `PathBuf` but not `&PathBuf`, and no deref
+    /// coercion happens at an `impl Trait` parameter.
+    fn client(endpoint: &Path) -> anyhow::Result<reqwest::Client> {
+        let builder = reqwest::Client::builder();
+        #[cfg(unix)]
+        let builder = builder.unix_socket(endpoint);
+        #[cfg(windows)]
+        let builder = builder.windows_named_pipe(endpoint);
+        builder.build().context("building the daemon client")
     }
 
-    async fn specs(socket: &Path) -> anyhow::Result<()> {
+    pub async fn specs(socket: &Path) -> anyhow::Result<()> {
         // The authority in these URLs is ignored — the socket decides where the
         // request goes — but reqwest still requires a syntactically valid URL.
         let body: serde_json::Value = client(socket)?
@@ -290,7 +320,7 @@ mod cli {
         Ok(())
     }
 
-    async fn run(socket: &Path, spec: &str, input: &str) -> anyhow::Result<()> {
+    pub async fn run(socket: &Path, spec: &str, input: &str) -> anyhow::Result<()> {
         let input: serde_json::Value =
             serde_json::from_str(input).context("--input must be JSON")?;
         let client = client(socket)?;
@@ -341,18 +371,7 @@ mod cli {
     }
 }
 
-#[cfg(unix)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     cli::main().await
-}
-
-#[cfg(not(unix))]
-fn main() {
-    eprintln!(
-        "cuttlefish talks to the daemon over a unix domain socket and does not \
-         run on this platform yet. The library crates are cross-platform; only \
-         the transport is unix-only."
-    );
-    std::process::exit(1);
 }

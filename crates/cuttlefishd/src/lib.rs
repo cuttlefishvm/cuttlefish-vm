@@ -77,11 +77,6 @@
 pub mod api;
 pub mod state;
 
-// Unix domain sockets only exist on unix, and tokio exposes no `UnixListener`
-// elsewhere. The rest of this crate — job store, router, handlers — is portable
-// and still compiles and tests on Windows; only the transport is gated, so a
-// Windows build fails loudly at `serve` rather than silently lacking it.
-#[cfg(unix)]
 pub mod serve;
 
 /// Scan every job directory under `jobs_root` for a ledger whose
