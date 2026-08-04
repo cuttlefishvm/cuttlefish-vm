@@ -1,4 +1,10 @@
 use cuttlefish_host::ledger::Ledger;
+use std::sync::Mutex;
+
+// Env vars are process-global; serialize the two tests that touch
+// CUTTLEFISH_JOBS_HOME/CUTTLEFISH_HOME so they can't interleave and read
+// each other's value.
+static ENV_GUARD: Mutex<()> = Mutex::new(());
 
 #[test]
 fn a_fresh_ledger_has_no_checkpoints() {
@@ -98,4 +104,23 @@ fn reopening_with_a_different_fingerprint_keeps_the_original() {
     Ledger::open(&path, "original").unwrap();
     let reopened = Ledger::open(&path, "different").unwrap();
     assert_eq!(reopened.graph_fingerprint().unwrap(), "original");
+}
+
+#[test]
+fn jobs_root_honors_cuttlefish_jobs_home_when_set() {
+    let _guard = ENV_GUARD.lock().unwrap();
+    std::env::set_var("CUTTLEFISH_JOBS_HOME", "/tmp/cf-jobs-test");
+    let root = cuttlefish_host::ledger::jobs_root();
+    std::env::remove_var("CUTTLEFISH_JOBS_HOME");
+    assert_eq!(root, Some(std::path::PathBuf::from("/tmp/cf-jobs-test")));
+}
+
+#[test]
+fn jobs_root_falls_back_to_cuttlefish_home_jobs_when_unset() {
+    let _guard = ENV_GUARD.lock().unwrap();
+    std::env::remove_var("CUTTLEFISH_JOBS_HOME");
+    std::env::set_var("CUTTLEFISH_HOME", "/tmp/cf-home-test");
+    let root = cuttlefish_host::ledger::jobs_root();
+    std::env::remove_var("CUTTLEFISH_HOME");
+    assert_eq!(root, Some(std::path::PathBuf::from("/tmp/cf-home-test/jobs")));
 }

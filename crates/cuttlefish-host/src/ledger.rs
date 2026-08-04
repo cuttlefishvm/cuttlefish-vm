@@ -186,10 +186,18 @@ impl Ledger {
     }
 }
 
-/// The root directory jobs live under — `$CUTTLEFISH_HOME/jobs` or
-/// `~/.cuttlefish/jobs`, mirroring `catalog::default_root`'s own
-/// `.../catalog` convention.
+/// The root directory jobs live under. Checks `$CUTTLEFISH_JOBS_HOME` first
+/// — set by `cuttlefish-run`'s project-scoping so a project's jobs/ledger
+/// state lives under `<project>/.cuttlefish/jobs` without also redirecting
+/// the (deliberately still-global) block catalog, which `$CUTTLEFISH_HOME`
+/// alone continues to control. Falls back to `$CUTTLEFISH_HOME/jobs` (or
+/// `~/.cuttlefish/jobs`) exactly as before when unset, so nothing about
+/// existing single-global-home behavior changes for a caller that never
+/// sets the new variable.
 pub fn jobs_root() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CUTTLEFISH_JOBS_HOME") {
+        return Some(std::path::PathBuf::from(dir));
+    }
     crate::catalog::cuttlefish_home().map(|h| h.join("jobs"))
 }
 
