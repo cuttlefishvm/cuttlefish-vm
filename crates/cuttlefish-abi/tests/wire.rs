@@ -184,6 +184,11 @@ fn job_status_serializes_as_snake_case() {
 }
 
 #[test]
+fn interrupted_is_not_terminal() {
+    assert!(!JobStatus::Interrupted.is_terminal());
+}
+
+#[test]
 fn an_older_block_still_deserializes_the_new_fields() {
     // Blocks are compiled separately and ship independently, so a block built
     // before images and media kinds existed must keep working. Both fields

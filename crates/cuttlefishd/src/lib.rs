@@ -83,3 +83,38 @@ pub mod state;
 // Windows build fails loudly at `serve` rather than silently lacking it.
 #[cfg(unix)]
 pub mod serve;
+
+/// Scan every job directory under `jobs_root` for a ledger whose
+/// `job_status` is still `Running` — i.e. a job that was mid-flight when the
+/// daemon last stopped — and record it in `jobs` as [`cuttlefish_abi::JobStatus::Interrupted`].
+///
+/// Called once at startup, and directly by tests that build a `JobStore`
+/// without going through `main()`. Nothing here resumes a job automatically:
+/// see the "Resume is a signal, not an automatic action" section of the
+/// design doc. `current_fingerprint` is passed through to `Ledger::open`,
+/// but is only meaningful for a ledger that doesn't exist yet — every ledger
+/// this loop opens already exists (its presence is what selected the
+/// directory), so the value recorded at that ledger's original creation is
+/// what's read back, untouched.
+pub async fn scan_for_interrupted_jobs(
+    jobs_root: &std::path::Path,
+    current_fingerprint: &str,
+    jobs: &state::JobStore,
+) -> anyhow::Result<()> {
+    if !jobs_root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(jobs_root)? {
+        let entry = entry?;
+        let ledger_path = entry.path().join("ledger.sqlite");
+        if !ledger_path.exists() {
+            continue;
+        }
+        let ledger = cuttlefish_host::ledger::Ledger::open(&ledger_path, current_fingerprint)?;
+        if ledger.job_status()? == cuttlefish_host::ledger::LedgerJobStatus::Running {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            jobs.mark_interrupted(id).await;
+        }
+    }
+    Ok(())
+}

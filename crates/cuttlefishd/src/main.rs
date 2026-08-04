@@ -111,10 +111,19 @@ async fn main() -> anyhow::Result<()> {
         checked.nodes.len()
     );
 
+    // Detect jobs that were still running when this daemon last stopped,
+    // before `checked.nodes` gets moved into `AppState` below — the
+    // fingerprint is computed from a reference to it.
+    let jobs = state::JobStore::default();
+    let jobs_root = cuttlefish_host::ledger::jobs_root()
+        .context("could not determine home directory; set CUTTLEFISH_HOME")?;
+    let current_fingerprint = cuttlefish_host::dag::graph_fingerprint(&checked.nodes);
+    cuttlefishd::scan_for_interrupted_jobs(&jobs_root, &current_fingerprint, &jobs).await?;
+
     let state = api::AppState {
         engine,
         backend,
-        jobs: state::JobStore::default(),
+        jobs,
         spec: Arc::new(spec),
         checked_nodes: Arc::new({
             let mut nodes = checked.nodes;

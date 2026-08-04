@@ -61,6 +61,26 @@ impl Job {
             log: Vec::new(),
         }
     }
+
+    /// Reconstruct a job discovered mid-flight in its ledger at daemon
+    /// startup — not actually running (there is no task backing it), just
+    /// recorded as having been running when the process last died.
+    ///
+    /// The `CancellationToken` is fresh and never cancelled: nothing is
+    /// executing for this job in this process, so there is nothing for it to
+    /// cancel. `envelope` stays `None` — there is nothing to show yet; a
+    /// resume endpoint is what eventually gives this job a real envelope.
+    pub fn interrupted(id: String) -> Self {
+        let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            id,
+            status: JobStatus::Interrupted,
+            envelope: None,
+            cancel: CancellationToken::new(),
+            events,
+            log: Vec::new(),
+        }
+    }
 }
 
 /// Every job this daemon knows about.
@@ -109,6 +129,12 @@ impl JobStore {
             job.status = envelope.status;
             job.envelope = Some(envelope);
         }
+    }
+
+    /// Record a job discovered mid-flight in its ledger at daemon startup;
+    /// see [`Job::interrupted`].
+    pub async fn mark_interrupted(&self, id: String) {
+        self.insert(Job::interrupted(id)).await;
     }
 
     /// Request cancellation. Returns whether the job existed.
