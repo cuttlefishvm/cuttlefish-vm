@@ -64,6 +64,12 @@ impl Ledger {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(path)?;
+        // A future reader (daemon startup scan, resume endpoint) may open
+        // its own connection to this same file while a running job's
+        // connection is mid-write. Without this, SQLite's default
+        // busy_timeout of 0 means that second connection gets an immediate
+        // SQLITE_BUSY instead of waiting briefly for the lock to clear.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS checkpoints (
                 node_name    TEXT PRIMARY KEY,

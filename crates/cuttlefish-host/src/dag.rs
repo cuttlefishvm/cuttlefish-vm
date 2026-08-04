@@ -211,12 +211,23 @@ pub fn graph_fingerprint(nodes: &[CheckedNode]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for node in nodes {
-        hasher.update(node.name.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(node.signature.to_string().as_bytes());
-        hasher.update(b"\0");
+        hash_length_prefixed(&mut hasher, node.name.as_bytes());
+        hash_length_prefixed(&mut hasher, node.signature.to_string().as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Feed `bytes` into `hasher` prefixed with its own length (as a fixed
+/// 8-byte big-endian `u64`), rather than delimiting with a fixed byte —
+/// delimiter-joining is only injective if the delimiter can never appear
+/// inside the content itself, which isn't guaranteed here (a wasm block's
+/// declared signature can contain arbitrary field-name text, including, in
+/// principle, an embedded NUL byte decoded from its `cf_signature` export's
+/// JSON). Length-prefixing has no such assumption.
+fn hash_length_prefixed(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest;
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
 }
 
 /// Kahn's algorithm, with the repeat_until exception: an edge from `node`

@@ -622,3 +622,127 @@ fn graph_fingerprint_is_stable_for_the_same_graph() {
         "fingerprinting the same graph twice must produce the same string"
     );
 }
+
+/// Regression test for the old `\0`-delimiter collision in
+/// `graph_fingerprint`: two structurally different node sequences that
+/// concatenate to the *exact same byte string* under the old
+/// `name + "\0" + signature.to_string() + "\0"` join, because
+/// `Ty::Record::describe()` renders field names verbatim with no escaping —
+/// so a crafted field name (as could arrive from a wasm block's decoded
+/// `cf_signature` JSON) can itself contain a `\0` byte and fake a node
+/// boundary.
+///
+/// Sequence A is one node whose output record has a single field named
+/// `fieldname`, crafted so its rendered signature text equals
+/// `sig1 + "\0" + "b" + "\0" + sig2`. Sequence B is the two nodes `a`/`sig1`
+/// and `b`/`sig2` that string is built from. Under the old delimiter-join
+/// scheme these hash identically despite being different graphs; the fixed,
+/// length-prefixed `graph_fingerprint` must tell them apart.
+#[test]
+fn graph_fingerprint_closes_the_old_delimiter_collision() {
+    use cuttlefish_abi::{Signature, Ty};
+
+    fn record_sig(field: &str) -> Signature {
+        let mut fields = BTreeMap::new();
+        fields.insert(field.to_string(), Ty::Text);
+        Signature {
+            input: Ty::Text,
+            output: Ty::Record(fields),
+        }
+    }
+
+    let sig1 = record_sig("g");
+    let sig2 = record_sig("h");
+    assert_eq!(sig1.to_string(), "text -> {g: text}");
+    assert_eq!(sig2.to_string(), "text -> {h: text}");
+
+    // Crafted so that wrapping it as `{fieldname: text}` (a record's own
+    // "{" ... ": text}" framing) reproduces `sig1 + "\0" + "b" + "\0" +
+    // sig2` byte-for-byte. Derivation: strip the record wrapper from sig1
+    // and sig2 and splice the two around the node-2 name "b".
+    let fieldname = "g: text}\0b\0text -> {h".to_string();
+    let sig_a = record_sig(&fieldname);
+
+    // Sanity-check the hand-derived algebra before trusting the rest of the
+    // test: sig_a's rendered text really does equal the naive two-node join.
+    let naive_two_node_join = format!("{sig1}\0b\0{sig2}");
+    assert_eq!(
+        sig_a.to_string(),
+        naive_two_node_join,
+        "the crafted field name must reproduce the two-node byte stream exactly"
+    );
+
+    let sequence_a = vec![checked_node("a", sig_a)];
+    let sequence_b = vec![checked_node("a", sig1), checked_node("b", sig2)];
+
+    // Reproduce the *old*, pre-fix `\0`-join scheme here (not called from
+    // production code) purely to prove these two sequences really would
+    // have collided under it.
+    fn old_broken_fingerprint(nodes: &[CheckedNode]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for node in nodes {
+            hasher.update(node.name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(node.signature.to_string().as_bytes());
+            hasher.update(b"\0");
+        }
+        format!("{:x}", hasher.finalize())
+    }
+    assert_eq!(
+        old_broken_fingerprint(&sequence_a),
+        old_broken_fingerprint(&sequence_b),
+        "sanity check: these two sequences must collide under the old delimiter-join scheme"
+    );
+
+    // The actual fix under test: the real, length-prefixed
+    // `graph_fingerprint` must NOT collide on these two structurally
+    // different sequences.
+    assert_ne!(
+        graph_fingerprint(&sequence_a),
+        graph_fingerprint(&sequence_b),
+        "length-prefixed hashing must distinguish sequences that collided under the old \\0-join"
+    );
+}
+
+/// A more direct, types-free proof of `hash_length_prefixed`'s injectivity
+/// property: feeding it `["ab", "c"]` and `["a", "bc"]` must not produce the
+/// same digest, even though a plain `\0`-delimiter join of those two pairs
+/// with content-embedded delimiter bytes could in principle collide. This
+/// exercises the primitive itself, independent of `CheckedNode`/`Signature`
+/// plumbing.
+#[test]
+fn hash_length_prefixed_is_injective_across_a_boundary_shift() {
+    use sha2::{Digest, Sha256};
+
+    fn hash_pair(a: &[u8], b: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        // Mirrors dag.rs's private `hash_length_prefixed` exactly, since
+        // that function isn't exported — this is the same primitive,
+        // exercised directly on raw bytes rather than through
+        // `CheckedNode`.
+        for part in [a, b] {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    // Under a naive `\0`-join, "a\0b" + "\0" + "c\0" and "a\0" + "b\0c" +
+    // "\0" style boundary shifts are exactly the injectivity failure mode.
+    // Length-prefixing must keep these distinct.
+    assert_ne!(
+        hash_pair(b"ab", b"c"),
+        hash_pair(b"a", b"bc"),
+        "shifting content across a segment boundary must change the hash"
+    );
+
+    // A segment that itself contains a literal NUL byte (standing in for a
+    // block-declared signature field name with an embedded NUL) must not be
+    // confusable with a delimiter-joined split at that NUL.
+    assert_ne!(
+        hash_pair(b"a\0b", b"c"),
+        hash_pair(b"a", b"b\0c"),
+        "an embedded NUL inside a segment must not be interpretable as a segment boundary"
+    );
+}
