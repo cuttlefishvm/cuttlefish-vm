@@ -618,6 +618,23 @@ async fn resuming_an_interrupted_job_completes_remaining_nodes() {
         body["envelope"]["result"]["summary"], "PRE-CACHED-STALE",
         "the final result must not be n1's stale cached value"
     );
+
+    // The above only proves `n2` genuinely ran — `n2` was always going to be
+    // the job's result regardless of whether `n1`'s skip-on-resume logic
+    // actually worked, since it's the last non-skipped node in topological
+    // order either way. Prove `n1` specifically was skipped, not silently
+    // re-run, by reopening the ledger and checking its checkpoint is still
+    // the exact stale value written before resume — a real re-execution
+    // would have overwritten it with the stub backend's real output.
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&job_dir.join("ledger.sqlite"), &h.fingerprint)
+            .unwrap();
+    assert_eq!(
+        ledger.get_completed("n1").unwrap(),
+        Some(serde_json::json!({ "summary": "PRE-CACHED-STALE", "marker": "stale" })),
+        "n1's checkpoint must still be the pre-seeded stale value — proving it was skipped on \
+         resume rather than silently re-executed and re-checkpointed"
+    );
 }
 
 #[tokio::test]

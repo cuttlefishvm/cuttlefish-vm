@@ -172,14 +172,38 @@ impl JobStore {
     /// "intent already satisfied" doesn't apply. Instead it's transitioned
     /// directly to `Cancelled` here. That conveniently also closes the loop
     /// for resume: a resume check against `status == Interrupted` correctly
-    /// refuses a job cancelled this way, with no extra plumbing needed. The
-    /// on-disk ledger still says `Running` — not updated here; a future task
-    /// can decide whether that needs reconciling.
+    /// refuses a job cancelled this way, with no extra plumbing needed.
+    ///
+    /// The on-disk ledger is also updated to match: without this, its
+    /// `job_status` table would still say `'running'`, and a subsequent
+    /// daemon restart's startup scan would re-read that, silently re-mark
+    /// the job `Interrupted`, and discard this cancel decision entirely —
+    /// the ledger is the authoritative durability record, so it must not be
+    /// allowed to diverge from the in-memory view like that.
     pub async fn cancel(&self, id: &str) -> bool {
         let mut jobs = self.jobs.lock().await;
         match jobs.get_mut(id) {
             Some(job) if job.status == JobStatus::Interrupted => {
                 job.status = JobStatus::Cancelled;
+                // Persist to the ledger too — otherwise a restart before
+                // this job's final disposition is otherwise resolved would
+                // silently re-mark it Interrupted, discarding this cancel
+                // decision. Best effort: if the ledger write fails, the
+                // in-memory transition above still holds for this process's
+                // lifetime; only a subsequent restart would be affected,
+                // which is a narrower, more acceptable failure window than
+                // not trying at all.
+                if let Some(jobs_root) = cuttlefish_host::ledger::jobs_root() {
+                    let ledger_path = jobs_root.join(id).join("ledger.sqlite");
+                    // Any existing fingerprint is preserved by
+                    // `Ledger::open` (only inserted on first creation) — the
+                    // value passed here is irrelevant for an
+                    // already-existing ledger, which this always is by the
+                    // time a job can be cancelled.
+                    if let Ok(ledger) = cuttlefish_host::ledger::Ledger::open(&ledger_path, "") {
+                        let _ = ledger.finish("cancelled");
+                    }
+                }
                 true
             }
             Some(job) => {

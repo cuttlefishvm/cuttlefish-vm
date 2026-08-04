@@ -147,3 +147,79 @@ async fn cancelling_an_interrupted_job_transitions_it_to_cancelled() {
          stuck at Interrupted while reporting success"
     );
 }
+
+/// `JobStore::cancel` resolves a job's on-disk directory through
+/// `cuttlefish_host::ledger::jobs_root()`, which falls back to the real
+/// `~/.cuttlefish/jobs` when `$CUTTLEFISH_HOME` is unset — exactly the
+/// production behavior, but not something a test suite should ever actually
+/// exercise against a developer's real home directory. Point it at one
+/// shared tempdir for the whole test binary instead, the same pattern
+/// `tests/api.rs`'s `ensure_test_cuttlefish_home` uses.
+///
+/// A `OnceLock` plus its own internal `Once`-style init (via `get_or_init`,
+/// which itself synchronizes concurrent callers) means every concurrently
+/// running `#[tokio::test]` in this file computes and sets the exact same
+/// value at most once, rather than racing distinct `std::env::set_var`
+/// calls against each other. No other test in this file reads or depends on
+/// `CUTTLEFISH_HOME`, so this is safe to set unconditionally.
+///
+/// Returns `jobs_root()` itself (i.e. `$CUTTLEFISH_HOME/jobs`), not
+/// `$CUTTLEFISH_HOME` — matching what `JobStore::cancel` actually resolves
+/// job directories under.
+fn ensure_test_cuttlefish_home() -> std::path::PathBuf {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CUTTLEFISH_HOME", dir.path());
+        dir
+    });
+    cuttlefish_host::ledger::jobs_root().expect("CUTTLEFISH_HOME set above")
+}
+
+#[tokio::test]
+async fn cancelling_an_interrupted_job_persists_to_its_ledger() {
+    // The bug this guards against: `cancel`'s special case for an
+    // `Interrupted` job used to transition `job.status` to `Cancelled`
+    // in-memory only, leaving the ledger's `job_status` table still saying
+    // `'running'`. A daemon restart before anything else resolved the job
+    // would have the startup scan re-read that stale `'running'` row and
+    // silently re-mark the job `Interrupted`, discarding the cancel
+    // decision with no error and no signal. Proving the in-memory status
+    // looks right (as the sibling test above does) isn't enough — this
+    // reopens the ledger directly afterward, the same way the startup scan
+    // would on a real restart, and checks what it actually persisted.
+    let jobs_root = ensure_test_cuttlefish_home();
+    let job_id = "interrupted-job-to-cancel";
+    let ledger_path = jobs_root.join(job_id).join("ledger.sqlite");
+
+    // A ledger left `running` — exactly the on-disk state an interrupted
+    // job has: created, never `finish`ed.
+    {
+        let ledger = Ledger::open(&ledger_path, "some-fingerprint").unwrap();
+        assert_eq!(
+            ledger.job_status().unwrap(),
+            cuttlefish_host::ledger::LedgerJobStatus::Running,
+            "sanity check: a freshly opened ledger must start out running"
+        );
+    }
+
+    let jobs = JobStore::default();
+    jobs.mark_interrupted(job_id.to_string()).await;
+
+    let existed = jobs.cancel(job_id).await;
+    assert!(existed, "cancel must report that the job exists");
+
+    let after = jobs.get(job_id).await.unwrap();
+    assert_eq!(after.status, JobStatus::Cancelled);
+
+    // Reopen the ledger fresh, as a restarted daemon's startup scan would,
+    // and confirm the on-disk record now matches the in-memory one.
+    let reopened = Ledger::open(&ledger_path, "some-fingerprint").unwrap();
+    assert_eq!(
+        reopened.job_status().unwrap(),
+        cuttlefish_host::ledger::LedgerJobStatus::Cancelled,
+        "cancelling an interrupted job must persist to its ledger — otherwise a restart before \
+         this job's disposition is otherwise resolved would see 'running' and silently re-mark \
+         it Interrupted, discarding the cancel decision"
+    );
+}
