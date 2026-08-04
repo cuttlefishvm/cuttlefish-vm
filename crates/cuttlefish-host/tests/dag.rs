@@ -382,3 +382,99 @@ fn a_node_combining_one_branch_output_with_one_unconditional_output_is_fine() {
         "joined must be recorded as exclusive to the pdf label, transitively via handle_pdf"
     );
 }
+
+#[test]
+fn two_different_decisions_labeling_the_same_node_is_not_a_conflict() {
+    // A node fed by one label from decision "classify" and one label from
+    // an unrelated decision "urgency" — genuinely fine, since they're
+    // independent decisions, not two mutually-exclusive outcomes of the
+    // same one. This is exactly the case compute_branch_exclusivity's
+    // `same_decision` guard exists to permit: without that guard (i.e. if
+    // any two differing labels were treated as a conflict regardless of
+    // which decision they belong to), this would incorrectly fail with
+    // ConflictingBranchFanIn.
+    let dir = tempfile::tempdir().unwrap();
+    let mut resolved = HashMap::new();
+    resolved.insert(
+        "classify".to_string(),
+        resolved_for(dir.path(), "classify_c", "{}", "{route: text}"),
+    );
+    resolved.insert(
+        "urgency".to_string(),
+        resolved_for(dir.path(), "urgency_c", "{}", "{level: text}"),
+    );
+    resolved.insert(
+        "handle_pdf".to_string(),
+        resolved_for(
+            dir.path(),
+            "handle_pdf_c",
+            "{route: text}",
+            "{result: text}",
+        ),
+    );
+    resolved.insert(
+        "handle_high".to_string(),
+        resolved_for(
+            dir.path(),
+            "handle_high_c",
+            "{level: text}",
+            "{result: text}",
+        ),
+    );
+    resolved.insert(
+        "joined".to_string(),
+        resolved_for(
+            dir.path(),
+            "joined_c",
+            "{a: {result: text}, b: {result: text}}",
+            "text",
+        ),
+    );
+
+    let graph = NodeGraph {
+        nodes: vec![
+            ("classify".to_string(), node(None)),
+            ("urgency".to_string(), node(None)),
+            ("handle_pdf".to_string(), node(Some(from("classify")))),
+            ("handle_high".to_string(), node(Some(from("urgency")))),
+            (
+                "joined".to_string(),
+                node(Some(record(&[
+                    ("a", from("handle_pdf")),
+                    ("b", from("handle_high")),
+                ]))),
+            ),
+        ],
+    };
+    // Two independent decisions, each with two labels, so each genuinely has
+    // more than one mutually-exclusive outcome — only one target per
+    // decision actually appears as a graph node; the other exists solely so
+    // "same decision" has real meaning to check against.
+    let branches = Branches {
+        decisions: vec![
+            (
+                "classify".to_string(),
+                vec![
+                    ("pdf".to_string(), "handle_pdf".to_string()),
+                    ("scan".to_string(), "handle_scan".to_string()),
+                ],
+            ),
+            (
+                "urgency".to_string(),
+                vec![
+                    ("high".to_string(), "handle_high".to_string()),
+                    ("low".to_string(), "handle_low".to_string()),
+                ],
+            ),
+        ],
+    };
+
+    let checked = check_graph(&Engine::default(), &graph, &branches, &resolved).expect(
+        "a node fed by one label each from two different decisions must not be treated as a conflict",
+    );
+    assert_eq!(checked.nodes.len(), 5);
+    // The point of this test is that check_graph returns Ok — which of
+    // "pdf"/"high" ends up as joined's exclusive_to value is an unspecified
+    // tie-break of propagation order, not something this test should pin
+    // down.
+}
