@@ -321,17 +321,21 @@ async fn cancel_is_accepted_and_the_job_still_reaches_a_terminal_state() {
 
 #[tokio::test]
 async fn a_bare_catalog_name_resolves_through_the_same_path_main_rs_uses() {
-    // `main.rs` builds a `Catalog` at `catalog::default_root()`, then resolves
-    // every `spec.pipeline` entry with `pipeline::resolve_and_load(&catalog,
-    // spec_dir, entry, ResolutionContext::Interactive)` before handing the
-    // results to `pipeline::check`. `start()` above builds `AppState`
-    // directly and never exercises that resolution step, so it can't prove a
-    // bare catalog name (no `@version`, no path separators) actually works —
-    // this test calls the exact same two functions, in the exact same order,
-    // against a real `Catalog` on a real tempdir, confirmed by reading
-    // `main.rs`'s resolution block after this task's edit.
+    // `main.rs` builds a `Catalog` at `catalog::default_root()`, then for
+    // every `spec.nodes` entry calls `pipeline::resolve_and_load(&catalog,
+    // spec_dir, &node.block.to_string_lossy(), ResolutionContext::Interactive)`,
+    // collects the results into a `HashMap<String, ResolvedInput>` keyed by
+    // node name, and hands that to `dag::check_graph`. `start()` above builds
+    // `AppState` directly and never exercises that resolution step, so it
+    // can't prove a bare catalog name (no `@version`, no path separators)
+    // actually works — this test walks the exact same graph shape
+    // (`NodeGraph::single`, the one-node graph a bare `block = "...";` spec
+    // desugars to) through the exact same two functions, in the exact same
+    // order, against a real `Catalog` on a real tempdir.
+    use cuttlefish_core::graph::NodeGraph;
     use cuttlefish_host::catalog::{Catalog, ResolutionContext};
-    use cuttlefish_host::pipeline::{check, resolve_and_load};
+    use cuttlefish_host::dag::check_graph;
+    use cuttlefish_host::pipeline::resolve_and_load;
 
     let catalog_dir = tempfile::tempdir().unwrap();
     let spec_dir = tempfile::tempdir().unwrap();
@@ -345,18 +349,29 @@ async fn a_bare_catalog_name_resolves_through_the_same_path_main_rs_uses() {
         .add("echo-summarize@1", &wasm_path, &engine)
         .expect("cataloging the compiled example block should succeed");
 
-    let resolved = resolve_and_load(
-        &catalog,
-        spec_dir.path(),
-        "echo-summarize",
-        ResolutionContext::Interactive,
-    )
-    .expect("a bare name with no @version should resolve to the latest catalog entry");
-    assert_eq!(resolved.resolved.as_deref(), Some("echo-summarize@1"));
+    let graph = NodeGraph::single(std::path::PathBuf::from("echo-summarize"));
+    let resolved: std::collections::HashMap<_, _> = graph
+        .nodes
+        .iter()
+        .map(|(name, node)| {
+            let input = resolve_and_load(
+                &catalog,
+                spec_dir.path(),
+                &node.block.to_string_lossy(),
+                ResolutionContext::Interactive,
+            )
+            .expect("a bare name with no @version should resolve to the latest catalog entry");
+            (name.clone(), input)
+        })
+        .collect();
+    assert_eq!(
+        resolved["block"].resolved.as_deref(),
+        Some("echo-summarize@1")
+    );
 
-    let checked =
-        check(&engine, &[resolved]).expect("the resolved single-stage pipeline should typecheck");
-    assert_eq!(checked.stages().len(), 1);
+    let checked = check_graph(&engine, &graph, &Branches::default(), &resolved)
+        .expect("the resolved single-node graph should typecheck");
+    assert_eq!(checked.nodes.len(), 1);
 }
 
 #[tokio::test]
