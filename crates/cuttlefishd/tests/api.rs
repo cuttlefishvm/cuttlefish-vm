@@ -831,6 +831,142 @@ async fn shutdown_causes_serve_to_return() {
 }
 
 #[tokio::test]
+async fn shutdown_force_exits_even_with_an_open_sse_stream() {
+    // The gap the force-exit fallback closes: `job_events` keeps its stream
+    // open for as long as the store holds a live sender — which is forever,
+    // not just until the job finishes (see `streams_tokens_and_a_result_over_sse`'s
+    // comment). axum's graceful shutdown only closes a connection once its
+    // current response finishes, so a client sitting on that stream would
+    // otherwise block `/shutdown` indefinitely.
+    //
+    // Proving the process itself goes down needs an actual OS process —
+    // every other test in this file drives `serve::serve` in-process, which
+    // can prove a *future* resolves but can't prove a real `exit(0)` fires
+    // without also ending this test binary and every test running alongside
+    // it. So, uniquely among this file's tests, this spawns the genuine
+    // `cuttlefishd` binary.
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let sock = unique_endpoint(dir.path());
+
+    std::fs::write(dir.path().join("block.wasm"), example_block()).unwrap();
+    std::fs::write(dir.path().join("doc.txt"), "some document text").unwrap();
+    let spec_path = dir.path().join("spec.cf");
+    std::fs::write(
+        &spec_path,
+        r#"
+spec summarize_docs = {
+  description = "Use when a local file needs summarizing.";
+  model = Stub "";
+  data_policy = Local_only;
+  capabilities = [ Read "." ];
+  block = "block.wasm";
+}
+"#,
+    )
+    .unwrap();
+
+    // `CUTTLEFISH_SHUTDOWN_GRACE_MS` shrinks the force-exit fallback's wait
+    // to something a test can afford to sit through; production never sets
+    // it, so this changes nothing about the constant a real daemon uses.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cuttlefishd"))
+        .arg(&spec_path)
+        .arg(dir.path().join("block.wasm"))
+        .arg(&sock)
+        .env("CUTTLEFISH_HOME", home.path())
+        .env("CUTTLEFISH_SHUTDOWN_GRACE_MS", "200")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the cuttlefishd binary under test must be spawnable");
+
+    let builder = reqwest::Client::builder();
+    #[cfg(unix)]
+    let builder = builder.unix_socket(sock.as_path());
+    #[cfg(windows)]
+    let builder = builder.windows_named_pipe(sock.as_path());
+    let client = builder.build().unwrap();
+
+    let mut ready = false;
+    for _ in 0..500 {
+        if client.get("http://localhost/specs").send().await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if !ready {
+        let _ = child.kill();
+        panic!("daemon never accepted a request on {}", sock.display());
+    }
+
+    let id = client
+        .post("http://localhost/jobs")
+        .json(&serde_json::json!({
+            "spec": "summarize_docs",
+            "input": { "path": dir.path().join("doc.txt").to_str().unwrap() },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["job_id"]
+        .as_str()
+        .expect("submission must return a job_id")
+        .to_string();
+
+    // Open the event stream and hold onto the response without ever reading
+    // or dropping it — dropping it would close the connection from the
+    // client side and let axum's ordinary graceful path succeed on its own,
+    // which would prove nothing about the fallback. It stays alive (and the
+    // connection stays open) for the rest of this function.
+    let events = client
+        .get(format!("http://localhost/jobs/{id}/events"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(events.status(), 200);
+
+    let resp = client
+        .post("http://localhost/shutdown")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    // The real assertion: the daemon *process* actually exits — well within
+    // the 200ms grace period plus slack — despite the still-open SSE
+    // connection `events` is holding. Without the force-exit fallback this
+    // would hang until `events` is dropped, which for a real long-running
+    // job could be indefinite; this loop would instead spin for the whole
+    // deadline below and then fail, exactly the regression this test guards.
+    let mut exited = None;
+    for _ in 0..500 {
+        if let Some(status) = child.try_wait().expect("polling the child process") {
+            exited = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    match exited {
+        Some(status) => assert!(status.success(), "cuttlefishd exited non-zero: {status:?}"),
+        None => {
+            let _ = child.kill();
+            panic!(
+                "cuttlefishd did not exit within ~5s of POST /shutdown despite an open SSE \
+                 stream — the force-exit fallback did not fire"
+            );
+        }
+    }
+
+    // Keep the connection alive up to here, so the exit above is proven
+    // against a genuinely still-open stream rather than one this function
+    // already let close.
+    drop(events);
+}
+
+#[tokio::test]
 async fn concurrent_resume_calls_only_spawn_one_run() {
     // The bug this guards against: two `POST /jobs/{id}/resume` calls that
     // both read `status == Interrupted` via the plain, non-atomic pre-flight
