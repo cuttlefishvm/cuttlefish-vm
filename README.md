@@ -240,22 +240,26 @@ $ wine 'c:\cuttlefishd.exe' 'c:\specs\summarize.cuttlefish' "" '\\.\pipe\cuttlef
 $ wine 'c:\cuttlefish.exe' specs --endpoint '\\.\pipe\cuttlefish'
 ```
 
-That much genuinely works: the daemon binds the pipe, the client connects over
-it, and `catalog add/list/show` round-trips with byte-identical hashes to a
-native run.
+That works end to end: the daemon binds the pipe, the client connects over it,
+`catalog add/list/show` round-trips with byte-identical hashes to a native run,
+and `cuttlefish run` completes a real job — file read through the capability
+check, model called, result returned over the pipe.
 
 **Treat Wine as a smoke test, not a gate.** It reimplements the Win32 API on
 unix primitives, so a pass is evidence rather than proof, and a failure may be
 a Wine gap rather than a real bug. In particular it cannot validate the pipe's
 access control, which is the property the transport was chosen for — Wine does
 not meaningfully enforce Windows ACLs. Anything load-bearing still has to go
-through the Windows CI job.
+through the Windows CI job, which spawns a real daemon on a real named pipe and
+runs jobs against it (`crates/cuttlefishd/tests/api.rs`).
 
-One known open question, found exactly this way: running a job under Wine fails
-with `capability_denied` on a path that a native unix run accepts. That may be
-Wine's path semantics or a real bug in how capability roots are resolved on
-Windows; it has not been chased down yet, and a Windows CI test that submits a
-job would settle it.
+One trap worth knowing when driving a job by hand: a capability grant like
+`Read "./docs"` is resolved relative to the spec, but the `path` in a job's
+input is resolved against the **daemon's working directory**. Point them at
+different places and you get `capability_denied` on a file that visibly exists
+inside the granted directory. That is the capability check working, not a bug —
+`a_relative_path_is_resolved_against_the_working_directory_not_the_root` in
+`crates/cuttlefish-host/tests/caps.rs` pins the rule.
 
 [crossover]: https://www.codeweavers.com/crossover
 

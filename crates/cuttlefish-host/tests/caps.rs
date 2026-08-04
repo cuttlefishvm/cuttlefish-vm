@@ -137,3 +137,42 @@ fn any_one_of_several_granted_roots_suffices() {
     let caps = Capabilities::new(vec![a.path().to_path_buf(), b.path().to_path_buf()]);
     assert!(caps.allows_read(&file));
 }
+
+/// A relative path is resolved against the process working directory, not
+/// against the granted root.
+///
+/// This is the rule that is easy to assume backwards: granting `./docs` and
+/// then asking to read `docs/note.txt` only works if the *caller's* working
+/// directory is the one the grant was written relative to. Getting it wrong
+/// looks exactly like a capability bug — a denial on a file that plainly
+/// exists inside the granted directory — so it is pinned here rather than
+/// rediscovered.
+#[test]
+fn a_relative_path_is_resolved_against_the_working_directory_not_the_root() {
+    let cwd = std::env::current_dir().unwrap();
+    // Inside the working directory, so a relative spelling can reach it. Self
+    // cleaning, so it does not leave anything behind in the crate.
+    let here = tempfile::tempdir_in(&cwd).unwrap();
+    let leaf = here.path().file_name().unwrap();
+
+    let file = here.path().join("f.txt");
+    fs::write(&file, "hi").unwrap();
+
+    let relative = std::path::Path::new(leaf).join("f.txt");
+    assert!(relative.is_relative(), "the point of this test");
+
+    let caps = Capabilities::new(vec![here.path().to_path_buf()]);
+    assert!(
+        caps.allows_read(&relative),
+        "a relative path that resolves inside the grant must be allowed"
+    );
+
+    // The same spelling, against a grant somewhere else entirely, is denied —
+    // the resolution is real, not a string comparison that happened to match.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let other_caps = Capabilities::new(vec![elsewhere.path().to_path_buf()]);
+    assert!(
+        !other_caps.allows_read(&relative),
+        "the same relative spelling must not be allowed by an unrelated grant"
+    );
+}
