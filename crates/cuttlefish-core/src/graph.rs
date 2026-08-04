@@ -74,6 +74,58 @@ impl NodeGraph {
     }
 }
 
+/// Whether a graph is a strict linear chain — a single strand where node
+/// `i`'s sole input (if any) is `FromNode` of node `i-1`, nothing more:
+///
+/// - `branches` must be empty (no conditional dispatch to encode).
+/// - No node declares `repeat_until` (no loop to encode).
+/// - No node's `input` is `Record`/`List` fan-in.
+/// - **Beyond per-node checks:** the *whole graph* must be one strand, not
+///   just individually-simple nodes that still fan out or fan in as a
+///   group. Concretely: the first declared node has no input; every
+///   subsequent declared node's input must be exactly `FromNode` of the
+///   node declared immediately before it; and no node may be referenced by
+///   more than one other node's `FromNode` (that would be fan-out — two
+///   nodes both reading node `k`'s output — which individually satisfies
+///   every per-node check above while still not being a chain).
+///
+/// `cuttlefish build`'s bundle format only knows how to encode this exact
+/// shape, walked in `spec.nodes`' declaration order.
+pub fn is_simple_chain(graph: &NodeGraph, branches: &Branches) -> bool {
+    if !branches.decisions.is_empty() {
+        return false;
+    }
+    for (i, (_, node)) in graph.nodes.iter().enumerate() {
+        if node.repeat_until.is_some() {
+            return false;
+        }
+        match (i, &node.input) {
+            (0, None) => {}
+            (0, Some(_)) => return false, // the entry node must have no input
+            (_, Some(InputExpr::FromNode(referenced))) => {
+                let (previous_name, _) = &graph.nodes[i - 1];
+                if referenced != previous_name {
+                    return false; // not chained to the immediately-preceding node
+                }
+            }
+            _ => return false, // missing input, or Record/List fan-in
+        }
+    }
+    // Fan-out check: provably unreachable given the position check above
+    // already passed (if every node's input is exactly its immediate
+    // predecessor, no target can have two referrers) — kept as an explicit,
+    // cheap assertion rather than an implicit invariant, so a future change
+    // to the loop above that weakens it trips this instead of silently
+    // regressing.
+    let mut referenced_counts = std::collections::HashMap::new();
+    for (_, node) in &graph.nodes {
+        if let Some(InputExpr::FromNode(referenced)) = &node.input {
+            *referenced_counts.entry(referenced.clone()).or_insert(0) += 1;
+        }
+    }
+    referenced_counts.values().all(|&count| count <= 1)
+}
+
 /// `branches = { node_name = { "label" -> target; ... }; ... }`
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Branches {
@@ -286,5 +338,119 @@ impl<'a> GraphParser<'a> {
         }
         self.expect(&Tok::CloseBrace)?;
         Ok((Branches { decisions }, self.at))
+    }
+}
+
+#[cfg(test)]
+mod is_simple_chain_tests {
+    use super::*;
+
+    fn node(block: &str, input: Option<InputExpr>) -> Node {
+        Node {
+            block: PathBuf::from(block),
+            input,
+            repeat_until: None,
+            max_iterations: None,
+        }
+    }
+
+    fn from_node(name: &str) -> InputExpr {
+        InputExpr::FromNode(name.to_string())
+    }
+
+    #[test]
+    fn a_genuine_three_node_chain_is_simple() {
+        let graph = NodeGraph {
+            nodes: vec![
+                ("a".into(), node("blocks/a", None)),
+                ("b".into(), node("blocks/b", Some(from_node("a")))),
+                ("c".into(), node("blocks/c", Some(from_node("b")))),
+            ],
+        };
+        assert!(is_simple_chain(&graph, &Branches::default()));
+    }
+
+    #[test]
+    fn record_fan_in_is_not_simple() {
+        let mut fields = BTreeMap::new();
+        fields.insert("x".to_string(), from_node("a"));
+        fields.insert("y".to_string(), from_node("b"));
+        let graph = NodeGraph {
+            nodes: vec![
+                ("a".into(), node("blocks/a", None)),
+                ("b".into(), node("blocks/b", None)),
+                (
+                    "c".into(),
+                    node("blocks/c", Some(InputExpr::Record(fields))),
+                ),
+            ],
+        };
+        assert!(!is_simple_chain(&graph, &Branches::default()));
+    }
+
+    #[test]
+    fn list_fan_in_is_not_simple() {
+        let graph = NodeGraph {
+            nodes: vec![
+                ("a".into(), node("blocks/a", None)),
+                ("b".into(), node("blocks/b", None)),
+                (
+                    "c".into(),
+                    node(
+                        "blocks/c",
+                        Some(InputExpr::List(vec![from_node("a"), from_node("b")])),
+                    ),
+                ),
+            ],
+        };
+        assert!(!is_simple_chain(&graph, &Branches::default()));
+    }
+
+    #[test]
+    fn a_repeat_until_node_is_not_simple() {
+        let mut looped = node("blocks/b", Some(from_node("a")));
+        looped.repeat_until = Some("done".to_string());
+        looped.max_iterations = Some(5);
+        let graph = NodeGraph {
+            nodes: vec![("a".into(), node("blocks/a", None)), ("b".into(), looped)],
+        };
+        assert!(!is_simple_chain(&graph, &Branches::default()));
+    }
+
+    #[test]
+    fn a_branches_decision_is_not_simple() {
+        let graph = NodeGraph {
+            nodes: vec![
+                ("a".into(), node("blocks/a", None)),
+                ("b".into(), node("blocks/b", Some(from_node("a")))),
+            ],
+        };
+        let branches = Branches {
+            decisions: vec![("a".to_string(), vec![("done".to_string(), "b".to_string())])],
+        };
+        assert!(!is_simple_chain(&graph, &branches));
+    }
+
+    /// Two independent, individually-simple nodes that both declare
+    /// `in = a.out` — fan-out from `a`. Neither `b` nor `c` individually has
+    /// fan-in (each has exactly one `FromNode` input); what makes this not a
+    /// chain is a whole-graph property (two referrers of `a`), not anything
+    /// visible from a single node in isolation. In this implementation the
+    /// position check (node `i`'s input must be exactly node `i-1`) already
+    /// rejects this case before the dedicated fan-out tally ever runs — `c`'s
+    /// immediate predecessor is `b`, not `a` — which is exactly why that
+    /// tally is documented as unreachable-but-kept-explicit. This test
+    /// pins the required *behavior* (fan-out is rejected), independent of
+    /// which internal check catches it.
+    #[test]
+    fn fan_out_from_a_shared_predecessor_is_not_simple() {
+        let graph = NodeGraph {
+            nodes: vec![
+                ("a".into(), node("blocks/a", None)),
+                ("b".into(), node("blocks/b", Some(from_node("a")))),
+                ("c".into(), node("blocks/c", Some(from_node("a")))),
+            ],
+        };
+        assert!(!is_simple_chain(&graph, &Branches::default()));
     }
 }

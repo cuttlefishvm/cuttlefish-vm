@@ -206,20 +206,39 @@ mod cli {
         let catalog = cuttlefish_host::catalog::Catalog::open(catalog_root);
         let engine = wasmtime::Engine::default();
 
+        // cuttlefish build packages a Checked pipeline into a linear .cfbundle
+        // node array (crates/cuttlefish-host/src/bundle.rs) — it doesn't yet
+        // know how to encode branches, loops, or fan-in into that format. A
+        // spec whose graph is a simple chain (each node has at most one
+        // predecessor, no repeat_until, no branches referencing it) still
+        // builds exactly as before; anything else is a clear, explicit refusal
+        // rather than a silently wrong or truncated bundle.
+        if !cuttlefish_core::graph::is_simple_chain(&spec.nodes, &spec.branches) {
+            bail!(
+                "`{}`'s graph isn't a simple linear chain (it has fan-in, a repeat_until \
+                 loop, or conditional dispatch) — `cuttlefish build` doesn't yet support \
+                 packaging that into a bundle. Run it via cuttlefishd instead.",
+                spec.name
+            );
+        }
+        // A confirmed-linear graph's topological order is just its declaration
+        // order for a chain (each node's sole predecessor is the previous one);
+        // `spec.nodes.nodes` is already in that order (NodeGraph preserves
+        // insertion order — see graph.rs).
         let resolved: Vec<_> = spec
-            .pipeline
+            .nodes
+            .nodes
             .iter()
-            .map(|entry| {
+            .map(|(_, node)| {
                 cuttlefish_host::pipeline::resolve_and_load(
                     &catalog,
                     spec_dir,
-                    &entry.to_string_lossy(),
+                    &node.block.to_string_lossy(),
                     cuttlefish_host::catalog::ResolutionContext::Interactive,
                 )
             })
             .collect::<Result<_, _>>()
             .with_context(|| format!("resolving the pipeline for `{}`", spec.name))?;
-
         let checked = cuttlefish_host::pipeline::check(&engine, &resolved)
             .with_context(|| format!("checking the pipeline for `{}`", spec.name))?;
 
