@@ -2,6 +2,7 @@
 //! what it accepts. Most of these tests are refusals: a spec that half-parses
 //! would run a job under permissions nobody wrote down.
 
+use cuttlefish_core::graph::InputExpr;
 use cuttlefish_core::spec::{parse_spec, DataPolicy, ModelRef, SpecError};
 use std::path::PathBuf;
 
@@ -24,7 +25,9 @@ fn parses_every_field_of_the_sample() {
     assert_eq!(spec.model, ModelRef::new("path", "./models/stub.gguf"));
     assert_eq!(spec.data_policy, DataPolicy::LocalOnly);
     assert_eq!(spec.read_roots, vec![PathBuf::from("./docs")]);
-    assert_eq!(spec.block(), PathBuf::from("../blocks/echo-summarize"));
+    assert_eq!(spec.nodes.nodes.len(), 1);
+    let (_, node) = &spec.nodes.nodes[0];
+    assert_eq!(node.block, PathBuf::from("../blocks/echo-summarize"));
 }
 
 #[test]
@@ -208,37 +211,46 @@ fn the_repository_example_spec_parses() {
 }
 
 #[test]
-fn a_pipeline_of_several_blocks_parses_in_order() {
-    // Order is the whole meaning of a pipeline; reversing it would typecheck
-    // differently and run differently.
+fn block_is_sugar_for_a_one_node_graph() {
+    let spec = parse_spec(SAMPLE).unwrap();
+    assert_eq!(spec.nodes.nodes.len(), 1);
+    let (_, node) = &spec.nodes.nodes[0];
+    assert_eq!(node.block, PathBuf::from("../blocks/echo-summarize"));
+}
+
+#[test]
+fn a_nodes_block_with_fan_in_parses() {
+    let src = SAMPLE.replace(
+        r#"block = "../blocks/echo-summarize";"#,
+        r#"nodes = {
+             chunk = { block = "../blocks/chunk" };
+             summarize = { block = "../blocks/summarize"; in = chunk.out; };
+           };"#,
+    );
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(spec.nodes.nodes.len(), 2);
+    assert_eq!(
+        spec.nodes.get("summarize").unwrap().input,
+        Some(InputExpr::FromNode("chunk".into()))
+    );
+}
+
+#[test]
+fn an_empty_nodes_block_is_rejected() {
+    let src = SAMPLE.replace(r#"block = "../blocks/echo-summarize";"#, "nodes = { };");
+    assert!(parse_spec(&src).is_err());
+}
+
+#[test]
+fn pipeline_field_is_no_longer_recognized() {
     let src = SAMPLE.replace(
         r#"block = "../blocks/echo-summarize";"#,
         r#"pipeline = [ "../blocks/chunk", "../blocks/summarize" ];"#,
     );
-    let spec = parse_spec(&src).unwrap();
-    assert_eq!(
-        spec.pipeline,
-        vec![
-            PathBuf::from("../blocks/chunk"),
-            PathBuf::from("../blocks/summarize")
-        ]
-    );
-}
-
-#[test]
-fn block_is_sugar_for_a_one_element_pipeline() {
-    // Both spellings must produce the same thing, so nothing downstream has to
-    // handle two cases.
-    let spec = parse_spec(SAMPLE).unwrap();
-    assert_eq!(spec.pipeline.len(), 1);
-    assert_eq!(spec.block(), spec.pipeline[0]);
-}
-
-#[test]
-fn an_empty_pipeline_is_rejected() {
-    // A pipeline that runs nothing and returns nothing is never what was meant.
-    let src = SAMPLE.replace(r#"block = "../blocks/echo-summarize";"#, "pipeline = [ ];");
-    assert!(parse_spec(&src).is_err());
+    assert!(matches!(
+        parse_spec(&src),
+        Err(SpecError::UnknownField(f)) if f == "pipeline"
+    ));
 }
 
 // -- things the old character-splitting parser got wrong --------------------

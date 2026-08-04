@@ -512,6 +512,8 @@ pub enum JobStatus {
     Failed,
     /// Stopped by request.
     Cancelled,
+    /// Was running when the daemon last stopped; not resumed automatically.
+    Interrupted,
 }
 
 impl JobStatus {

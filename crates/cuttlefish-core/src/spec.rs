@@ -13,6 +13,11 @@
 //! yet, against guesses about its shape. When the pipeline syntax lands, this
 //! module gets replaced rather than extended.
 //!
+//! The `nodes = { ... }` / `branches = { ... }` graph syntax added since is not
+//! that pipeline syntax: it is still the same flat `key = value` grammar, just
+//! shaped to describe a graph, with no expressions or inference beyond the
+//! `node.out` reference syntax itself.
+//!
 //! # Why it refuses so much
 //!
 //! A spec grants capabilities. Every accepted-but-misunderstood construct is a
@@ -27,7 +32,7 @@
 //!
 //! Being liberal in what it accepts would be exactly the wrong instinct here.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Where a job's model comes from.
@@ -110,21 +115,15 @@ pub struct Spec {
     pub data_policy: DataPolicy,
     /// Directories this job may read beneath. Empty means none.
     pub read_roots: Vec<PathBuf>,
-    /// The proc-blocks implementing the job, in the order they run.
+    /// The proc-blocks implementing the job, as a graph of nodes.
     ///
-    /// Each block's output feeds the next one's input, and those seams are
-    /// typechecked before anything runs. A single-element pipeline is the
-    /// ordinary case and can be written as `block = "..."`.
-    pub pipeline: Vec<PathBuf>,
-}
-
-impl Spec {
-    /// The first block. A spec always has at least one.
-    pub fn block(&self) -> &Path {
-        self.pipeline
-            .first()
-            .expect("a spec has at least one block")
-    }
+    /// Each node's declared input is typechecked against the nodes feeding
+    /// it before anything runs. `block = "...";` is sugar for a one-node
+    /// graph — see [`crate::graph::NodeGraph::single`].
+    pub nodes: crate::graph::NodeGraph,
+    /// Conditional dispatch: which branch target fires for each labeled
+    /// route a branching node produces. Empty when the spec has none.
+    pub branches: crate::graph::Branches,
 }
 
 /// Why a spec was rejected.
@@ -240,8 +239,8 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Equals)?;
         self.expect(&Tok::OpenBrace)?;
 
-        let (mut description, mut model, mut data_policy, mut read_roots, mut pipeline) =
-            (None, None, None, None, None);
+        let (mut description, mut model, mut data_policy, mut read_roots, mut nodes, mut branches) =
+            (None, None, None, None, None, None);
 
         while self.peek().is_some() && self.peek() != Some(&Tok::CloseBrace) {
             let key = self.ident()?;
@@ -249,8 +248,29 @@ impl<'a> Parser<'a> {
 
             match key.as_str() {
                 "description" => description = Some(self.string("description")?),
-                "block" => pipeline = Some(vec![PathBuf::from(self.string("block")?)]),
-                "pipeline" => pipeline = Some(self.pipeline()?),
+                "block" => {
+                    nodes = Some(crate::graph::NodeGraph::single(PathBuf::from(
+                        self.string("block")?,
+                    )))
+                }
+                "nodes" => {
+                    let (g, new_at) = crate::graph::GraphParser {
+                        tokens: self.tokens,
+                        at: self.at,
+                    }
+                    .node_graph()?;
+                    self.at = new_at; // advance Parser's own cursor past what GraphParser consumed
+                    nodes = Some(g);
+                }
+                "branches" => {
+                    let (b, new_at) = crate::graph::GraphParser {
+                        tokens: self.tokens,
+                        at: self.at,
+                    }
+                    .branches()?;
+                    self.at = new_at;
+                    branches = Some(b);
+                }
                 "capabilities" => read_roots = Some(self.capabilities()?),
                 "model" => model = Some(self.model()?),
                 "data_policy" => {
@@ -281,7 +301,8 @@ impl<'a> Parser<'a> {
             model: model.ok_or(SpecError::MissingField("model"))?,
             data_policy: data_policy.ok_or(SpecError::MissingField("data_policy"))?,
             read_roots: read_roots.ok_or(SpecError::MissingField("capabilities"))?,
-            pipeline: pipeline.ok_or(SpecError::MissingField("block"))?,
+            nodes: nodes.ok_or(SpecError::MissingField("block"))?,
+            branches: branches.unwrap_or_default(),
         })
     }
 
@@ -294,30 +315,6 @@ impl<'a> Parser<'a> {
             )));
         }
         Ok(ModelRef::new(provider, self.string("model")?))
-    }
-
-    /// `[ "a", "b" ]`
-    fn pipeline(&mut self) -> Result<Vec<PathBuf>, SpecError> {
-        let mut blocks = Vec::new();
-        self.expect(&Tok::OpenBracket)?;
-        while self.peek() != Some(&Tok::CloseBracket) {
-            blocks.push(PathBuf::from(self.string("pipeline")?));
-            if self.peek() == Some(&Tok::Comma) {
-                self.at += 1;
-            } else {
-                break;
-            }
-        }
-        self.expect(&Tok::CloseBracket)?;
-
-        if blocks.is_empty() {
-            // A pipeline that runs nothing and returns nothing is never what an
-            // author meant to write.
-            return Err(SpecError::Malformed(
-                "a pipeline needs at least one block".into(),
-            ));
-        }
-        Ok(blocks)
     }
 
     /// `[ Read "a", Read "b" ]`

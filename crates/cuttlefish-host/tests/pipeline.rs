@@ -13,7 +13,9 @@
 mod support;
 
 use cuttlefish_host::catalog::{ArtifactKind, Catalog, ResolutionContext};
-use cuttlefish_host::pipeline::{check, resolve_and_load, PipelineError, ResolvedInput};
+use cuttlefish_host::pipeline::{
+    check, read_stage_signature, resolve_and_load, PipelineError, ResolvedInput,
+};
 use std::path::PathBuf;
 use support::block_with;
 use wasmtime::Engine;
@@ -209,6 +211,27 @@ fn an_empty_pipeline_is_rejected() {
     assert!(matches!(err, PipelineError::Empty));
 }
 
+#[test]
+fn read_stage_signature_matches_what_check_already_produced_for_a_block() {
+    // `read_stage_signature` must be the exact same per-node lookup `check`
+    // already runs — pinning it against a real compiled block, not a mock,
+    // is the whole point (a mocked signature would test the extraction
+    // against a fiction rather than the artifact that will actually run).
+    let dir = tempfile::tempdir().unwrap();
+    let block = block_with(dir.path(), "read_sig_a", "text", "text");
+
+    let input = ResolvedInput {
+        name: "x".into(),
+        kind: ArtifactKind::Block,
+        resolved: None,
+        bytes: std::fs::read(&block).unwrap(),
+    };
+
+    let sig = read_stage_signature(&Engine::default(), &input).unwrap();
+    assert_eq!(sig.input.describe(), "text");
+    assert_eq!(sig.output.describe(), "text");
+}
+
 // -- execution --------------------------------------------------------------
 
 /// Compile a block that echoes its input with a field added, so a chain's
@@ -270,8 +293,31 @@ export_block!(B);
         .join(format!("{}.wasm", name.replace('-', "_")))
 }
 
+/// A [`cuttlefish_host::dag::CheckedNode`] for a test, permissive-signature
+/// and non-looping, differing only in name, module bytes, and `input`.
+fn checked_node(
+    name: &str,
+    module_bytes: Vec<u8>,
+    input: Option<cuttlefish_core::graph::InputExpr>,
+) -> cuttlefish_host::dag::CheckedNode {
+    cuttlefish_host::dag::CheckedNode {
+        name: name.to_string(),
+        kind: ArtifactKind::Block,
+        resolved: None,
+        module_bytes,
+        signature: cuttlefish_abi::Signature {
+            input: cuttlefish_abi::Ty::Json,
+            output: cuttlefish_abi::Ty::Json,
+        },
+        input,
+        repeat_until: None,
+        max_iterations: None,
+    }
+}
+
 #[tokio::test]
 async fn a_pipeline_threads_each_result_into_the_next_block() {
+    use cuttlefish_core::graph::InputExpr;
     use cuttlefish_host::{
         caps::Capabilities,
         infer::StubBackend,
@@ -285,16 +331,28 @@ async fn a_pipeline_threads_each_result_into_the_next_block() {
     let third = std::fs::read(tagging_block(dir.path(), "chain_three", "third")).unwrap();
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let ledger = cuttlefish_host::ledger::Ledger::open(
+        &ledger_dir.path().join("ledger.sqlite"),
+        "test-fingerprint",
+    )
+    .unwrap();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         JobSpec {
-            stages: vec![first, second, third],
+            nodes: vec![
+                checked_node("n0", first, None),
+                checked_node("n1", second, Some(InputExpr::FromNode("n0".to_string()))),
+                checked_node("n2", third, Some(InputExpr::FromNode("n1".to_string()))),
+            ],
+            exclusive_to: std::collections::HashMap::new(),
             input: serde_json::json!({}),
             caps: Capabilities::default(),
         },
         tx,
         tokio_util::sync::CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -309,6 +367,7 @@ async fn a_pipeline_threads_each_result_into_the_next_block() {
 
 #[tokio::test]
 async fn a_failing_stage_ends_the_job_and_names_the_stage() {
+    use cuttlefish_core::graph::InputExpr;
     use cuttlefish_host::{
         caps::Capabilities,
         infer::StubBackend,
@@ -322,16 +381,31 @@ async fn a_failing_stage_ends_the_job_and_names_the_stage() {
     // A later stage that is not wasm at all: it must fail, and the error must
     // say *which* block, or a long pipeline turns debugging into a hunt.
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let ledger = cuttlefish_host::ledger::Ledger::open(
+        &ledger_dir.path().join("ledger.sqlite"),
+        "test-fingerprint",
+    )
+    .unwrap();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         JobSpec {
-            stages: vec![good, b"not wasm".to_vec()],
+            nodes: vec![
+                checked_node("n0", good, None),
+                checked_node(
+                    "n1",
+                    b"not wasm".to_vec(),
+                    Some(InputExpr::FromNode("n0".to_string())),
+                ),
+            ],
+            exclusive_to: std::collections::HashMap::new(),
             input: serde_json::json!({}),
             caps: Capabilities::default(),
         },
         tx,
         tokio_util::sync::CancellationToken::new(),
+        &ledger,
     )
     .await;
 

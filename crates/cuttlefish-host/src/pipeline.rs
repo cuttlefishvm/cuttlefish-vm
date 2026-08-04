@@ -161,40 +161,7 @@ pub fn check(engine: &Engine, inputs: &[ResolvedInput]) -> Result<Checked, Pipel
 
     let mut stages: Vec<Stage> = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let signature = match input.kind {
-            crate::catalog::ArtifactKind::Block => {
-                crate::runner::read_signature(engine, &input.bytes).map_err(|e| {
-                    PipelineError::Uninspectable {
-                        name: input.name.clone(),
-                        message: format!("{e:#}"),
-                    }
-                })?
-            }
-            crate::catalog::ArtifactKind::Bundle => {
-                let compact = crate::catalog::read_bundle_signature(&input.bytes, &input.name)
-                    .map_err(|e| PipelineError::Uninspectable {
-                        name: input.name.clone(),
-                        // `read_bundle_signature`'s own error already embeds
-                        // the name (it's `{path}: {reason}` with `path` set
-                        // to our `name`); re-stringifying the whole error
-                        // here would print the name twice. Pull out just the
-                        // reason so `Uninspectable`'s own `{name}: {message}`
-                        // formatting is the only place the name appears.
-                        message: match e {
-                            crate::catalog::CatalogError::UninspectableArtifact {
-                                reason, ..
-                            } => reason,
-                            other => other.to_string(),
-                        },
-                    })?;
-                compact
-                    .parse::<Signature>()
-                    .map_err(|e| PipelineError::Uninspectable {
-                        name: input.name.clone(),
-                        message: format!("cached signature `{compact}` does not parse: {e}"),
-                    })?
-            }
-        };
+        let signature = read_stage_signature(engine, input)?;
 
         if let Some(previous) = stages.last() {
             if !previous.signature.output.assignable_to(&signature.input) {
@@ -217,6 +184,47 @@ pub fn check(engine: &Engine, inputs: &[ResolvedInput]) -> Result<Checked, Pipel
     }
 
     Ok(Checked { stages })
+}
+
+/// Read one resolved input's declared [`Signature`], regardless of whether
+/// it's a block or a bundle. Shared by [`check`] (linear) and the graph
+/// checker in `crate::dag` — both need exactly this per-node lookup, just
+/// composed differently around it.
+pub fn read_stage_signature(
+    engine: &Engine,
+    input: &ResolvedInput,
+) -> Result<Signature, PipelineError> {
+    match input.kind {
+        crate::catalog::ArtifactKind::Block => crate::runner::read_signature(engine, &input.bytes)
+            .map_err(|e| PipelineError::Uninspectable {
+                name: input.name.clone(),
+                message: format!("{e:#}"),
+            }),
+        crate::catalog::ArtifactKind::Bundle => {
+            let compact = crate::catalog::read_bundle_signature(&input.bytes, &input.name)
+                .map_err(|e| PipelineError::Uninspectable {
+                    name: input.name.clone(),
+                    // `read_bundle_signature`'s own error already embeds
+                    // the name (it's `{path}: {reason}` with `path` set
+                    // to our `name`); re-stringifying the whole error
+                    // here would print the name twice. Pull out just the
+                    // reason so `Uninspectable`'s own `{name}: {message}`
+                    // formatting is the only place the name appears.
+                    message: match e {
+                        crate::catalog::CatalogError::UninspectableArtifact { reason, .. } => {
+                            reason
+                        }
+                        other => other.to_string(),
+                    },
+                })?;
+            compact
+                .parse::<Signature>()
+                .map_err(|e| PipelineError::Uninspectable {
+                    name: input.name.clone(),
+                    message: format!("cached signature `{compact}` does not parse: {e}"),
+                })
+        }
+    }
 }
 
 /// Turn one pipeline-entry string from a spec into a loaded, kind-tagged

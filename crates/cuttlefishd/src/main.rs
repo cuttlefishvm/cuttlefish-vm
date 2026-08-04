@@ -64,21 +64,24 @@ async fn main() -> anyhow::Result<()> {
     let catalog_root = cuttlefish_host::catalog::default_root()
         .context("could not determine home directory; set CUTTLEFISH_HOME")?;
     let catalog = cuttlefish_host::catalog::Catalog::open(catalog_root);
-    let resolved: Vec<_> = spec
-        .pipeline
-        .iter()
-        .map(|entry| {
-            cuttlefish_host::pipeline::resolve_and_load(
-                &catalog,
-                spec_dir,
-                &entry.to_string_lossy(),
-                cuttlefish_host::catalog::ResolutionContext::Interactive,
-            )
-        })
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("resolving the pipeline for `{}`", spec.name))?;
-    let checked = cuttlefish_host::pipeline::check(&engine, &resolved)
-        .with_context(|| format!("checking the pipeline for `{}`", spec.name))?;
+    let resolved: std::collections::HashMap<String, cuttlefish_host::pipeline::ResolvedInput> =
+        spec.nodes
+            .nodes
+            .iter()
+            .map(|(name, node)| {
+                cuttlefish_host::pipeline::resolve_and_load(
+                    &catalog,
+                    spec_dir,
+                    &node.block.to_string_lossy(),
+                    cuttlefish_host::catalog::ResolutionContext::Interactive,
+                )
+                .map(|input| (name.clone(), input))
+            })
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("resolving the pipeline for `{}`", spec.name))?;
+    let checked =
+        cuttlefish_host::dag::check_graph(&engine, &spec.nodes, &spec.branches, &resolved)
+            .with_context(|| format!("checking the pipeline for `{}`", spec.name))?;
 
     // A stage can typecheck cleanly as a Bundle (its cached signature parses
     // and its seams fit) while still being unrunnable: `stages` below feeds
@@ -90,9 +93,9 @@ async fn main() -> anyhow::Result<()> {
     // is unaffected: embedding a bundle stage in an outer bundle is fine, it
     // is only *running* one directly that isn't supported yet.
     if let Some(bundle_stage) = checked
-        .stages()
+        .nodes
         .iter()
-        .find(|s| s.kind == cuttlefish_host::catalog::ArtifactKind::Bundle)
+        .find(|n| n.kind == cuttlefish_host::catalog::ArtifactKind::Bundle)
     {
         anyhow::bail!(
             "stage `{}` resolved to a bundle, not a block. Running a nested bundle as a \
@@ -103,33 +106,39 @@ async fn main() -> anyhow::Result<()> {
     }
 
     eprintln!(
-        "cuttlefishd pipeline `{}`: {} accepting {} producing {}",
+        "cuttlefishd pipeline `{}`: {} node(s)",
         spec.name,
-        checked.stages().len(),
-        checked.input(),
-        checked.output()
+        checked.nodes.len()
     );
+
+    // Detect jobs that were still running when this daemon last stopped,
+    // before `checked.nodes` gets moved into `AppState` below — the
+    // fingerprint is computed from a reference to it.
+    let jobs = state::JobStore::default();
+    let jobs_root = cuttlefish_host::ledger::jobs_root()
+        .context("could not determine home directory; set CUTTLEFISH_HOME")?;
+    let current_fingerprint = cuttlefish_host::dag::graph_fingerprint(&checked.nodes);
+    cuttlefishd::scan_for_interrupted_jobs(&jobs_root, &current_fingerprint, &jobs).await?;
 
     let state = api::AppState {
         engine,
         backend,
-        jobs: state::JobStore::default(),
+        jobs,
         spec: Arc::new(spec),
-        // The checked pipeline already holds every block's bytes. The positional
-        // wasm argument overrides the *first* stage, so an operator can point at
-        // a freshly built block without editing the spec — useful for a
-        // single-block spec, and harmless for a longer one.
-        stages: Arc::new({
-            let mut stages: Vec<Vec<u8>> = checked
-                .stages()
-                .iter()
-                .map(|s| s.module_bytes.clone())
-                .collect();
+        checked_nodes: Arc::new({
+            let mut nodes = checked.nodes;
+            // The positional wasm argument overrides the FIRST node in
+            // topological order — same convention as before (it used to
+            // override stage index 0), an operator can still point at a
+            // freshly built block without editing the spec.
             if let Ok(bytes) = std::fs::read(&wasm_path) {
-                stages[0] = bytes;
+                if let Some(first) = nodes.first_mut() {
+                    first.module_bytes = bytes;
+                }
             }
-            stages
+            nodes
         }),
+        exclusive_to: Arc::new(checked.exclusive_to),
     };
 
     serve::serve(api::router(state), &endpoint).await

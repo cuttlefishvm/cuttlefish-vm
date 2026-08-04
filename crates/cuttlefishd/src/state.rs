@@ -61,6 +61,26 @@ impl Job {
             log: Vec::new(),
         }
     }
+
+    /// Reconstruct a job discovered mid-flight in its ledger at daemon
+    /// startup — not actually running (there is no task backing it), just
+    /// recorded as having been running when the process last died.
+    ///
+    /// The `CancellationToken` is fresh and never cancelled: nothing is
+    /// executing for this job in this process, so there is nothing for it to
+    /// cancel. `envelope` stays `None` — there is nothing to show yet; a
+    /// resume endpoint is what eventually gives this job a real envelope.
+    pub fn interrupted(id: String) -> Self {
+        let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            id,
+            status: JobStatus::Interrupted,
+            envelope: None,
+            cancel: CancellationToken::new(),
+            events,
+            log: Vec::new(),
+        }
+    }
 }
 
 /// Every job this daemon knows about.
@@ -111,18 +131,107 @@ impl JobStore {
         }
     }
 
+    /// Record a job discovered mid-flight in its ledger at daemon startup;
+    /// see [`Job::interrupted`].
+    pub async fn mark_interrupted(&self, id: String) {
+        self.insert(Job::interrupted(id)).await;
+    }
+
+    /// Snapshot every known job, in the same `{job_id, status, envelope}`
+    /// shape `get_job` returns for one — this is what makes an `Interrupted`
+    /// job (surfaced only via the startup scan, never streamed) actually
+    /// discoverable: an agent lists jobs, sees one sitting at `Interrupted`,
+    /// and only then decides whether to call resume.
+    pub async fn list(&self) -> Vec<serde_json::Value> {
+        self.jobs
+            .lock()
+            .await
+            .values()
+            .map(|job| {
+                serde_json::json!({
+                    "job_id": job.id,
+                    "status": job.status,
+                    "envelope": job.envelope,
+                })
+            })
+            .collect()
+    }
+
     /// Request cancellation. Returns whether the job existed.
     ///
     /// Best-effort by nature: a job that has already finished is reported as
     /// cancelled-successfully because the caller's intent — "do not keep running
     /// this" — is already satisfied.
+    ///
+    /// A job discovered `Interrupted` at startup is a different case: its
+    /// `CancellationToken` is fresh and wired to nothing (see
+    /// [`Job::interrupted`]), so calling `.cancel()` on it would silently do
+    /// nothing and leave `status` stuck at `Interrupted` forever, while still
+    /// reporting success — unlike an already-terminal job, its final
+    /// disposition is genuinely unresolved (it could still be resumed), so
+    /// "intent already satisfied" doesn't apply. Instead it's transitioned
+    /// directly to `Cancelled` here. That conveniently also closes the loop
+    /// for resume: a resume check against `status == Interrupted` correctly
+    /// refuses a job cancelled this way, with no extra plumbing needed.
+    ///
+    /// The on-disk ledger is also updated to match: without this, its
+    /// `job_status` table would still say `'running'`, and a subsequent
+    /// daemon restart's startup scan would re-read that, silently re-mark
+    /// the job `Interrupted`, and discard this cancel decision entirely —
+    /// the ledger is the authoritative durability record, so it must not be
+    /// allowed to diverge from the in-memory view like that.
     pub async fn cancel(&self, id: &str) -> bool {
-        match self.jobs.lock().await.get(id) {
+        let mut jobs = self.jobs.lock().await;
+        match jobs.get_mut(id) {
+            Some(job) if job.status == JobStatus::Interrupted => {
+                job.status = JobStatus::Cancelled;
+                // Persist to the ledger too — otherwise a restart before
+                // this job's final disposition is otherwise resolved would
+                // silently re-mark it Interrupted, discarding this cancel
+                // decision. Best effort: if the ledger write fails, the
+                // in-memory transition above still holds for this process's
+                // lifetime; only a subsequent restart would be affected,
+                // which is a narrower, more acceptable failure window than
+                // not trying at all.
+                if let Some(jobs_root) = cuttlefish_host::ledger::jobs_root() {
+                    let ledger_path = jobs_root.join(id).join("ledger.sqlite");
+                    // Any existing fingerprint is preserved by
+                    // `Ledger::open` (only inserted on first creation) — the
+                    // value passed here is irrelevant for an
+                    // already-existing ledger, which this always is by the
+                    // time a job can be cancelled.
+                    if let Ok(ledger) = cuttlefish_host::ledger::Ledger::open(&ledger_path, "") {
+                        let _ = ledger.finish("cancelled");
+                    }
+                }
+                true
+            }
             Some(job) => {
                 job.cancel.cancel();
                 true
             }
             None => false,
+        }
+    }
+
+    /// Atomically transition a job from `Interrupted` to `Running`, if and
+    /// only if it's still `Interrupted` at the moment this runs — the guard
+    /// against two concurrent `POST /jobs/{id}/resume` calls both winning and
+    /// spawning duplicate `run_job` executions against the same ledger.
+    ///
+    /// Returns the job (with its now-updated status) if this call won the
+    /// race, or `None` if another call already claimed it first (or the job
+    /// doesn't exist). Callers must run every other pre-flight check first —
+    /// this method exists to be the *last* thing before `tokio::spawn`, not a
+    /// replacement for the earlier checks; see `resume_job`'s ordering note.
+    pub async fn try_start_resume(&self, id: &str) -> Option<Job> {
+        let mut jobs = self.jobs.lock().await;
+        match jobs.get_mut(id) {
+            Some(job) if job.status == JobStatus::Interrupted => {
+                job.status = JobStatus::Running;
+                Some(job.clone())
+            }
+            _ => None,
         }
     }
 }

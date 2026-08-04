@@ -10,5 +10,6 @@
 #![warn(missing_docs)]
 
 pub mod endpoint;
+pub mod graph;
 pub mod lex;
 pub mod spec;

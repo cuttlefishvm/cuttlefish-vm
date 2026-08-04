@@ -38,8 +38,11 @@ pub struct AppState {
     pub jobs: JobStore,
     /// The one spec this daemon serves. A registry of many arrives later.
     pub spec: Arc<Spec>,
-    /// The spec's compiled blocks, in execution order, already typechecked.
-    pub stages: Arc<Vec<Vec<u8>>>,
+    /// The spec's checked nodes, in topological order, ready to execute.
+    pub checked_nodes: Arc<Vec<cuttlefish_host::dag::CheckedNode>>,
+    /// Which nodes are exclusive to which branch decision+label.
+    pub exclusive_to:
+        Arc<std::collections::HashMap<String, cuttlefish_host::dag::BranchExclusivity>>,
 }
 
 /// A job submission.
@@ -56,9 +59,10 @@ pub fn router(state: AppState) -> Router {
     // Path parameters use axum 0.8 syntax — `{id}`, not the `:id` of 0.7.
     Router::new()
         .route("/specs", get(list_specs))
-        .route("/jobs", post(submit))
+        .route("/jobs", get(list_jobs).post(submit))
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/jobs/{id}/events", get(job_events))
+        .route("/jobs/{id}/resume", post(resume_job))
         .with_state(state)
 }
 
@@ -88,11 +92,63 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
     }
 
     let id = uuid::Uuid::new_v4().to_string();
+
+    // A durable job directory, minted alongside the job_id: every job gets
+    // its own on-disk ledger from the moment it's submitted, so a process
+    // restart mid-job has something to resume from (later task) rather than
+    // the job simply vanishing.
+    let jobs_root = match cuttlefish_host::ledger::jobs_root() {
+        Some(root) => root,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "could not determine home directory; set CUTTLEFISH_HOME"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let job_dir = jobs_root.join(&id);
+    if let Err(e) = std::fs::create_dir_all(&job_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("creating job directory {}: {e}", job_dir.display())
+            })),
+        )
+            .into_response();
+    }
+    let fingerprint = cuttlefish_host::dag::graph_fingerprint(&st.checked_nodes);
+    let ledger =
+        match cuttlefish_host::ledger::Ledger::open(&job_dir.join("ledger.sqlite"), &fingerprint) {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("opening ledger for job {id}: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    if let Err(e) = std::fs::write(job_dir.join("input.json"), req.input.to_string()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("writing input.json for job {id}: {e}")
+            })),
+        )
+            .into_response();
+    }
+
     let cancel = CancellationToken::new();
     st.jobs.insert(Job::new(id.clone(), cancel.clone())).await;
 
     let job_spec = JobSpec {
-        stages: (*st.stages).clone(),
+        nodes: (*st.checked_nodes).clone(),
+        exclusive_to: (*st.exclusive_to).clone(),
         input: req.input,
         caps: Capabilities::new(st.spec.read_roots.clone()),
     };
@@ -121,7 +177,7 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         id.clone(),
     );
     tokio::spawn(async move {
-        let envelope = run_job(engine, backend, job_spec, tx, cancel).await;
+        let envelope = run_job(engine, backend, job_spec, tx, cancel, &ledger).await;
         store
             .publish(
                 &job_id,
@@ -136,6 +192,17 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         Json(serde_json::json!({ "job_id": id })),
     )
         .into_response()
+}
+
+/// Every job this daemon knows about, in the same shape as `get_job`.
+///
+/// This is what makes `Interrupted` jobs — surfaced only by the startup scan,
+/// never pushed to anyone — actually discoverable: an agent lists jobs, sees
+/// one sitting at `Interrupted`, and only then decides whether resuming it is
+/// the right call. Resume is a signal, not an automatic action; this endpoint
+/// is what delivers the signal.
+async fn list_jobs(State(st): State<AppState>) -> impl IntoResponse {
+    Json(st.jobs.list().await)
 }
 
 /// Current status, and the envelope once the job has finished.
@@ -164,6 +231,139 @@ async fn cancel_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
     } else {
         StatusCode::NOT_FOUND
     }
+}
+
+/// Explicitly resume a job the startup scan found `Interrupted`.
+///
+/// Deliberately not automatic: per the design's "resume is a signal, not an
+/// automatic action," an agent must see the job sitting at `Interrupted` (via
+/// `GET /jobs`) and choose to call this — a crashed job never silently starts
+/// running again on its own.
+async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let job = match st.jobs.get(&id).await {
+        Some(job) if job.status == cuttlefish_abi::JobStatus::Interrupted => job,
+        Some(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "only an Interrupted job can be resumed" })),
+            )
+                .into_response()
+        }
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let jobs_root = match cuttlefish_host::ledger::jobs_root() {
+        Some(root) => root,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "could not determine home directory; set CUTTLEFISH_HOME"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let job_dir = jobs_root.join(&id);
+
+    // The whole reason a graph_fingerprint is recorded: this daemon process
+    // might be serving a different spec than the one that started this job
+    // (an operator could have restarted it pointed at a different spec
+    // file). Reject before touching the ledger's checkpoints at all —
+    // resuming node-by-node against a mismatched graph would run some
+    // nodes' blocks against a spec they were never checked against.
+    let current_fingerprint = cuttlefish_host::dag::graph_fingerprint(&st.checked_nodes);
+    let ledger = match cuttlefish_host::ledger::Ledger::open(
+        &job_dir.join("ledger.sqlite"),
+        &current_fingerprint,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("opening ledger: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    let stored_fingerprint = match ledger.graph_fingerprint() {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("reading ledger: {e}") })),
+            )
+                .into_response()
+        }
+    };
+    if stored_fingerprint != current_fingerprint {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "this job's graph fingerprint doesn't match the spec this daemon \
+                          is currently serving — it was likely started against a different \
+                          version of the spec. Refusing to resume rather than run its \
+                          remaining nodes against a mismatched graph."
+            })),
+        )
+            .into_response();
+    }
+
+    // Fingerprint verified — re-run using the same JobSpec-construction path
+    // `submit` uses, reading input.json back from job_dir, and letting
+    // run_job's ledger-aware loop skip everything already checkpointed via
+    // the same ledger opened above.
+    let input: serde_json::Value = match std::fs::read_to_string(job_dir.join("input.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "job directory has no readable input.json" })),
+            )
+                .into_response()
+        }
+    };
+    let job_spec = JobSpec {
+        nodes: (*st.checked_nodes).clone(),
+        exclusive_to: (*st.exclusive_to).clone(),
+        input,
+        caps: Capabilities::new(st.spec.read_roots.clone()),
+    };
+
+    // Atomic guard against a concurrent second /resume call racing to this
+    // same point — only one call may actually win and spawn run_job. This
+    // deliberately sits last, after every fallible pre-flight check above
+    // has already succeeded: flipping status any earlier would risk leaving
+    // the job stuck in a new status with nothing running and no way to
+    // resume it again, if a later check then failed.
+    if st.jobs.try_start_resume(&id).await.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "this job is already being resumed" })),
+        )
+            .into_response();
+    }
+
+    let (engine, backend, store, job_id) = (
+        st.engine.clone(),
+        st.backend.clone(),
+        st.jobs.clone(),
+        id.clone(),
+    );
+    let cancel = job.cancel.clone();
+    tokio::spawn(async move {
+        // Events aren't replayed for a resume in v1 — a client watching
+        // `/jobs/{id}/events` mid-crash has already lost that stream; the
+        // result still lands durably via `finish`, same as any other job.
+        let (tx, _rx) = mpsc::channel::<JobEvent>(256);
+        let envelope = run_job(engine, backend, job_spec, tx, cancel, &ledger).await;
+        store.finish(&job_id, envelope).await;
+    });
+
+    StatusCode::ACCEPTED.into_response()
 }
 
 /// Live event stream, replaying anything already emitted.

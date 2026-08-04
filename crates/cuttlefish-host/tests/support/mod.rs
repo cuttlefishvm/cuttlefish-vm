@@ -29,26 +29,14 @@ pub fn clean_cargo(program: &str) -> std::process::Command {
 
 use std::path::PathBuf;
 
-/// Compile a one-off block with the given signature and body, returning its
-/// `.wasm` path.
-///
-/// Writing and compiling a real crate is slow but is the only way to test
-/// what is actually claimed: that the declaration travels inside the module.
-///
-/// `support` is compiled fresh into each integration-test binary; binaries
-/// that don't call this (`runner.rs`) would otherwise see it as dead code.
-#[allow(dead_code)]
-pub fn block_with(dir: &std::path::Path, name: &str, input: &str, output: &str) -> PathBuf {
-    let crate_dir = dir.join(name);
-    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
-
+/// The `Cargo.toml` every one-off fixture block shares — factored out so
+/// [`block_with`] and [`block_with_source`] can't drift from each other.
+fn manifest(name: &str) -> String {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let sdk = workspace.join("crates/cuttlefish-sdk");
 
-    std::fs::write(
-        crate_dir.join("Cargo.toml"),
-        format!(
-            r#"[package]
+    format!(
+        r#"[package]
 name = "{name}"
 version = "0.0.0"
 edition = "2021"
@@ -62,19 +50,29 @@ serde_json = "1"
 
 [workspace]
 "#,
-            // A TOML *literal* string (single quotes) and forward slashes: a
-            // Windows path in a normal TOML string makes `\a` an escape
-            // sequence, so the manifest fails to parse and the fixture fails
-            // to build — on one platform only, with an error that says
-            // nothing about paths.
-            sdk.display().to_string().replace('\\', "/")
-        ),
+        // A TOML *literal* string (single quotes) and forward slashes: a
+        // Windows path in a normal TOML string makes `\a` an escape
+        // sequence, so the manifest fails to parse and the fixture fails
+        // to build — on one platform only, with an error that says
+        // nothing about paths.
+        sdk.display().to_string().replace('\\', "/")
     )
-    .unwrap();
+}
 
-    std::fs::write(
-        crate_dir.join("src/lib.rs"),
-        format!(
+/// Compile a one-off block with the given signature and body, returning its
+/// `.wasm` path.
+///
+/// Writing and compiling a real crate is slow but is the only way to test
+/// what is actually claimed: that the declaration travels inside the module.
+///
+/// `support` is compiled fresh into each integration-test binary; binaries
+/// that don't call this (`runner.rs`) would otherwise see it as dead code.
+#[allow(dead_code)]
+pub fn block_with(dir: &std::path::Path, name: &str, input: &str, output: &str) -> PathBuf {
+    block_with_source(
+        dir,
+        name,
+        &format!(
             r#"use cuttlefish_sdk::{{export_block, Block, Command, Event, Signature}};
 
 #[derive(Default)]
@@ -99,7 +97,24 @@ export_block!(B);
 "#
         ),
     )
-    .unwrap();
+}
+
+/// Compile a one-off block from a caller-supplied `src/lib.rs`, returning its
+/// `.wasm` path.
+///
+/// This is [`block_with`]'s more general sibling: [`block_with`] can only
+/// produce a block that immediately returns `Null`, which is enough for
+/// typecheck-only fixtures but not for anything that needs to exercise real
+/// `start`/`step` behavior (echoing input, looping, emitting a route,
+/// panicking if invoked). Callers write the whole block body themselves —
+/// still against `cuttlefish_sdk`, still exported with `export_block!`.
+#[allow(dead_code)]
+pub fn block_with_source(dir: &std::path::Path, name: &str, lib_rs: &str) -> PathBuf {
+    let crate_dir = dir.join(name);
+    std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+
+    std::fs::write(crate_dir.join("Cargo.toml"), manifest(name)).unwrap();
+    std::fs::write(crate_dir.join("src/lib.rs"), lib_rs).unwrap();
 
     let status = clean_cargo(env!("CARGO"))
         .current_dir(&crate_dir)

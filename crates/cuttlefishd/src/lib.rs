@@ -78,3 +78,60 @@ pub mod api;
 pub mod state;
 
 pub mod serve;
+
+/// Scan every job directory under `jobs_root` for a ledger whose
+/// `job_status` is still `Running` — i.e. a job that was mid-flight when the
+/// daemon last stopped — and record it in `jobs` as [`cuttlefish_abi::JobStatus::Interrupted`].
+///
+/// Called once at startup, and directly by tests that build a `JobStore`
+/// without going through `main()`. Nothing here resumes a job automatically:
+/// see the "Resume is a signal, not an automatic action" section of the
+/// design doc. `current_fingerprint` is passed through to `Ledger::open`,
+/// but is only meaningful for a ledger that doesn't exist yet — every ledger
+/// this loop opens already exists (its presence is what selected the
+/// directory), so the value recorded at that ledger's original creation is
+/// what's read back, untouched.
+///
+/// A single job directory whose ledger can't be opened or read (e.g.
+/// corrupted by a hard crash mid-write) is logged and skipped, not treated
+/// as fatal — the whole point of this scan is to surface crash damage, so it
+/// must not itself go down because of the very class of crash it looks for.
+/// Only a failure to list `jobs_root` at all is fatal, since that means the
+/// scan cannot proceed in any capacity.
+pub async fn scan_for_interrupted_jobs(
+    jobs_root: &std::path::Path,
+    current_fingerprint: &str,
+    jobs: &state::JobStore,
+) -> anyhow::Result<()> {
+    if !jobs_root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(jobs_root)? {
+        let entry = entry?;
+        let ledger_path = entry.path().join("ledger.sqlite");
+        if !ledger_path.exists() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let ledger = match cuttlefish_host::ledger::Ledger::open(&ledger_path, current_fingerprint)
+        {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not open ledger for job `{id}` at startup scan, skipping: {e}"
+                );
+                continue;
+            }
+        };
+        match ledger.job_status() {
+            Ok(cuttlefish_host::ledger::LedgerJobStatus::Running) => {
+                jobs.mark_interrupted(id).await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("warning: could not read job status for job `{id}` at startup scan, skipping: {e}");
+            }
+        }
+    }
+    Ok(())
+}

@@ -61,8 +61,9 @@ Caused by:
 
 ## Pipeline entries: bare `name@version` resolves through the catalog
 
-A spec's `block = "..."` (or `pipeline = [...]`) entry is resolved the same
-way in both `cuttlefish build` and `cuttlefishd`'s `run` path:
+A spec's `block = "..."` (or each node's `block = "..."` inside `nodes =
+{...}`) entry is resolved the same way in both `cuttlefish build` and
+`cuttlefishd`'s `run` path:
 
 - A path that exists relative to the spec's own directory, or that ends in
   `.wasm`/`.cfbundle`, is read directly from disk.
