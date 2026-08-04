@@ -301,12 +301,21 @@ fn cancelled(usage: Usage, message: &str) -> Envelope {
 ///
 /// Always returns an [`Envelope`]; failures are values, not errors, because the
 /// caller has to report *something* to whoever submitted the job.
+///
+/// `ledger` is consulted before any resume-sensitive decision (branch-skip,
+/// transitive-skip, or actually running a node) and written to immediately
+/// after that decision is made, so that a process restart mid-job — a later
+/// task's concern, not this function's — can resume from exactly the state
+/// this function left behind. The whole body runs inside a single labeled
+/// block (`'run: { ... }`) so that every exit path, however it got there,
+/// still reaches the one `ledger.finish(...)` call at the end.
 pub async fn run_job(
     engine: Arc<Engine>,
     backend: Arc<dyn InferBackend>,
     job: JobSpec,
     events: mpsc::Sender<JobEvent>,
     cancel: CancellationToken,
+    ledger: &crate::ledger::Ledger,
 ) -> Envelope {
     let started = Instant::now();
     let mut usage = Usage {
@@ -324,209 +333,317 @@ pub async fn run_job(
     // security property rests on.
     let mut handles = Handles::default();
 
-    if job.nodes.is_empty() {
-        usage.duration_ms = started.elapsed().as_millis() as u64;
-        return fail(
-            error_codes::SCHEMA_VALIDATION_FAILED,
-            "this job has no nodes to run",
-            usage,
-        );
-    }
-
-    let total = job.nodes.len();
-    let mut outputs: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
-    let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut route_taken: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-
-    for (index, node) in job.nodes.iter().enumerate() {
-        // Tell watchers which node is running. A pipeline that stalls is much
-        // easier to diagnose when the stream says where.
-        if total > 1 {
-            let _ = events
-                .send(JobEvent::Progress(serde_json::json!({
-                    "stage": index + 1,
-                    "of": total,
-                    "node": node.name,
-                })))
-                .await;
+    let envelope = 'run: {
+        if job.nodes.is_empty() {
+            usage.duration_ms = started.elapsed().as_millis() as u64;
+            break 'run fail(
+                error_codes::SCHEMA_VALIDATION_FAILED,
+                "this job has no nodes to run",
+                usage,
+            );
         }
 
-        // Branch-skip: this node is exclusive to a decision+label, and that
-        // decision's chosen route (already recorded earlier in this same
-        // loop, since the branching node is always topologically before the
-        // nodes exclusive to its labels) doesn't match.
-        if let Some(ex) = job.exclusive_to.get(&node.name) {
-            if let Some(taken) = route_taken.get(&ex.decision) {
-                if taken != &ex.label {
+        let total = job.nodes.len();
+        let mut outputs: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut route_taken: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for (index, node) in job.nodes.iter().enumerate() {
+            // Resume: a node the ledger already marked skipped stays skipped
+            // — its branch decision is not re-evaluated.
+            match ledger.is_skipped(&node.name) {
+                Ok(true) => {
                     skipped.insert(node.name.clone());
                     continue;
                 }
+                Ok(false) => {}
+                Err(e) => {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    break 'run fail(
+                        error_codes::SCHEMA_VALIDATION_FAILED,
+                        format!("reading ledger skip state for node `{}`: {e}", node.name),
+                        usage,
+                    );
+                }
             }
-        }
-        // Transitive skip: this node's input needs a skipped node's output.
-        if let Some(expr) = &node.input {
-            if references_any(expr, &skipped) {
-                skipped.insert(node.name.clone());
-                continue;
-            }
-        }
 
-        let node_input = match &node.input {
-            None => job.input.clone(),
-            Some(expr) => evaluate_input(expr, &outputs),
-        };
-
-        // Bounded loop: repeat_until re-invokes this node on its own prior
-        // output, up to max_iterations. A node without repeat_until runs
-        // exactly once (the loop's `None` arm breaks immediately).
-        let mut current_input = node_input;
-        let mut iterations: u32 = 0;
-        let result = loop {
-            let r = match run_stage(
-                &engine,
-                &backend,
-                &node.module_bytes,
-                current_input.clone(),
-                &job.caps,
-                &mut handles,
-                &events,
-                &cancel,
-                &mut usage,
-                started,
-                index,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(envelope) => return envelope,
-            };
-            match &node.repeat_until {
-                None => break r,
-                Some(field) => {
-                    iterations += 1;
-                    let done = r.get(field).and_then(|v| v.as_str()) == Some("done");
-                    if done {
-                        break r;
+            // Resume: a completed checkpoint means reuse the cached output
+            // instead of re-running.
+            match ledger.get_completed(&node.name) {
+                Ok(Some(cached)) => {
+                    // If this was a branches decision node, its route must be
+                    // recorded in `route_taken` here too — not just after a
+                    // fresh `run_stage` call below — or a downstream,
+                    // not-yet-reached branch-exclusive node would see no
+                    // recorded decision at all on a resumed run and
+                    // (incorrectly) never be skipped. The checkpoint only
+                    // ever holds a value that already passed this same route
+                    // validation the first time it ran, so this is purely
+                    // re-deriving `route_taken`, never re-validating.
+                    if let Some(route) = cached.get("route").and_then(|v| v.as_str()) {
+                        route_taken.insert(node.name.clone(), route.to_string());
                     }
-                    let max = node
-                        .max_iterations
-                        .expect("repeat_until requires max_iterations, enforced at parse time");
-                    if iterations >= max {
+                    outputs.insert(node.name.clone(), cached);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    break 'run fail(
+                        error_codes::SCHEMA_VALIDATION_FAILED,
+                        format!("reading ledger checkpoint for node `{}`: {e}", node.name),
+                        usage,
+                    );
+                }
+            }
+
+            // Tell watchers which node is running. A pipeline that stalls is
+            // much easier to diagnose when the stream says where.
+            if total > 1 {
+                let _ = events
+                    .send(JobEvent::Progress(serde_json::json!({
+                        "stage": index + 1,
+                        "of": total,
+                        "node": node.name,
+                    })))
+                    .await;
+            }
+
+            // Fresh branch-skip decision (only reached if the ledger had no
+            // recorded state for this node — i.e. this is either a fresh
+            // run, or a resumed run that hadn't reached this node yet).
+            //
+            // Branch-skip: this node is exclusive to a decision+label, and
+            // that decision's chosen route (already recorded earlier in this
+            // same loop, since the branching node is always topologically
+            // before the nodes exclusive to its labels) doesn't match.
+            if let Some(ex) = job.exclusive_to.get(&node.name) {
+                if let Some(taken) = route_taken.get(&ex.decision) {
+                    if taken != &ex.label {
+                        skipped.insert(node.name.clone());
+                        if let Err(e) = ledger.write_skipped(&node.name) {
+                            usage.duration_ms = started.elapsed().as_millis() as u64;
+                            break 'run fail(
+                                error_codes::SCHEMA_VALIDATION_FAILED,
+                                format!("recording skip for node `{}` in ledger: {e}", node.name),
+                                usage,
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
+            // Transitive skip: this node's input needs a skipped node's
+            // output.
+            if let Some(expr) = &node.input {
+                if references_any(expr, &skipped) {
+                    skipped.insert(node.name.clone());
+                    if let Err(e) = ledger.write_skipped(&node.name) {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
-                        return fail(
+                        break 'run fail(
+                            error_codes::SCHEMA_VALIDATION_FAILED,
+                            format!("recording skip for node `{}` in ledger: {e}", node.name),
+                            usage,
+                        );
+                    }
+                    continue;
+                }
+            }
+
+            let node_input = match &node.input {
+                None => job.input.clone(),
+                Some(expr) => evaluate_input(expr, &outputs),
+            };
+
+            // Bounded loop: repeat_until re-invokes this node on its own
+            // prior output, up to max_iterations. A node without
+            // repeat_until runs exactly once (the loop's `None` arm breaks
+            // immediately).
+            let mut current_input = node_input;
+            let mut iterations: u32 = 0;
+            let result = loop {
+                let r = match run_stage(
+                    &engine,
+                    &backend,
+                    &node.module_bytes,
+                    current_input.clone(),
+                    &job.caps,
+                    &mut handles,
+                    &events,
+                    &cancel,
+                    &mut usage,
+                    started,
+                    index,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(envelope) => break 'run envelope,
+                };
+                match &node.repeat_until {
+                    None => break r,
+                    Some(field) => {
+                        iterations += 1;
+                        let done = r.get(field).and_then(|v| v.as_str()) == Some("done");
+                        if done {
+                            break r;
+                        }
+                        let max = node
+                            .max_iterations
+                            .expect("repeat_until requires max_iterations, enforced at parse time");
+                        if iterations >= max {
+                            usage.duration_ms = started.elapsed().as_millis() as u64;
+                            break 'run fail(
+                                error_codes::SCHEMA_VALIDATION_FAILED,
+                                format!(
+                                    "node `{}` did not reach repeat_until=\"done\" within max_iterations={max}",
+                                    node.name
+                                ),
+                                usage,
+                            );
+                        }
+                        current_input = r;
+                    }
+                }
+            };
+
+            // A branching node: read its `route` field and record the
+            // decision for later nodes' branch-skip check (top of this
+            // loop).
+            //
+            // Whether this node is actually a `branches` decision at all is
+            // determined from `job.exclusive_to` rather than by threading
+            // `Branches` itself into `JobSpec`: `dag::compute_branch_exclusivity`
+            // seeds an entry for every `(label, target)` pair of every declared
+            // decision, so the set of `label`s across all `exclusive_to` entries
+            // whose `decision` names this node IS exactly this decision's full,
+            // valid label set. An unmatched or missing `route` on a genuine
+            // decision node is a job failure — loud, not a silent no-op — per
+            // the design spec's "Conditional dispatch" section.
+            let valid_labels: Vec<&str> = job
+                .exclusive_to
+                .values()
+                .filter(|ex| ex.decision == node.name)
+                .map(|ex| ex.label.as_str())
+                .collect();
+            if !valid_labels.is_empty() {
+                match result.get("route").and_then(|v| v.as_str()) {
+                    Some(route) if valid_labels.contains(&route) => {
+                        route_taken.insert(node.name.clone(), route.to_string());
+                    }
+                    Some(route) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        break 'run fail(
                             error_codes::SCHEMA_VALIDATION_FAILED,
                             format!(
-                                "node `{}` did not reach repeat_until=\"done\" within max_iterations={max}",
+                                "node `{}` produced route \"{route}\", which doesn't match any \
+                                 declared label for this branches decision",
                                 node.name
                             ),
                             usage,
                         );
                     }
-                    current_input = r;
+                    None => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        break 'run fail(
+                            error_codes::SCHEMA_VALIDATION_FAILED,
+                            format!(
+                                "node `{}` is a branches decision but its output has no `route` field",
+                                node.name
+                            ),
+                            usage,
+                        );
+                    }
                 }
+            } else if let Some(route) = result.get("route").and_then(|v| v.as_str()) {
+                // Not a declared decision node, but its output happens to
+                // carry a route field anyway — harmless, record it
+                // defensively (no downstream node's exclusive_to can
+                // reference this decision name if it isn't a real decision,
+                // so this is inert either way, just avoids silently
+                // dropping information that happens to be present).
+                route_taken.insert(node.name.clone(), route.to_string());
             }
-        };
 
-        // A branching node: read its `route` field and record the decision
-        // for later nodes' branch-skip check (top of this loop).
-        //
-        // Whether this node is actually a `branches` decision at all is
-        // determined from `job.exclusive_to` rather than by threading
-        // `Branches` itself into `JobSpec`: `dag::compute_branch_exclusivity`
-        // seeds an entry for every `(label, target)` pair of every declared
-        // decision, so the set of `label`s across all `exclusive_to` entries
-        // whose `decision` names this node IS exactly this decision's full,
-        // valid label set. An unmatched or missing `route` on a genuine
-        // decision node is a job failure — loud, not a silent no-op — per
-        // the design spec's "Conditional dispatch" section.
-        let valid_labels: Vec<&str> = job
-            .exclusive_to
-            .values()
-            .filter(|ex| ex.decision == node.name)
-            .map(|ex| ex.label.as_str())
-            .collect();
-        if !valid_labels.is_empty() {
-            match result.get("route").and_then(|v| v.as_str()) {
-                Some(route) if valid_labels.contains(&route) => {
-                    route_taken.insert(node.name.clone(), route.to_string());
-                }
-                Some(route) => {
-                    usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(
-                        error_codes::SCHEMA_VALIDATION_FAILED,
-                        format!(
-                            "node `{}` produced route \"{route}\", which doesn't match any \
-                             declared label for this branches decision",
-                            node.name
-                        ),
-                        usage,
-                    );
-                }
-                None => {
-                    usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return fail(
-                        error_codes::SCHEMA_VALIDATION_FAILED,
-                        format!(
-                            "node `{}` is a branches decision but its output has no `route` field",
-                            node.name
-                        ),
-                        usage,
-                    );
-                }
+            // Checkpoint a genuinely-executed node's result before recording
+            // it in `outputs` — the ledger write must happen before the
+            // in-memory outputs map update so a crash between the two can't
+            // leave the ledger silently behind the in-memory state (the
+            // in-memory state doesn't survive a crash anyway, so
+            // ledger-first is the only order that matters for durability;
+            // the reverse order would just be a smaller window for the same
+            // underlying property, not correctness).
+            if let Err(e) = ledger.write_completed(&node.name, &result) {
+                usage.duration_ms = started.elapsed().as_millis() as u64;
+                break 'run fail(
+                    error_codes::SCHEMA_VALIDATION_FAILED,
+                    format!(
+                        "recording checkpoint for node `{}` in ledger: {e}",
+                        node.name
+                    ),
+                    usage,
+                );
             }
-        } else if let Some(route) = result.get("route").and_then(|v| v.as_str()) {
-            // Not a declared decision node, but its output happens to carry a
-            // route field anyway — harmless, record it defensively (no
-            // downstream node's exclusive_to can reference this decision
-            // name if it isn't a real decision, so this is inert either way,
-            // just avoids silently dropping information that happens to be
-            // present).
-            route_taken.insert(node.name.clone(), route.to_string());
+            outputs.insert(node.name.clone(), result);
         }
 
-        outputs.insert(node.name.clone(), result);
+        usage.duration_ms = started.elapsed().as_millis() as u64;
+
+        // What is "the" job result for a graph? Convention: the output of the
+        // LAST node in topological order that wasn't skipped. This exactly
+        // matches today's linear-pipeline behavior in the degenerate case (a
+        // linear chain's last node in topo order is its sole sink), and
+        // generalizes sensibly to a branching graph (exactly one path executes,
+        // so there's still a well-defined "last node that actually ran") and to
+        // a fan-in graph without branches (the join/sink node is last in topo
+        // order, since nothing depends on it).
+        //
+        // Known limitation: for a graph with two or more independent sinks (no
+        // edge between them at all — `cuttlefishd`'s daemon path genuinely
+        // accepts such graphs, unlike `cuttlefish build`, which restricts itself
+        // to linear graphs), "last in topological order" is decided by the
+        // topological sort's tie-break (alphabetical node name among ready
+        // nodes), not by any deliberate semantic answer about which sink's
+        // output should represent the job. Don't mistake that tie-break for a
+        // considered multi-sink policy — it isn't one.
+        let result = job
+            .nodes
+            .iter()
+            .rev()
+            .find_map(|n| outputs.get(&n.name).cloned());
+
+        match result {
+            Some(value) => Envelope {
+                status: JobStatus::Completed,
+                result: Some(value),
+                error: None,
+                usage,
+            },
+            None => fail(
+                error_codes::SCHEMA_VALIDATION_FAILED,
+                "every node in this job was skipped; there is no result",
+                usage,
+            ),
+        }
+    };
+
+    let ledger_status = match envelope.status {
+        JobStatus::Completed => "completed",
+        JobStatus::Failed => "failed",
+        JobStatus::Cancelled => "cancelled",
+        _ => "running", // shouldn't occur — defensive only
+    };
+    if let Err(e) = ledger.finish(ledger_status) {
+        // A ledger write failure at this final step doesn't invalidate the
+        // job's already-computed, correct result — losing it here means a
+        // wrong Interrupted-detection on next restart, not a wrong result
+        // now. Loud enough to notice, not loud enough to discard real work
+        // that already succeeded or failed for its own, unrelated reason.
+        eprintln!("warning: failed to record job {ledger_status} status in ledger: {e}");
     }
-
-    usage.duration_ms = started.elapsed().as_millis() as u64;
-
-    // What is "the" job result for a graph? Convention: the output of the
-    // LAST node in topological order that wasn't skipped. This exactly
-    // matches today's linear-pipeline behavior in the degenerate case (a
-    // linear chain's last node in topo order is its sole sink), and
-    // generalizes sensibly to a branching graph (exactly one path executes,
-    // so there's still a well-defined "last node that actually ran") and to
-    // a fan-in graph without branches (the join/sink node is last in topo
-    // order, since nothing depends on it).
-    //
-    // Known limitation: for a graph with two or more independent sinks (no
-    // edge between them at all — `cuttlefishd`'s daemon path genuinely
-    // accepts such graphs, unlike `cuttlefish build`, which restricts itself
-    // to linear graphs), "last in topological order" is decided by the
-    // topological sort's tie-break (alphabetical node name among ready
-    // nodes), not by any deliberate semantic answer about which sink's
-    // output should represent the job. Don't mistake that tie-break for a
-    // considered multi-sink policy — it isn't one.
-    let result = job
-        .nodes
-        .iter()
-        .rev()
-        .find_map(|n| outputs.get(&n.name).cloned());
-
-    match result {
-        Some(value) => Envelope {
-            status: JobStatus::Completed,
-            result: Some(value),
-            error: None,
-            usage,
-        },
-        None => fail(
-            error_codes::SCHEMA_VALIDATION_FAILED,
-            "every node in this job was skipped; there is no result",
-            usage,
-        ),
-    }
+    envelope
 }
 
 /// Run one block to completion, returning what it produced.

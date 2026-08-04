@@ -10,7 +10,9 @@ mod support;
 
 use cuttlefish_core::graph::{Branches, InputExpr, Node, NodeGraph};
 use cuttlefish_host::catalog::ArtifactKind;
-use cuttlefish_host::dag::{check_graph, BranchExclusivity, DagError};
+use cuttlefish_host::dag::{
+    check_graph, graph_fingerprint, BranchExclusivity, CheckedNode, DagError,
+};
 use cuttlefish_host::pipeline::ResolvedInput;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -566,4 +568,57 @@ fn an_unknown_branch_target_is_rejected() {
         }
         other => panic!("expected UnknownReference, got {other:?}"),
     }
+}
+
+/// A minimal `CheckedNode` with a given name and signature — the two fields
+/// `graph_fingerprint` actually reads. Everything else is filled with a
+/// plain, unconditional shape, same convention as `runner.rs` tests' own
+/// `node()` helper.
+fn checked_node(name: &str, signature: cuttlefish_abi::Signature) -> CheckedNode {
+    CheckedNode {
+        name: name.to_string(),
+        kind: ArtifactKind::Block,
+        resolved: None,
+        module_bytes: Vec::new(),
+        signature,
+        input: None,
+        repeat_until: None,
+        max_iterations: None,
+    }
+}
+
+fn sig(input: &str, output: &str) -> cuttlefish_abi::Signature {
+    cuttlefish_abi::Signature {
+        input: input.parse().expect("valid Ty text"),
+        output: output.parse().expect("valid Ty text"),
+    }
+}
+
+#[test]
+fn graph_fingerprint_differs_when_a_node_signature_changes() {
+    let a = vec![checked_node("chunk", sig("{path: text}", "[text]"))];
+    let b = vec![checked_node(
+        "chunk",
+        sig("{path: text}", "{summary: text}"),
+    )];
+
+    assert_ne!(
+        graph_fingerprint(&a),
+        graph_fingerprint(&b),
+        "changing a node's declared signature must change the fingerprint"
+    );
+}
+
+#[test]
+fn graph_fingerprint_is_stable_for_the_same_graph() {
+    let nodes = vec![
+        checked_node("chunk", sig("{path: text}", "[text]")),
+        checked_node("summarize", sig("[text]", "{summary: text}")),
+    ];
+
+    assert_eq!(
+        graph_fingerprint(&nodes),
+        graph_fingerprint(&nodes),
+        "fingerprinting the same graph twice must produce the same string"
+    );
 }

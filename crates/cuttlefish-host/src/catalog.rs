@@ -819,16 +819,24 @@ impl Catalog {
     }
 }
 
+/// The bare `$CUTTLEFISH_HOME`/`~/.cuttlefish` root everything else in this
+/// crate's on-disk layout (the catalog, the jobs directory) is rooted under.
+/// `None` when neither `$CUTTLEFISH_HOME` nor a resolvable home directory is
+/// available — this library never exits the process on a caller's behalf, so
+/// reporting that is the caller's job (both `cuttlefish` and `cuttlefishd`
+/// already have their own error-reporting convention).
+pub(crate) fn cuttlefish_home() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("CUTTLEFISH_HOME") {
+        return Some(PathBuf::from(home));
+    }
+    dirs::home_dir().map(|home| home.join(".cuttlefish"))
+}
+
 /// Where the catalog lives when the caller doesn't say otherwise:
 /// `$CUTTLEFISH_HOME/catalog` if set, else `~/.cuttlefish/catalog`. `None`
-/// when neither is available — this library never exits the process on a
-/// caller's behalf, so reporting that is the caller's job (both `cuttlefish`
-/// and `cuttlefishd` already have their own error-reporting convention).
+/// when neither is available — see [`cuttlefish_home`].
 pub fn default_root() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("CUTTLEFISH_HOME") {
-        return Some(PathBuf::from(home).join("catalog"));
-    }
-    dirs::home_dir().map(|home| home.join(".cuttlefish").join("catalog"))
+    cuttlefish_home().map(|h| h.join("catalog"))
 }
 
 /// The current UTC time, truncated to whole seconds and formatted as RFC

@@ -15,6 +15,7 @@ use cuttlefish_host::{
     catalog::ArtifactKind,
     dag::CheckedNode,
     infer::StubBackend,
+    ledger::Ledger,
     runner::{run_job, JobEvent, JobSpec},
 };
 use std::collections::HashMap;
@@ -22,6 +23,16 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wasmtime::Engine;
+
+/// A fresh, real per-test ledger backed by its own tempdir — same pattern
+/// `ledger.rs`'s own tests use. Returned together with the `TempDir` so the
+/// caller keeps it alive for the ledger's lifetime (the ledger's sqlite file
+/// lives inside it).
+fn test_ledger() -> (tempfile::TempDir, Ledger) {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "test-fingerprint").unwrap();
+    (dir, ledger)
+}
 
 /// Build the example block and return its wasm bytes.
 ///
@@ -108,12 +119,14 @@ async fn runs_a_job_end_to_end() {
     let f = fixture("some document text");
     let (tx, mut rx) = mpsc::channel(64);
 
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         spec(&f, serde_json::json!({ "path": f.doc.to_str().unwrap() })),
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -139,12 +152,14 @@ async fn denies_a_read_outside_the_granted_capability() {
     std::fs::write(&secret, "proprietary").unwrap();
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         spec(&f, serde_json::json!({ "path": secret.to_str().unwrap() })),
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -164,6 +179,7 @@ async fn a_guest_stop_verdict_truncates_generation() {
     let f = fixture("text");
     let (tx, _rx) = mpsc::channel(64);
 
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
@@ -176,6 +192,7 @@ async fn a_guest_stop_verdict_truncates_generation() {
         ),
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -203,12 +220,14 @@ async fn cancelling_before_the_job_starts_yields_cancelled() {
     cancel.cancel();
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         spec(&f, serde_json::json!({ "path": f.doc.to_str().unwrap() })),
         tx,
         cancel,
+        &ledger,
     )
     .await;
 
@@ -223,12 +242,14 @@ async fn malformed_input_fails_with_a_code_rather_than_trapping() {
     let f = fixture("text");
     let (tx, _rx) = mpsc::channel(64);
 
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         spec(&f, serde_json::json!({ "wrong_field": 1 })),
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -244,6 +265,7 @@ async fn a_module_that_is_not_wasm_fails_as_a_trap() {
     let f = fixture("text");
     let (tx, _rx) = mpsc::channel(64);
 
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
@@ -255,6 +277,7 @@ async fn a_module_that_is_not_wasm_fails_as_a_trap() {
         },
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -270,12 +293,14 @@ async fn a_multibyte_document_survives_the_slice_boundary() {
     let f = fixture("héllo wörld ✓ 日本語");
     let (tx, _rx) = mpsc::channel(64);
 
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         spec(&f, serde_json::json!({ "path": f.doc.to_str().unwrap() })),
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -317,12 +342,14 @@ async fn images_sent_to_a_text_only_backend_fail_loudly() {
     std::fs::write(&png, [0x89, b'P', b'N', b'G', 13, 10, 26, 10]).unwrap();
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(TextOnlyBackend),
         spec(&f, serde_json::json!({ "path": png.to_str().unwrap() })),
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -351,12 +378,14 @@ async fn images_reach_a_backend_that_accepts_them() {
     std::fs::write(&png, [0x89, b'P', b'N', b'G', 13, 10, 26, 10]).unwrap();
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         spec(&f, serde_json::json!({ "path": png.to_str().unwrap() })),
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -483,12 +512,14 @@ async fn a_fan_in_node_receives_both_upstream_outputs() {
     };
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         job,
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -546,12 +577,14 @@ export_block!(NeverDone);
     };
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         job,
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -610,12 +643,14 @@ export_block!(DoneFirst);
     };
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         job,
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -706,12 +741,14 @@ export_block!(MustNotRun);
     };
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         job,
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -803,12 +840,14 @@ export_block!(MustNotRun);
     };
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         job,
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -903,12 +942,14 @@ export_block!(MustNotRun);
     };
 
     let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
         job,
         tx,
         CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -925,5 +966,200 @@ export_block!(MustNotRun);
     assert!(
         envelope.result.is_none(),
         "a failed job must never carry a partial result"
+    );
+}
+
+#[tokio::test]
+async fn resuming_skips_a_node_already_checkpointed_in_the_ledger() {
+    // Simulates the resume path a later task's `/resume` endpoint will
+    // drive: a ledger that already has a completed checkpoint for the first
+    // node, handed to a fresh `run_job` call. The first node must not
+    // re-run (it panics if it does), and its cached output must be exactly
+    // what the second node sees.
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    let must_not_run = std::fs::read(support::block_with_source(
+        dir.path(),
+        "resume_must_not_run",
+        r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct MustNotRun;
+
+impl Block for MustNotRun {
+    fn start(&mut self, _input: serde_json::Value) -> Command {
+        panic!("this node already has a completed checkpoint and must not re-run");
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!()
+    }
+}
+
+export_block!(MustNotRun);
+"#,
+    ))
+    .unwrap();
+    let echo = std::fs::read(support::block_with_source(
+        dir.path(),
+        "resume_echo",
+        &echo_block_source(),
+    ))
+    .unwrap();
+
+    let mut second = node("second", echo);
+    second.input = Some(InputExpr::FromNode("first".to_string()));
+
+    let job = JobSpec {
+        nodes: vec![node("first", must_not_run), second],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (_ledger_dir, ledger) = test_ledger();
+    let cached_output = serde_json::json!({ "from": "checkpoint" });
+    ledger.write_completed("first", &cached_output).unwrap();
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+    )
+    .await;
+
+    assert_eq!(
+        envelope.status,
+        JobStatus::Completed,
+        "resuming past an already-checkpointed node must not fail the job: {envelope:?}"
+    );
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(
+        result, cached_output,
+        "the second node (an echo) must have received exactly the checkpointed output"
+    );
+}
+
+#[tokio::test]
+async fn resuming_rebuilds_route_taken_from_a_cached_decision_nodes_checkpoint() {
+    // A decision node whose checkpoint is already `completed` (as if a prior
+    // run picked a route and then the process died before reaching either
+    // branch target) must still gate its branch-exclusive children
+    // correctly on resume: the branch NOT taken must stay skipped, and the
+    // branch that WAS taken must actually run — even though the decision
+    // node itself is never re-executed to produce that route "live".
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    // Must never run: proves this test exercises the cached-route path, not
+    // a live re-execution of the decision node.
+    let router = std::fs::read(support::block_with_source(
+        dir.path(),
+        "resume_router",
+        r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct Router;
+
+impl Block for Router {
+    fn start(&mut self, _input: serde_json::Value) -> Command {
+        panic!("the decision node already has a completed checkpoint and must not re-run");
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!()
+    }
+}
+
+export_block!(Router);
+"#,
+    ))
+    .unwrap();
+    let must_not_run_src = r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct MustNotRun;
+
+impl Block for MustNotRun {
+    fn start(&mut self, _input: serde_json::Value) -> Command {
+        panic!("this node is exclusive to a branch that was not taken and must not run");
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!()
+    }
+}
+
+export_block!(MustNotRun);
+"#;
+    let pdf_only = std::fs::read(support::block_with_source(
+        dir.path(),
+        "resume_pdf_only",
+        must_not_run_src,
+    ))
+    .unwrap();
+    let scan_only = std::fs::read(support::block_with_source(
+        dir.path(),
+        "resume_scan_only",
+        &const_block_source("ScanOnly", r#"{ "ran": "scan_only" }"#),
+    ))
+    .unwrap();
+
+    let mut exclusive_to = HashMap::new();
+    exclusive_to.insert(
+        "pdf_only".to_string(),
+        cuttlefish_host::dag::BranchExclusivity {
+            decision: "router".to_string(),
+            label: "pdf".to_string(),
+        },
+    );
+    exclusive_to.insert(
+        "scan_only".to_string(),
+        cuttlefish_host::dag::BranchExclusivity {
+            decision: "router".to_string(),
+            label: "scan".to_string(),
+        },
+    );
+
+    let job = JobSpec {
+        nodes: vec![
+            node("router", router),
+            node("pdf_only", pdf_only),
+            node("scan_only", scan_only),
+        ],
+        exclusive_to,
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (_ledger_dir, ledger) = test_ledger();
+    // The decision was already made and checkpointed before the (simulated)
+    // restart — "scan" was chosen.
+    ledger
+        .write_completed("router", &serde_json::json!({ "route": "scan" }))
+        .unwrap();
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+    )
+    .await;
+
+    assert_eq!(
+        envelope.status,
+        JobStatus::Completed,
+        "resuming past a cached decision node must still gate its branches correctly: {envelope:?}"
+    );
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(
+        result["ran"], "scan_only",
+        "the branch actually taken (per the cached route) must run: {result}"
     );
 }

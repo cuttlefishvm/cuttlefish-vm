@@ -201,6 +201,24 @@ pub fn check_graph(
     })
 }
 
+/// A stable fingerprint of a checked graph's shape and contents — every
+/// node's name and declared signature, joined and hashed. Two graphs with
+/// the same fingerprint are the same, for resume-safety purposes; this
+/// isn't a security boundary, just a "did the loaded spec actually change"
+/// guard, so a simple SHA-256 (already a workspace dependency, same crate
+/// the catalog's own content-hashing uses) is all this needs.
+pub fn graph_fingerprint(nodes: &[CheckedNode]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for node in nodes {
+        hasher.update(node.name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(node.signature.to_string().as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Kahn's algorithm, with the repeat_until exception: an edge from `node`
 /// back to itself (or forming a cycle) is only legal when `node` declares
 /// `repeat_until` — everything else with an unresolved inbound edge after

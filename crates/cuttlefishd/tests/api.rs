@@ -51,7 +51,29 @@ struct Harness {
     doc: std::path::PathBuf,
 }
 
+/// `submit` now resolves a job directory through
+/// `cuttlefish_host::ledger::jobs_root()`, which falls back to the real
+/// `~/.cuttlefish/jobs` when `$CUTTLEFISH_HOME` is unset — exactly the
+/// production behavior, but not something a test suite should ever actually
+/// exercise against a developer's real home directory. Point it at one
+/// shared tempdir for the whole test binary instead.
+///
+/// A `OnceLock` plus its own internal `Once`-style init (via
+/// `get_or_init`, which itself synchronizes concurrent callers) means every
+/// concurrently-running `#[tokio::test]` in this file computes and sets the
+/// exact same value at most once, rather than racing distinct
+/// `std::env::set_var` calls against each other.
+fn ensure_test_cuttlefish_home() {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("CUTTLEFISH_HOME", dir.path());
+        dir
+    });
+}
+
 async fn start() -> Harness {
+    ensure_test_cuttlefish_home();
     let dir = tempfile::tempdir().unwrap();
     let doc = dir.path().join("doc.txt");
     std::fs::write(&doc, "some document text").unwrap();

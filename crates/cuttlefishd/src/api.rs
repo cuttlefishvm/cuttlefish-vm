@@ -91,6 +91,57 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
     }
 
     let id = uuid::Uuid::new_v4().to_string();
+
+    // A durable job directory, minted alongside the job_id: every job gets
+    // its own on-disk ledger from the moment it's submitted, so a process
+    // restart mid-job has something to resume from (later task) rather than
+    // the job simply vanishing.
+    let jobs_root = match cuttlefish_host::ledger::jobs_root() {
+        Some(root) => root,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "could not determine home directory; set CUTTLEFISH_HOME"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let job_dir = jobs_root.join(&id);
+    if let Err(e) = std::fs::create_dir_all(&job_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("creating job directory {}: {e}", job_dir.display())
+            })),
+        )
+            .into_response();
+    }
+    let fingerprint = cuttlefish_host::dag::graph_fingerprint(&st.checked_nodes);
+    let ledger =
+        match cuttlefish_host::ledger::Ledger::open(&job_dir.join("ledger.sqlite"), &fingerprint) {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("opening ledger for job {id}: {e}")
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    if let Err(e) = std::fs::write(job_dir.join("input.json"), req.input.to_string()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("writing input.json for job {id}: {e}")
+            })),
+        )
+            .into_response();
+    }
+
     let cancel = CancellationToken::new();
     st.jobs.insert(Job::new(id.clone(), cancel.clone())).await;
 
@@ -125,7 +176,7 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         id.clone(),
     );
     tokio::spawn(async move {
-        let envelope = run_job(engine, backend, job_spec, tx, cancel).await;
+        let envelope = run_job(engine, backend, job_spec, tx, cancel, &ledger).await;
         store
             .publish(
                 &job_id,

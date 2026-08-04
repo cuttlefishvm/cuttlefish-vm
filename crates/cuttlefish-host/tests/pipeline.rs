@@ -331,6 +331,12 @@ async fn a_pipeline_threads_each_result_into_the_next_block() {
     let third = std::fs::read(tagging_block(dir.path(), "chain_three", "third")).unwrap();
 
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let ledger = cuttlefish_host::ledger::Ledger::open(
+        &ledger_dir.path().join("ledger.sqlite"),
+        "test-fingerprint",
+    )
+    .unwrap();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
@@ -346,6 +352,7 @@ async fn a_pipeline_threads_each_result_into_the_next_block() {
         },
         tx,
         tokio_util::sync::CancellationToken::new(),
+        &ledger,
     )
     .await;
 
@@ -374,6 +381,12 @@ async fn a_failing_stage_ends_the_job_and_names_the_stage() {
     // A later stage that is not wasm at all: it must fail, and the error must
     // say *which* block, or a long pipeline turns debugging into a hunt.
     let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    let ledger_dir = tempfile::tempdir().unwrap();
+    let ledger = cuttlefish_host::ledger::Ledger::open(
+        &ledger_dir.path().join("ledger.sqlite"),
+        "test-fingerprint",
+    )
+    .unwrap();
     let envelope = run_job(
         Arc::new(Engine::default()),
         Arc::new(StubBackend::default()),
@@ -392,6 +405,7 @@ async fn a_failing_stage_ends_the_job_and_names_the_stage() {
         },
         tx,
         tokio_util::sync::CancellationToken::new(),
+        &ledger,
     )
     .await;
 

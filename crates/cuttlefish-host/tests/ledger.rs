@@ -3,14 +3,14 @@ use cuttlefish_host::ledger::Ledger;
 #[test]
 fn a_fresh_ledger_has_no_checkpoints() {
     let dir = tempfile::tempdir().unwrap();
-    let ledger = Ledger::open(&dir.path().join("ledger.sqlite")).unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "test-fingerprint").unwrap();
     assert_eq!(ledger.get_completed("some_node").unwrap(), None);
 }
 
 #[test]
 fn a_completed_checkpoint_round_trips() {
     let dir = tempfile::tempdir().unwrap();
-    let ledger = Ledger::open(&dir.path().join("ledger.sqlite")).unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "test-fingerprint").unwrap();
     let output = serde_json::json!({"summary": "hi"});
     ledger.write_completed("summarize", &output).unwrap();
     assert_eq!(ledger.get_completed("summarize").unwrap(), Some(output));
@@ -19,7 +19,7 @@ fn a_completed_checkpoint_round_trips() {
 #[test]
 fn a_skipped_checkpoint_has_no_output_but_is_recorded() {
     let dir = tempfile::tempdir().unwrap();
-    let ledger = Ledger::open(&dir.path().join("ledger.sqlite")).unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "test-fingerprint").unwrap();
     ledger.write_skipped("handle_pdf").unwrap();
     assert!(ledger.is_skipped("handle_pdf").unwrap());
     assert_eq!(ledger.get_completed("handle_pdf").unwrap(), None);
@@ -28,7 +28,7 @@ fn a_skipped_checkpoint_has_no_output_but_is_recorded() {
 #[test]
 fn job_status_starts_running_and_can_be_finalized() {
     let dir = tempfile::tempdir().unwrap();
-    let ledger = Ledger::open(&dir.path().join("ledger.sqlite")).unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "test-fingerprint").unwrap();
     assert_eq!(
         ledger.job_status().unwrap(),
         cuttlefish_host::ledger::LedgerJobStatus::Running
@@ -45,10 +45,10 @@ fn reopening_an_existing_ledger_preserves_its_checkpoints() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite");
     {
-        let ledger = Ledger::open(&path).unwrap();
+        let ledger = Ledger::open(&path, "test-fingerprint").unwrap();
         ledger.write_completed("a", &serde_json::json!(1)).unwrap();
     }
-    let reopened = Ledger::open(&path).unwrap();
+    let reopened = Ledger::open(&path, "test-fingerprint").unwrap();
     assert_eq!(
         reopened.get_completed("a").unwrap(),
         Some(serde_json::json!(1))
@@ -59,7 +59,7 @@ fn reopening_an_existing_ledger_preserves_its_checkpoints() {
 fn a_real_database_error_is_not_silently_treated_as_no_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite");
-    let ledger = Ledger::open(&path).unwrap();
+    let ledger = Ledger::open(&path, "test-fingerprint").unwrap();
 
     // Drop the checkpoints table out from under the still-open ledger
     // connection via a second connection to the same file. Querying it
@@ -89,4 +89,13 @@ fn a_real_database_error_is_not_silently_treated_as_no_checkpoint() {
         !matches!(skipped, Err(rusqlite::Error::QueryReturnedNoRows)),
         "is_skipped must not report a genuine error as QueryReturnedNoRows: {skipped:?}"
     );
+}
+
+#[test]
+fn reopening_with_a_different_fingerprint_keeps_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    Ledger::open(&path, "original").unwrap();
+    let reopened = Ledger::open(&path, "different").unwrap();
+    assert_eq!(reopened.graph_fingerprint().unwrap(), "original");
 }
