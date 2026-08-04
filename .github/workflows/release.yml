@@ -116,6 +116,12 @@ jobs:
 
   # Cuts the GitHub Release once, before any binary uploads race to create it.
   # Binary jobs below only ever upload assets to an already-existing release.
+  #
+  # Created as a *draft*, deliberately: GitHub's immutable-releases feature
+  # locks a published release's assets the instant it's created, so a
+  # published-on-creation release can never receive the binary uploads the
+  # jobs below need to add afterward. A draft stays mutable. `publish-release`
+  # (after every binary has uploaded) is what actually publishes it.
   create-release:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -124,7 +130,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Create release if it does not already exist
+      - name: Create draft release if it does not already exist
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -133,7 +139,7 @@ jobs:
             echo "release $GITHUB_REF_NAME already exists"
           else
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --title "$GITHUB_REF_NAME" --generate-notes
+              --title "$GITHUB_REF_NAME" --generate-notes --draft
           fi
 
   # Prebuilt `cuttlefish` (CLI) and `cuttlefishd` (daemon) binaries, so using
@@ -219,6 +225,30 @@ jobs:
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/v')
+        # Explicit, because this step's `$VAR`-style interpolation is bash
+        # syntax — the Windows runner's default shell for `run:` is pwsh,
+        # where `$GITHUB_REF_NAME`/`$ASSET` are not the env vars they look
+        # like, silently expanding to empty strings instead of failing loudly.
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+
+  # The release was created as a draft (see create-release) specifically so
+  # every binary upload above lands before GitHub's immutable-releases
+  # feature locks it — publishing (un-drafting) only happens here, once,
+  # after every matrix job in release-binaries has finished uploading its
+  # asset. Publishing early would let the very first successful upload race
+  # ahead of the rest and lock the release before the others get a chance.
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Undraft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
