@@ -678,3 +678,70 @@ async fn resuming_a_job_whose_ledger_fingerprint_does_not_match_is_refused() {
         "a fingerprint-mismatched job must not have run any node"
     );
 }
+
+#[tokio::test]
+async fn concurrent_resume_calls_only_spawn_one_run() {
+    // The bug this guards against: two `POST /jobs/{id}/resume` calls that
+    // both read `status == Interrupted` via the plain, non-atomic pre-flight
+    // check (nothing updates status in between, before this fix existed)
+    // would *both* go on to open the ledger and spawn `run_job` — a genuine
+    // double-execution race against the same sqlite file.
+    //
+    // Exercising this truly at the HTTP layer is not honest: `resume_job`
+    // does a lot of synchronous work (std::fs, rusqlite) between the
+    // pre-flight check and the atomic guard, and a `#[tokio::test]`'s
+    // current-thread runtime only switches tasks at await points, so two
+    // `tokio::join!`ed HTTP requests aren't guaranteed to actually interleave
+    // at the moment that matters. What's actually being guaranteed is a
+    // property of `JobStore::try_start_resume` itself: driven concurrently
+    // via `tokio::join!`, at most one of two calls against the same id may
+    // observe `Interrupted` and win the transition to `Running`. Testing
+    // that directly is a more reliable proof of the guarantee than hoping an
+    // HTTP-level race lands on the right instruction.
+    let jobs = JobStore::default();
+    let id = "race-job".to_string();
+    jobs.mark_interrupted(id.clone()).await;
+
+    // Stand in for both concurrent handlers' earlier, non-atomic
+    // `status == Interrupted` pre-flight check having already passed for
+    // both of them — exactly the window that made the original bug
+    // possible.
+    assert_eq!(
+        jobs.get(&id).await.unwrap().status,
+        cuttlefish_abi::JobStatus::Interrupted
+    );
+    assert_eq!(
+        jobs.get(&id).await.unwrap().status,
+        cuttlefish_abi::JobStatus::Interrupted
+    );
+
+    // Now both race for the one atomic transition that's allowed to actually
+    // spawn `run_job`, driven concurrently rather than called sequentially
+    // in sequence, so this proves the guarantee under real interleaving
+    // rather than under an ordering the test itself imposed.
+    let (a, b) = tokio::join!(jobs.try_start_resume(&id), jobs.try_start_resume(&id));
+
+    let wins = [a.is_some(), b.is_some()]
+        .into_iter()
+        .filter(|won| *won)
+        .count();
+    assert_eq!(
+        wins,
+        1,
+        "exactly one of two concurrent resume attempts must win the race \
+         (a={}, b={})",
+        a.is_some(),
+        b.is_some()
+    );
+    let winner = a.or(b).expect("one call must have won");
+    assert_eq!(
+        winner.status,
+        cuttlefish_abi::JobStatus::Running,
+        "the winner's job must actually be flipped to Running"
+    );
+
+    // The guard stays exclusive after the race too — a third caller arriving
+    // later must still be refused, not slip through because the two racers
+    // "used up" some one-shot state incorrectly.
+    assert!(jobs.try_start_resume(&id).await.is_none());
+}

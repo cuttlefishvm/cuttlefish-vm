@@ -333,6 +333,20 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
         caps: Capabilities::new(st.spec.read_roots.clone()),
     };
 
+    // Atomic guard against a concurrent second /resume call racing to this
+    // same point — only one call may actually win and spawn run_job. This
+    // deliberately sits last, after every fallible pre-flight check above
+    // has already succeeded: flipping status any earlier would risk leaving
+    // the job stuck in a new status with nothing running and no way to
+    // resume it again, if a later check then failed.
+    if st.jobs.try_start_resume(&id).await.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "this job is already being resumed" })),
+        )
+            .into_response();
+    }
+
     let (engine, backend, store, job_id) = (
         st.engine.clone(),
         st.backend.clone(),

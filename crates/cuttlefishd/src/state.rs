@@ -189,4 +189,25 @@ impl JobStore {
             None => false,
         }
     }
+
+    /// Atomically transition a job from `Interrupted` to `Running`, if and
+    /// only if it's still `Interrupted` at the moment this runs — the guard
+    /// against two concurrent `POST /jobs/{id}/resume` calls both winning and
+    /// spawning duplicate `run_job` executions against the same ledger.
+    ///
+    /// Returns the job (with its now-updated status) if this call won the
+    /// race, or `None` if another call already claimed it first (or the job
+    /// doesn't exist). Callers must run every other pre-flight check first —
+    /// this method exists to be the *last* thing before `tokio::spawn`, not a
+    /// replacement for the earlier checks; see `resume_job`'s ordering note.
+    pub async fn try_start_resume(&self, id: &str) -> Option<Job> {
+        let mut jobs = self.jobs.lock().await;
+        match jobs.get_mut(id) {
+            Some(job) if job.status == JobStatus::Interrupted => {
+                job.status = JobStatus::Running;
+                Some(job.clone())
+            }
+            _ => None,
+        }
+    }
 }
