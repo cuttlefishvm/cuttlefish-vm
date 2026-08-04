@@ -122,5 +122,8 @@ fn jobs_root_falls_back_to_cuttlefish_home_jobs_when_unset() {
     std::env::set_var("CUTTLEFISH_HOME", "/tmp/cf-home-test");
     let root = cuttlefish_host::ledger::jobs_root();
     std::env::remove_var("CUTTLEFISH_HOME");
-    assert_eq!(root, Some(std::path::PathBuf::from("/tmp/cf-home-test/jobs")));
+    assert_eq!(
+        root,
+        Some(std::path::PathBuf::from("/tmp/cf-home-test/jobs"))
+    );
 }
