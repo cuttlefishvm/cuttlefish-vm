@@ -431,7 +431,58 @@ pub async fn run_job(
 
         // A branching node: read its `route` field and record the decision
         // for later nodes' branch-skip check (top of this loop).
-        if let Some(route) = result.get("route").and_then(|v| v.as_str()) {
+        //
+        // Whether this node is actually a `branches` decision at all is
+        // determined from `job.exclusive_to` rather than by threading
+        // `Branches` itself into `JobSpec`: `dag::compute_branch_exclusivity`
+        // seeds an entry for every `(label, target)` pair of every declared
+        // decision, so the set of `label`s across all `exclusive_to` entries
+        // whose `decision` names this node IS exactly this decision's full,
+        // valid label set. An unmatched or missing `route` on a genuine
+        // decision node is a job failure — loud, not a silent no-op — per
+        // the design spec's "Conditional dispatch" section.
+        let valid_labels: Vec<&str> = job
+            .exclusive_to
+            .values()
+            .filter(|ex| ex.decision == node.name)
+            .map(|ex| ex.label.as_str())
+            .collect();
+        if !valid_labels.is_empty() {
+            match result.get("route").and_then(|v| v.as_str()) {
+                Some(route) if valid_labels.contains(&route) => {
+                    route_taken.insert(node.name.clone(), route.to_string());
+                }
+                Some(route) => {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return fail(
+                        error_codes::SCHEMA_VALIDATION_FAILED,
+                        format!(
+                            "node `{}` produced route \"{route}\", which doesn't match any \
+                             declared label for this branches decision",
+                            node.name
+                        ),
+                        usage,
+                    );
+                }
+                None => {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return fail(
+                        error_codes::SCHEMA_VALIDATION_FAILED,
+                        format!(
+                            "node `{}` is a branches decision but its output has no `route` field",
+                            node.name
+                        ),
+                        usage,
+                    );
+                }
+            }
+        } else if let Some(route) = result.get("route").and_then(|v| v.as_str()) {
+            // Not a declared decision node, but its output happens to carry a
+            // route field anyway — harmless, record it defensively (no
+            // downstream node's exclusive_to can reference this decision
+            // name if it isn't a real decision, so this is inert either way,
+            // just avoids silently dropping information that happens to be
+            // present).
             route_taken.insert(node.name.clone(), route.to_string());
         }
 
@@ -448,6 +499,15 @@ pub async fn run_job(
     // so there's still a well-defined "last node that actually ran") and to
     // a fan-in graph without branches (the join/sink node is last in topo
     // order, since nothing depends on it).
+    //
+    // Known limitation: for a graph with two or more independent sinks (no
+    // edge between them at all — `cuttlefishd`'s daemon path genuinely
+    // accepts such graphs, unlike `cuttlefish build`, which restricts itself
+    // to linear graphs), "last in topological order" is decided by the
+    // topological sort's tie-break (alphabetical node name among ready
+    // nodes), not by any deliberate semantic answer about which sink's
+    // output should represent the job. Don't mistake that tie-break for a
+    // considered multi-sink policy — it isn't one.
     let result = job
         .nodes
         .iter()

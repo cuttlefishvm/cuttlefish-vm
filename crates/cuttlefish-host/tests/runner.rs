@@ -663,6 +663,21 @@ export_block!(MustNotRun);
     ))
     .unwrap();
 
+    // Exclusive to the branch that IS taken, with a distinctive output so
+    // the job result proves *this* node ran rather than merely that the job
+    // completed.
+    let scan_only = std::fs::read(support::block_with_source(
+        dir.path(),
+        "branch_scan_only",
+        &const_block_source("ScanOnly", r#"{ "ran": "scan_only" }"#),
+    ))
+    .unwrap();
+
+    // Both of `router`'s declared labels get an entry, matching what
+    // `dag::compute_branch_exclusivity` would seed from a real `branches`
+    // decision that declares every label it can produce — a decision with
+    // only one label declared would itself be the route-validation bug this
+    // suite guards against.
     let mut exclusive_to = HashMap::new();
     exclusive_to.insert(
         "pdf_only".to_string(),
@@ -671,9 +686,20 @@ export_block!(MustNotRun);
             label: "pdf".to_string(),
         },
     );
+    exclusive_to.insert(
+        "scan_only".to_string(),
+        cuttlefish_host::dag::BranchExclusivity {
+            decision: "router".to_string(),
+            label: "scan".to_string(),
+        },
+    );
 
     let job = JobSpec {
-        nodes: vec![node("router", router), node("pdf_only", must_not_run)],
+        nodes: vec![
+            node("router", router),
+            node("pdf_only", must_not_run),
+            node("scan_only", scan_only),
+        ],
         exclusive_to,
         input: serde_json::json!({}),
         caps,
@@ -695,5 +721,209 @@ export_block!(MustNotRun);
         "the job must complete: the gated node must be skipped, not run (envelope: {envelope:?})"
     );
     let result = envelope.result.expect("a completed job carries a result");
-    assert_eq!(result["route"], "scan");
+    assert_eq!(
+        result["ran"], "scan_only",
+        "the job result should be the node exclusive to the taken branch: {result}"
+    );
+}
+
+#[tokio::test]
+async fn an_unmatched_route_value_fails_the_job_loudly() {
+    // The router's declared labels are "pdf" and "scan" (per exclusive_to,
+    // below), but it emits "totally_wrong_value" — a typo'd or otherwise
+    // unmatched route. Per the design spec's "Conditional dispatch" section,
+    // this must fail the job loudly rather than silently skip every
+    // branch-exclusive node and let an earlier node's output stand in as
+    // the result.
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    let router = std::fs::read(support::block_with_source(
+        dir.path(),
+        "unmatched_router",
+        &const_block_source("Router", r#"{ "route": "totally_wrong_value" }"#),
+    ))
+    .unwrap();
+    // Neither branch target may run: an unmatched route must fail before
+    // either is reached.
+    let must_not_run_src = r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct MustNotRun;
+
+impl Block for MustNotRun {
+    fn start(&mut self, _input: serde_json::Value) -> Command {
+        panic!("this node must not run when the route is unmatched");
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!()
+    }
+}
+
+export_block!(MustNotRun);
+"#;
+    let pdf_only = std::fs::read(support::block_with_source(
+        dir.path(),
+        "unmatched_pdf_only",
+        must_not_run_src,
+    ))
+    .unwrap();
+    let scan_only = std::fs::read(support::block_with_source(
+        dir.path(),
+        "unmatched_scan_only",
+        must_not_run_src,
+    ))
+    .unwrap();
+
+    let mut exclusive_to = HashMap::new();
+    exclusive_to.insert(
+        "pdf_only".to_string(),
+        cuttlefish_host::dag::BranchExclusivity {
+            decision: "router".to_string(),
+            label: "pdf".to_string(),
+        },
+    );
+    exclusive_to.insert(
+        "scan_only".to_string(),
+        cuttlefish_host::dag::BranchExclusivity {
+            decision: "router".to_string(),
+            label: "scan".to_string(),
+        },
+    );
+
+    let job = JobSpec {
+        nodes: vec![
+            node("router", router),
+            node("pdf_only", pdf_only),
+            node("scan_only", scan_only),
+        ],
+        exclusive_to,
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        envelope.status,
+        JobStatus::Failed,
+        "an unmatched route must fail the job, not silently skip every branch \
+         and complete with a stale result (envelope: {envelope:?})"
+    );
+    assert_eq!(
+        envelope.error.unwrap().code,
+        error_codes::SCHEMA_VALIDATION_FAILED
+    );
+    assert!(
+        envelope.result.is_none(),
+        "a failed job must never carry a partial result"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_route_field_on_a_decision_node_fails_the_job_loudly() {
+    // The router is a genuine branches decision (per exclusive_to, below),
+    // but its output carries no `route` field at all. Without the fix, no
+    // entry is ever recorded in `route_taken` for this decision, so the
+    // branch-skip check never fires and every branch-exclusive node runs
+    // unconditionally — defeating conditional dispatch entirely. Assert the
+    // job fails instead.
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    // Returns a plain object with no `route` field.
+    let router = std::fs::read(support::block_with_source(
+        dir.path(),
+        "routeless_router",
+        &const_block_source("Router", r#"{ "something_else": "x" }"#),
+    ))
+    .unwrap();
+    let must_not_run_src = r#"use cuttlefish_sdk::{export_block, Block, Command, Event};
+
+#[derive(Default)]
+struct MustNotRun;
+
+impl Block for MustNotRun {
+    fn start(&mut self, _input: serde_json::Value) -> Command {
+        panic!("this node must not run when the decision node produced no route");
+    }
+    fn step(&mut self, _event: Event) -> Command {
+        unreachable!()
+    }
+}
+
+export_block!(MustNotRun);
+"#;
+    let pdf_only = std::fs::read(support::block_with_source(
+        dir.path(),
+        "routeless_pdf_only",
+        must_not_run_src,
+    ))
+    .unwrap();
+    let scan_only = std::fs::read(support::block_with_source(
+        dir.path(),
+        "routeless_scan_only",
+        must_not_run_src,
+    ))
+    .unwrap();
+
+    let mut exclusive_to = HashMap::new();
+    exclusive_to.insert(
+        "pdf_only".to_string(),
+        cuttlefish_host::dag::BranchExclusivity {
+            decision: "router".to_string(),
+            label: "pdf".to_string(),
+        },
+    );
+    exclusive_to.insert(
+        "scan_only".to_string(),
+        cuttlefish_host::dag::BranchExclusivity {
+            decision: "router".to_string(),
+            label: "scan".to_string(),
+        },
+    );
+
+    let job = JobSpec {
+        nodes: vec![
+            node("router", router),
+            node("pdf_only", pdf_only),
+            node("scan_only", scan_only),
+        ],
+        exclusive_to,
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (tx, _rx) = mpsc::channel(64);
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(
+        envelope.status,
+        JobStatus::Failed,
+        "a decision node with no route field must fail the job, not run every \
+         branch-exclusive node unconditionally (envelope: {envelope:?})"
+    );
+    assert_eq!(
+        envelope.error.unwrap().code,
+        error_codes::SCHEMA_VALIDATION_FAILED
+    );
+    assert!(
+        envelope.result.is_none(),
+        "a failed job must never carry a partial result"
+    );
 }
