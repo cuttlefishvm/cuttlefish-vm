@@ -142,8 +142,26 @@ impl JobStore {
     /// Best-effort by nature: a job that has already finished is reported as
     /// cancelled-successfully because the caller's intent — "do not keep running
     /// this" — is already satisfied.
+    ///
+    /// A job discovered `Interrupted` at startup is a different case: its
+    /// `CancellationToken` is fresh and wired to nothing (see
+    /// [`Job::interrupted`]), so calling `.cancel()` on it would silently do
+    /// nothing and leave `status` stuck at `Interrupted` forever, while still
+    /// reporting success — unlike an already-terminal job, its final
+    /// disposition is genuinely unresolved (it could still be resumed), so
+    /// "intent already satisfied" doesn't apply. Instead it's transitioned
+    /// directly to `Cancelled` here. That conveniently also closes the loop
+    /// for resume: a resume check against `status == Interrupted` correctly
+    /// refuses a job cancelled this way, with no extra plumbing needed. The
+    /// on-disk ledger still says `Running` — not updated here; a future task
+    /// can decide whether that needs reconciling.
     pub async fn cancel(&self, id: &str) -> bool {
-        match self.jobs.lock().await.get(id) {
+        let mut jobs = self.jobs.lock().await;
+        match jobs.get_mut(id) {
+            Some(job) if job.status == JobStatus::Interrupted => {
+                job.status = JobStatus::Cancelled;
+                true
+            }
             Some(job) => {
                 job.cancel.cancel();
                 true

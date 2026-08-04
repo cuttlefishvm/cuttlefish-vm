@@ -96,6 +96,13 @@ pub mod serve;
 /// this loop opens already exists (its presence is what selected the
 /// directory), so the value recorded at that ledger's original creation is
 /// what's read back, untouched.
+///
+/// A single job directory whose ledger can't be opened or read (e.g.
+/// corrupted by a hard crash mid-write) is logged and skipped, not treated
+/// as fatal — the whole point of this scan is to surface crash damage, so it
+/// must not itself go down because of the very class of crash it looks for.
+/// Only a failure to list `jobs_root` at all is fatal, since that means the
+/// scan cannot proceed in any capacity.
 pub async fn scan_for_interrupted_jobs(
     jobs_root: &std::path::Path,
     current_fingerprint: &str,
@@ -110,10 +117,25 @@ pub async fn scan_for_interrupted_jobs(
         if !ledger_path.exists() {
             continue;
         }
-        let ledger = cuttlefish_host::ledger::Ledger::open(&ledger_path, current_fingerprint)?;
-        if ledger.job_status()? == cuttlefish_host::ledger::LedgerJobStatus::Running {
-            let id = entry.file_name().to_string_lossy().into_owned();
-            jobs.mark_interrupted(id).await;
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let ledger = match cuttlefish_host::ledger::Ledger::open(&ledger_path, current_fingerprint)
+        {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not open ledger for job `{id}` at startup scan, skipping: {e}"
+                );
+                continue;
+            }
+        };
+        match ledger.job_status() {
+            Ok(cuttlefish_host::ledger::LedgerJobStatus::Running) => {
+                jobs.mark_interrupted(id).await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("warning: could not read job status for job `{id}` at startup scan, skipping: {e}");
+            }
         }
     }
     Ok(())

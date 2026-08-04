@@ -79,3 +79,71 @@ async fn a_missing_jobs_root_is_not_an_error() {
         .await
         .expect("a jobs_root that doesn't exist yet (fresh install) must not error");
 }
+
+#[tokio::test]
+async fn one_corrupted_ledger_does_not_abort_the_whole_scan() {
+    let jobs_root = tempfile::tempdir().unwrap();
+
+    // A genuinely healthy job, still running.
+    let healthy_id = "healthy-job";
+    let healthy_ledger_path = jobs_root.path().join(healthy_id).join("ledger.sqlite");
+    {
+        let ledger = Ledger::open(&healthy_ledger_path, "some-fingerprint").unwrap();
+        assert_eq!(
+            ledger.job_status().unwrap(),
+            cuttlefish_host::ledger::LedgerJobStatus::Running,
+        );
+    }
+
+    // A job directory whose ledger file is garbage — e.g. from a hard crash
+    // mid-write. Written directly as bytes rather than through
+    // `Ledger::open`, so it is not a valid sqlite database at all.
+    let corrupted_id = "corrupted-job";
+    let corrupted_dir = jobs_root.path().join(corrupted_id);
+    std::fs::create_dir_all(&corrupted_dir).unwrap();
+    std::fs::write(
+        corrupted_dir.join("ledger.sqlite"),
+        b"not a sqlite database",
+    )
+    .unwrap();
+
+    let jobs = JobStore::default();
+    cuttlefishd::scan_for_interrupted_jobs(jobs_root.path(), "some-fingerprint", &jobs)
+        .await
+        .expect(
+            "one corrupted ledger must not fail the whole scan — that would brick the daemon \
+             on exactly the crash it exists to detect",
+        );
+
+    let healthy_job = jobs
+        .get(healthy_id)
+        .await
+        .expect("the healthy job must still be discovered and marked interrupted");
+    assert_eq!(healthy_job.status, JobStatus::Interrupted);
+
+    assert!(
+        jobs.get(corrupted_id).await.is_none(),
+        "a corrupted ledger should be skipped, not recorded as any particular status"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_an_interrupted_job_transitions_it_to_cancelled() {
+    let jobs = JobStore::default();
+    let job_id = "interrupted-job".to_string();
+    jobs.mark_interrupted(job_id.clone()).await;
+
+    let before = jobs.get(&job_id).await.unwrap();
+    assert_eq!(before.status, JobStatus::Interrupted);
+
+    let existed = jobs.cancel(&job_id).await;
+    assert!(existed, "cancel must report that the job exists");
+
+    let after = jobs.get(&job_id).await.unwrap();
+    assert_eq!(
+        after.status,
+        JobStatus::Cancelled,
+        "an interrupted job's cancel must actually transition it to Cancelled, not leave it \
+         stuck at Interrupted while reporting success"
+    );
+}
