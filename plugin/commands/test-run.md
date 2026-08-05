@@ -46,8 +46,10 @@ it. Don't just re-run `./try-run.sh` — that's already covered. Specifically:
 
 4. **Report**: for each thing tried, say what you expected, what actually
    happened, and whether they matched. Call out anything surprising
-   explicitly. If everything really did work, say specifically what you
-   tried that could plausibly have found a problem and didn't.
+   explicitly — a confusing error message, a case that should have failed
+   and didn't (or vice versa). If everything really did work, say
+   specifically what you tried that could plausibly have found a problem
+   and didn't — don't just say "everything worked."
 
 Black-box only — don't modify code. If you find something that looks like
 a real bug, report it clearly (command run, expected vs. actual, exit

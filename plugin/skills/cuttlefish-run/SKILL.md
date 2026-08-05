@@ -111,7 +111,8 @@ Write `daemon.json` with the new `{pid, spec_path, endpoint, started_at}`.
 Wait (briefly, bounded) for `cuttlefish specs --endpoint <endpoint>` to
 succeed before considering it up — a spec parse error or a bundle-stage
 rejection makes `cuttlefishd` exit immediately; check `daemon.log` if the
-probe never succeeds.
+probe never succeeds. Once the daemon is confirmed up, proceed to
+Auto-resume below.
 
 ## Auto-resume
 
