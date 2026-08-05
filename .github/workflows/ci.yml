@@ -162,6 +162,36 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
 
+  # crates/cuttlefish-host/assets/rhai-interpreter.wasm is a checked-in
+  # binary artifact, not built as part of an ordinary `cargo build
+  # --workspace` (see its own doc comment in cuttlefish-host/src/lib.rs for
+  # why `include_bytes!` requires this). That means it's possible to edit
+  # blocks/rhai-interpreter's source and forget to regenerate/recommit the
+  # asset — this job catches exactly that: it rebuilds the interpreter
+  # fresh and fails if the result differs from what's checked in, the same
+  # "kept in lockstep, fix code or bump deliberately" pattern the `msrv` job
+  # above already applies to the rust-version pin.
+  rhai-interpreter-asset-is-up-to-date:
+    name: Rhai interpreter asset is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Rebuild and diff
+        run: |
+          set -euo pipefail
+          cargo build --release -p cf-block-rhai-interpreter --target wasm32-unknown-unknown --locked
+          if ! cmp -s target/wasm32-unknown-unknown/release/cf_block_rhai_interpreter.wasm \
+                      crates/cuttlefish-host/assets/rhai-interpreter.wasm; then
+            echo "::error::crates/cuttlefish-host/assets/rhai-interpreter.wasm is stale — \
+                  rebuild it with ./scripts/rebuild-rhai-interpreter.sh and commit the result"
+            exit 1
+          fi
+
 # API docs are built and published by .github/workflows/docs.yml. Since this
 # project keeps its documentation in the code, that workflow is the docs build
 # — it is deliberately separate so a docs failure is legible as such.
