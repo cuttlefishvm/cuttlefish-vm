@@ -263,7 +263,7 @@ inside the granted directory. That is the capability check working, not a bug â€
 
 [crossover]: https://www.codeweavers.com/crossover
 
-## Agent tools (Claude Code)
+## Agent tools
 
 This repo carries its own Claude Code plugin marketplace
 (`.claude-plugin/marketplace.json`), so an agent working in a checkout of
@@ -278,8 +278,8 @@ adversarial exercise of the catalog CLI:
 /reload-plugins
 ```
 
-Once this lands on `main`, the same thing works from anywhere without a
-local checkout, using the GitHub shorthand instead of a local path:
+The same thing works from anywhere without a local checkout, using the
+GitHub shorthand instead of a local path:
 
 ```
 /plugin marketplace add cuttlefishvm/cuttlefish-vm
@@ -287,6 +287,12 @@ local checkout, using the GitHub shorthand instead of a local path:
 ```
 
 See [`plugin/README.md`](./plugin/README.md) for what the plugin provides.
+
+The skills themselves are plain bash/CLI instructions with no
+Claude-Code-specific tool references, so they work with any coding agent
+that can run shell commands and read Markdown â€” the install commands
+above are Claude Code's own syntax for adding the marketplace, not the
+only supported way to use what's inside it.
 
 ## Contributing
 
