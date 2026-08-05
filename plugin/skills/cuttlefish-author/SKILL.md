@@ -23,9 +23,8 @@ comfortably in a script.
 
 ## Build
 
-```bash
-nix develop --command cargo build -p cuttlefish
-```
+**REQUIRED SUB-SKILL:** Use cuttlefish-cli to get the `cuttlefish` binary
+before proceeding.
 
 Only `cuttlefish` itself is needed to run `block new`. Building a
 *scaffolded Rust block* additionally needs a real Rust toolchain — that's
