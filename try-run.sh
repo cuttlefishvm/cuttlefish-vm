@@ -14,16 +14,37 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 nix develop --command bash -c '
-  set -e
+  set -eo pipefail
   cargo build -q -p cf-block-echo-summarize --target wasm32-unknown-unknown
   cargo build -q -p cuttlefish -p cuttlefishd
 
   # Everything this run creates — the daemon jobs ledger, the throwaway
   # spec, the endpoint socket, and both daemon logs — lives under one work
   # dir so a single trap cleans it all up, including on a failure partway
-  # through.
+  # through. The trap also has to kill any daemon(s) still running at exit
+  # time — deleting $work out from under a live cuttlefishd only orphans
+  # it holding the socket open, it does not stop it — so both PIDs are
+  # tracked from before either daemon starts (empty is fine: `kill -9`
+  # on an unset/empty PID is a no-op courtesy of the unquoted expansion
+  # below dropping empty words, and is silenced either way).
+  daemon_pid=""
+  daemon_pid2=""
   work="$(mktemp -d)"
-  trap "rm -rf \"$work\"" EXIT
+  trap '\''
+    _trap_exit_code=$?
+    if [ "$_trap_exit_code" -ne 0 ]; then
+      for log in "$work/daemon.log" "$work/daemon2.log"; do
+        if [ -s "$log" ]; then
+          echo
+          echo "--- $log (tail, on failure) ---"
+          tail -n 50 "$log"
+        fi
+      done
+    fi
+    kill -9 $daemon_pid $daemon_pid2 2>/dev/null || true
+    rm -rf "$work"
+    exit "$_trap_exit_code"
+  '\'' EXIT
   export CUTTLEFISH_JOBS_HOME="$work/jobs"
   cf=./target/debug/cuttlefish
   cfd=./target/debug/cuttlefishd
@@ -70,9 +91,12 @@ import json,sys
 jobs = json.load(sys.stdin)
 print(next((j[\"status\"] for j in jobs if j[\"job_id\"] == \"$job_id\"), \"missing\"))
 ")"
-    [ "$status" = "completed" ] && break
+    case "$status" in
+      completed|failed) break ;;
+    esac
     sleep 0.1
   done
+  echo "final status: $status"
   [ "$status" = "completed" ]
   echo "job completed: ok"
 
