@@ -134,6 +134,56 @@ fn validate_name_version(s: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// Reserved Windows device basenames — case-insensitive, and reserved
+/// regardless of any extension (`con.txt` is just as invalid as `con`).
+/// None of these can be created as a directory or file name on Windows.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Validate a `cuttlefish block new` name: must be legal as a Cargo
+/// crate-name component (so `cf-block-<name>` is always a valid package
+/// name for the Rust authoring path, even when a script is what actually
+/// gets scaffolded) and safe as a directory basename on every platform this
+/// project supports.
+///
+/// Deliberately **not** the same validator as [`validate_name_version`]'s
+/// name half: that one allows `.`, which Cargo forbids outright in a crate
+/// name — confirmed empirically (`cargo init --name "cf-block-my.block"`
+/// fails) during this feature's design. A block name must be valid under
+/// *both* authoring paths, not just whichever one happens to be requested,
+/// so a name is never valid under `--lang rhai` and invalid under
+/// `--lang rust`.
+pub fn validate_block_name(name: &str) -> Result<(), CatalogError> {
+    let invalid = |reason: String| CatalogError::InvalidBlockName {
+        name: name.to_string(),
+        reason,
+    };
+
+    if name.is_empty() {
+        return Err(invalid("the name is empty".to_string()));
+    }
+    if !name.chars().next().unwrap().is_ascii_alphabetic() {
+        return Err(invalid("must start with a letter".to_string()));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+    {
+        return Err(invalid(format!(
+            "contains {bad:?}; only letters, digits, '-' and '_' are allowed"
+        )));
+    }
+    if WINDOWS_RESERVED_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(invalid(format!(
+            "\"{name}\" is a reserved name on Windows and can't be used as a directory name there"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Something went wrong reading, writing, or resolving through the catalog.
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -148,6 +198,19 @@ pub enum CatalogError {
     InvalidNameVersion {
         /// The identifier that was rejected.
         name_version: String,
+        /// Why it was rejected, as a sentence fragment.
+        reason: String,
+    },
+    /// The name handed to `cuttlefish block new` isn't legal as a directory
+    /// basename on every platform this project supports, or wouldn't survive
+    /// as the crate-name component of `cf-block-<name>` under the Rust
+    /// authoring path. Distinct from `InvalidNameVersion`: a block name never
+    /// has an `@version` half, so reusing that variant's "is not a
+    /// name@version" wording here would misdescribe the failure.
+    #[error("{name:?} is not a valid block name ({reason})")]
+    InvalidBlockName {
+        /// The name that was rejected.
+        name: String,
         /// Why it was rejected, as a sentence fragment.
         reason: String,
     },

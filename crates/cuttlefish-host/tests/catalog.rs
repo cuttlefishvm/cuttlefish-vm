@@ -5,7 +5,7 @@
 
 mod support;
 
-use cuttlefish_host::catalog::{ArtifactKind, Catalog};
+use cuttlefish_host::catalog::{validate_block_name, ArtifactKind, Catalog};
 use support::block_with;
 use wasmtime::Engine;
 
@@ -65,4 +65,36 @@ fn concurrent_add_of_different_blocks_never_corrupts_the_index() {
         2,
         "both concurrent adds must land: {entries:?}"
     );
+}
+
+#[test]
+fn a_simple_lowercase_name_is_valid() {
+    assert!(validate_block_name("my-block").is_ok());
+}
+
+#[test]
+fn a_name_with_a_dot_is_rejected() {
+    let err = validate_block_name("my.block").unwrap_err();
+    assert!(err.to_string().contains('.'), "{err}");
+}
+
+#[test]
+fn a_name_starting_with_a_digit_is_rejected() {
+    assert!(validate_block_name("1block").is_err());
+}
+
+#[test]
+fn a_windows_reserved_device_name_is_rejected_case_insensitively() {
+    for bad in ["con", "CON", "Con", "aux", "nul", "com1", "lpt9"] {
+        assert!(
+            validate_block_name(bad).is_err(),
+            "{bad} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn a_name_that_only_resembles_a_reserved_name_is_accepted() {
+    assert!(validate_block_name("console").is_ok());
+    assert!(validate_block_name("commander").is_ok());
 }
