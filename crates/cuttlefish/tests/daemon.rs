@@ -131,7 +131,7 @@ async fn submit_returns_a_job_id_immediately_without_waiting_for_completion() {
     std::fs::write(&spec_path, submit_test_spec_src()).unwrap();
     std::fs::write(dir.path().join("block.wasm"), support::example_block()).unwrap();
 
-    let endpoint = dir.path().join("daemon.sock");
+    let endpoint = support::unique_endpoint(dir.path());
     let mut daemon = support::spawn_daemon(&spec_path, &endpoint).await;
 
     // A daemon's *first-ever* job submission pays a one-time cold cost (the
@@ -217,7 +217,7 @@ async fn jobs_lists_a_submitted_job() {
     std::fs::write(&spec_path, submit_test_spec_src()).unwrap();
     std::fs::write(dir.path().join("block.wasm"), support::example_block()).unwrap();
 
-    let endpoint = dir.path().join("daemon.sock");
+    let endpoint = support::unique_endpoint(dir.path());
     let mut daemon = support::spawn_daemon(&spec_path, &endpoint).await;
 
     let submit_output = run_submit(&endpoint);
@@ -255,7 +255,7 @@ async fn resume_on_a_non_interrupted_job_reports_the_daemons_rejection() {
     std::fs::write(&spec_path, submit_test_spec_src()).unwrap();
     std::fs::write(dir.path().join("block.wasm"), support::example_block()).unwrap();
 
-    let endpoint = dir.path().join("daemon.sock");
+    let endpoint = support::unique_endpoint(dir.path());
     let mut daemon = support::spawn_daemon(&spec_path, &endpoint).await;
 
     let submit_output = run_submit(&endpoint);
@@ -298,7 +298,7 @@ async fn cancel_stops_a_job() {
     std::fs::write(dir.path().join("block.wasm"), support::example_block()).unwrap();
     std::fs::write(dir.path().join("doc.txt"), "some document text").unwrap();
 
-    let endpoint = dir.path().join("daemon.sock");
+    let endpoint = support::unique_endpoint(dir.path());
     let mut daemon = support::spawn_daemon(&spec_path, &endpoint).await;
 
     let input =
@@ -370,7 +370,7 @@ async fn shutdown_causes_the_daemon_process_to_exit() {
     std::fs::write(&spec_path, submit_test_spec_src()).unwrap();
     std::fs::write(dir.path().join("block.wasm"), support::example_block()).unwrap();
 
-    let endpoint = dir.path().join("daemon.sock");
+    let endpoint = support::unique_endpoint(dir.path());
     let mut daemon = support::spawn_daemon(&spec_path, &endpoint).await;
 
     let shutdown_output = run_shutdown(&endpoint);

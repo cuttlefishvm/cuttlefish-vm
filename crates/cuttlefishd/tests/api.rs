@@ -137,11 +137,47 @@ fn wasmish_endpoint(dir: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// Serializes every test in this file that spawns the real `cuttlefishd`
+/// binary (as opposed to the ~20+ other tests here that drive `serve::serve`
+/// in-process, which are cheap and stay concurrent).
+///
+/// Each spawned daemon does real cold-start work (wasmtime engine init,
+/// sqlite ledger setup) before it can answer its first request. Under CI's
+/// default test parallelism, these real-process-spawning tests can run
+/// concurrently with each other (and with everything else in this file), and
+/// a tight readiness bound is too tight under that contention — this is the
+/// same root cause as `crates/cuttlefish/tests/support.rs`'s
+/// `DAEMON_SERIAL_GUARD` (see its doc comment), just for this crate's own
+/// binary-spawning tests. Acquiring this guard before spawning ensures at
+/// most one real `cuttlefishd` is ever cold-starting (or running) at a time
+/// in this file, which is the fundamental fix; the generous readiness bound
+/// in `spawn_and_wait_ready` below is defense in depth on top of that, not a
+/// substitute for it.
+///
+/// `tokio::sync::Mutex`, not `std::sync::Mutex`: callers hold the returned
+/// guard across `.await` points for a test's entire body, which is exactly
+/// the pattern `clippy::await_holding_lock` flags for a std mutex.
+static REAL_DAEMON_SERIAL_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Acquire the serialization guard described on [`REAL_DAEMON_SERIAL_GUARD`].
+/// Call this as the first line of any test that spawns the real `cuttlefishd`
+/// binary (i.e. calls [`spawn_and_wait_ready`]), and keep the returned guard
+/// alive (bound to a local, e.g. `let _guard = ...`) for the test's entire
+/// body — not just around the spawn — so no other real-binary-spawning test
+/// can start its own cold start until this one's daemon is fully done with,
+/// not merely started.
+async fn real_daemon_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    REAL_DAEMON_SERIAL_GUARD.lock().await
+}
+
 /// Spawn the real `cuttlefishd` binary and poll `endpoint` until it accepts a
 /// request — the same portable readiness signal every in-process harness in
 /// this file uses (a unix socket never appears on the filesystem in time to
 /// poll for, and a named pipe never appears on the filesystem at all),
 /// against a real spawned OS process instead of an in-process `serve::serve`.
+///
+/// Callers should hold [`real_daemon_test_guard`]'s guard before calling this
+/// — see its doc comment for why.
 ///
 /// Panics (after killing the child) if the daemon never becomes ready, so
 /// callers only need to handle the happy path.
@@ -162,8 +198,16 @@ async fn spawn_and_wait_ready(
     let builder = builder.windows_named_pipe(endpoint);
     let client = builder.build().unwrap();
 
+    // 30s (3000 * 10ms), not the 5s (500 * 10ms) this used to be: that bound
+    // was sized for a fast, idle dev machine, and a genuinely slow or
+    // contended CI runner (see `REAL_DAEMON_SERIAL_GUARD`'s doc comment)
+    // needs real headroom above a single daemon's own cold-start cost. Still
+    // bounded, so an actual hang fails in well under a minute rather than
+    // wedging the job indefinitely. Matches the bound
+    // `crates/cuttlefish/tests/support.rs`'s `spawn_daemon` uses for the same
+    // reason.
     let mut ready = false;
-    for _ in 0..500 {
+    for _ in 0..3000 {
         if client.get("http://localhost/specs").send().await.is_ok() {
             ready = true;
             break;
@@ -913,6 +957,11 @@ async fn shutdown_force_exits_even_with_an_open_sse_stream() {
     // without also ending this test binary and every test running alongside
     // it. So, uniquely among this file's tests, this spawns the genuine
     // `cuttlefishd` binary.
+    //
+    // Held for this test's entire body — see `real_daemon_test_guard`'s doc
+    // comment for why these tests can't cold-start their daemons
+    // concurrently on a contended CI runner.
+    let _daemon_guard = real_daemon_test_guard().await;
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let sock = unique_endpoint(dir.path());
@@ -1101,6 +1150,11 @@ async fn cuttlefishd_starts_without_wasm_flag_and_rejects_a_stray_positional() {
     // Part A: `cuttlefishd <spec> <endpoint>` — no `--wasm` at all — must
     // start exactly as it did back when `endpoint` was the sole optional
     // positional (before `--wasm` existed).
+    //
+    // Held for this test's entire body — see `real_daemon_test_guard`'s doc
+    // comment for why these tests can't cold-start their daemons
+    // concurrently on a contended CI runner.
+    let _daemon_guard = real_daemon_test_guard().await;
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let sock = unique_endpoint(dir.path());
@@ -1218,6 +1272,11 @@ async fn cuttlefishd_wasm_flag_overrides_the_first_node() {
     // separately-compiled `override.wasm` that reports "override" instead.
     // If the flag didn't actually override the first node's bytes, the job's
     // result would still carry "original".
+    //
+    // Held for this test's entire body — see `real_daemon_test_guard`'s doc
+    // comment for why these tests can't cold-start their daemons
+    // concurrently on a contended CI runner.
+    let _daemon_guard = real_daemon_test_guard().await;
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let sock = unique_endpoint(dir.path());
@@ -1305,6 +1364,11 @@ async fn an_endpoint_value_is_never_mistaken_for_a_wasm_flag_value() {
     // shape there was only ever one positional slot after the spec to argue
     // about, but nothing here should tempt the new parser into treating this
     // endpoint value as a wasm path either.
+    //
+    // Held for this test's entire body — see `real_daemon_test_guard`'s doc
+    // comment for why these tests can't cold-start their daemons
+    // concurrently on a contended CI runner.
+    let _daemon_guard = real_daemon_test_guard().await;
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let sock = wasmish_endpoint(dir.path());

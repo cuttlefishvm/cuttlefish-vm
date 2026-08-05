@@ -7,6 +7,33 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+/// A private endpoint for one test.
+///
+/// Tests run concurrently, so each needs its own. On unix that is a socket
+/// inside the test's own tempdir; on Windows a bare filesystem path is not a
+/// valid/usable named pipe name — `cuttlefishd` on Windows listens on a named
+/// pipe, not a filesystem path — so a pipe name is constructed instead,
+/// unique via the process id plus a counter (a pipe name has no tempdir to
+/// live in). Mirrors `crates/cuttlefishd/tests/api.rs`'s own
+/// `unique_endpoint`.
+pub fn unique_endpoint(dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        dir.join("daemon.sock")
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let _ = dir;
+        PathBuf::from(format!(
+            r"\\.\pipe\cuttlefish-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+}
+
 /// Build `cuttlefishd` once per test binary and return its compiled path.
 ///
 /// `env!("CARGO_BIN_EXE_cuttlefishd")` doesn't work here — that's only
