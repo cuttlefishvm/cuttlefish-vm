@@ -39,12 +39,38 @@ fn block_new_rust_scaffolds_a_working_crate() {
     assert!(crate_dir.join("Cargo.toml").exists());
     assert!(crate_dir.join("src/lib.rs").exists());
 
+    // The scaffold pins cuttlefish-sdk to this workspace's own version (see
+    // main.rs's comment on cuttlefish_sdk_version) so that a *published*
+    // cuttlefish binary always scaffolds against a cuttlefish-sdk that
+    // actually exists on crates.io. Inside this checkout, though, the
+    // workspace version can be bumped ahead of what's published (e.g. a
+    // release-prep commit) — so patch the dependency back to the local
+    // crate rather than requiring crates.io to already have it.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    std::fs::create_dir_all(crate_dir.join(".cargo")).unwrap();
+    std::fs::write(
+        crate_dir.join(".cargo/config.toml"),
+        format!(
+            "[patch.crates-io]\ncuttlefish-sdk = {{ path = {:?} }}\n",
+            repo_root.join("crates/cuttlefish-sdk")
+        ),
+    )
+    .unwrap();
+
     // Actually build it — proves the scaffold is real, working Rust, not
     // just plausible-looking text.
+    // Cargo's config discovery walks up from the current directory, not
+    // from --manifest-path — so the patch above is only found if cwd is
+    // inside crate_dir's tree.
     let build = Command::new(env!("CARGO"))
         .args(["build", "--manifest-path"])
         .arg(crate_dir.join("Cargo.toml"))
         .args(["--target", "wasm32-unknown-unknown"])
+        .current_dir(&crate_dir)
         .output()
         .unwrap();
     assert!(
