@@ -153,13 +153,13 @@ const WINDOWS_RESERVED_NAMES: &[&str] = &[
 /// gets scaffolded) and safe as a directory basename on every platform this
 /// project supports.
 ///
-/// Deliberately **not** the same validator as [`validate_name_version`]'s
-/// name half: that one allows `.`, which Cargo forbids outright in a crate
-/// name — confirmed empirically (`cargo init --name "cf-block-my.block"`
-/// fails) during this feature's design. A block name must be valid under
-/// *both* authoring paths, not just whichever one happens to be requested,
-/// so a name is never valid under `--lang rhai` and invalid under
-/// `--lang rust`.
+/// Deliberately **not** the same validator as this catalog's own
+/// `name@version` name half: that one allows `.`, which Cargo forbids
+/// outright in a crate name — confirmed empirically (`cargo init --name
+/// "cf-block-my.block"` fails) during this feature's design. A block name
+/// must be valid under *both* authoring paths, not just whichever one
+/// happens to be requested, so a name is never valid under `--lang rhai`
+/// and invalid under `--lang rust`.
 pub fn validate_block_name(name: &str) -> Result<(), CatalogError> {
     let invalid = |reason: String| CatalogError::InvalidBlockName {
         name: name.to_string(),

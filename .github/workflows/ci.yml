@@ -182,8 +182,20 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Rebuild and diff
+        # RUSTFLAGS here must match scripts/rebuild-rhai-interpreter.sh's
+        # exactly — both remap this checkout's real absolute path to the
+        # same fixed placeholder, so the two rebuilds (this one and
+        # whoever ran the script locally) embed identical panic-location
+        # strings and produce byte-identical output despite running from
+        # different absolute paths. Confirmed empirically: without the
+        # remap, this job failed on the first real run because CI's
+        # checkout path (/home/runner/work/...) differs from any local
+        # checkout path. Also re-declares the getrandom_backend cfg flag
+        # from .cargo/config.toml, since setting RUSTFLAGS here replaces
+        # (does not merge with) that file's own target rustflags.
         run: |
           set -euo pipefail
+          export RUSTFLAGS='--cfg getrandom_backend="custom" --remap-path-prefix='"$(pwd)"'=/cuttlefishvm'
           cargo build --release -p cf-block-rhai-interpreter --target wasm32-unknown-unknown --locked
           if ! cmp -s target/wasm32-unknown-unknown/release/cf_block_rhai_interpreter.wasm \
                       crates/cuttlefish-host/assets/rhai-interpreter.wasm; then
