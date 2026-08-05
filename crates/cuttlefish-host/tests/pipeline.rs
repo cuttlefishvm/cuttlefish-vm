@@ -315,6 +315,7 @@ fn checked_node(
         input,
         repeat_until: None,
         max_iterations: None,
+        script: None,
     }
 }
 
