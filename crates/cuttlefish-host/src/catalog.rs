@@ -650,6 +650,20 @@ pub(crate) fn read_script_signature(bytes: &[u8], label: &str) -> Result<String,
         }
     })?;
 
+    // Compile (parse, don't run) the whole script now, at the earliest point
+    // a human or agent can act on it — same reasoning as the signature-header
+    // check above. Without this, a script with a valid header but a broken
+    // body catalogs fine and only fails at run time, inside
+    // `blocks/rhai-interpreter`, labeled `schema_validation_failed` — a
+    // misleading code for what is really a syntax error the catalog could
+    // have caught up front.
+    rhai::Engine::new()
+        .compile(text)
+        .map_err(|e| CatalogError::UninspectableArtifact {
+            path: PathBuf::from(label),
+            reason: format!("script does not parse: {e}"),
+        })?;
+
     Ok(header.to_string())
 }
 

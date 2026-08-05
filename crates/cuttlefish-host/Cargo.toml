@@ -65,6 +65,12 @@ pdfium-render = { version = "0.9", optional = true, default-features = false, fe
     "thread_safe",
 ] }
 image = { version = "0.25", optional = true }
+# Syntax-checking a Script-kind artifact's body at `catalog add` time (see
+# `catalog::read_script_signature`) — the same version `blocks/rhai-interpreter`
+# executes scripts with, so a script that compiles here is guaranteed to compile
+# there too. Only `Engine::compile` is used (an AST parse, no execution), so none
+# of that block's `no_time`/wasm-target concerns apply on this native target.
+rhai = "1"
 
 [dev-dependencies]
 tempfile = "3"

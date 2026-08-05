@@ -584,6 +584,13 @@ pub mod error_codes {
     pub const CAPABILITY_DENIED: &str = "capability_denied";
     /// Job input did not match the spec's declared shape.
     pub const SCHEMA_VALIDATION_FAILED: &str = "schema_validation_failed";
+    /// A Script-kind block's own logic failed at run time — a Rhai runtime
+    /// error (e.g. an out-of-bounds index, a missing function) surfacing
+    /// from inside the script itself. `catalog add` rejects a script whose
+    /// body doesn't *parse*, so this is specifically a failure that only
+    /// shows up once the script actually runs; it is not a schema mismatch,
+    /// so it does not reuse [`SCHEMA_VALIDATION_FAILED`].
+    pub const SCRIPT_ERROR: &str = "script_error";
     /// The guest trapped — a panic, a bad export signature, or malformed wasm.
     pub const WASM_TRAP: &str = "wasm_trap";
     /// The job exceeded its time budget.
