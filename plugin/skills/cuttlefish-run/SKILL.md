@@ -20,13 +20,8 @@ to use here.
 
 ## Build
 
-```bash
-nix develop --command cargo build -p cuttlefish -p cuttlefishd
-```
-
-Binaries land at `./target/debug/cuttlefish` and `./target/debug/cuttlefishd`.
-Always run cargo/the binaries through `nix develop --command ...` in this
-repo.
+**REQUIRED SUB-SKILL:** Use cuttlefish-cli to get the `cuttlefish`/
+`cuttlefishd` binaries before proceeding.
 
 ## State: `<project_root>/.cuttlefish/`
 
