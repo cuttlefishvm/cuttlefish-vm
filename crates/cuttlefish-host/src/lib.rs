@@ -50,6 +50,21 @@ pub mod ledger;
 pub mod llamacpp;
 pub mod ollama;
 pub mod pipeline;
+
+/// The shared Rhai interpreter's compiled bytes, embedded at compile time.
+///
+/// Stub for now — returns a tiny placeholder wasm module (a real, valid,
+/// minimal module), not the real interpreter, so `pipeline::resolve_and_load`
+/// has something to resolve `Script`-kind entries to before the real
+/// interpreter exists. A later task replaces this function's body with a
+/// real `include_bytes!` of a checked-in interpreter asset — the same item,
+/// same signature, not a new one.
+// TODO(later task): replace with the real embedded interpreter.
+pub fn embedded_rhai_interpreter_bytes() -> &'static [u8] {
+    // The smallest valid wasm module: magic bytes + version, no sections.
+    const MINIMAL_VALID_WASM: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+    MINIMAL_VALID_WASM
+}
 /// Rendering PDF pages out-of-process, so a renderer crash cannot take the
 /// daemon with it.
 #[cfg(feature = "pdf-render")]

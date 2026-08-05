@@ -42,6 +42,9 @@ pub struct Stage {
     pub module_bytes: Vec<u8>,
     /// What it declared.
     pub signature: Signature,
+    /// The script's own source text, for a `Script`-kind stage — `None` for
+    /// `Block`/`Bundle`. Threaded straight from `ResolvedInput::script`.
+    pub script: Option<String>,
 }
 
 /// One pipeline entry's bytes, already resolved and loaded — from disk or
@@ -57,6 +60,11 @@ pub struct ResolvedInput {
     pub resolved: Option<String>,
     /// The raw bytes.
     pub bytes: Vec<u8>,
+    /// The script's own source text, for a `Script`-kind entry — `None` for
+    /// `Block`/`Bundle`. `bytes` for a `Script` entry is the *interpreter's*
+    /// bytes (see `resolve_and_load`), not the script; this field is where
+    /// the actual script text lives through the rest of the pipeline.
+    pub script: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedInput {
@@ -69,6 +77,7 @@ impl std::fmt::Debug for ResolvedInput {
             .field("kind", &self.kind)
             .field("resolved", &self.resolved)
             .field("bytes", &format!("<{} bytes>", self.bytes.len()))
+            .field("script", &self.script)
             .finish()
     }
 }
@@ -180,6 +189,7 @@ pub fn check(engine: &Engine, inputs: &[ResolvedInput]) -> Result<Checked, Pipel
             resolved: input.resolved.clone(),
             module_bytes: input.bytes.clone(),
             signature,
+            script: input.script.clone(),
         });
     }
 
@@ -210,6 +220,33 @@ pub fn read_stage_signature(
                     // here would print the name twice. Pull out just the
                     // reason so `Uninspectable`'s own `{name}: {message}`
                     // formatting is the only place the name appears.
+                    message: match e {
+                        crate::catalog::CatalogError::UninspectableArtifact { reason, .. } => {
+                            reason
+                        }
+                        other => other.to_string(),
+                    },
+                })?;
+            compact
+                .parse::<Signature>()
+                .map_err(|e| PipelineError::Uninspectable {
+                    name: input.name.clone(),
+                    message: format!("cached signature `{compact}` does not parse: {e}"),
+                })
+        }
+        crate::catalog::ArtifactKind::Script => {
+            let script = input
+                .script
+                .as_deref()
+                .ok_or_else(|| PipelineError::Uninspectable {
+                    name: input.name.clone(),
+                    message: "a Script-kind ResolvedInput with no script text — this is an \
+                          internal bug in resolve_and_load, not a user-facing error"
+                        .to_string(),
+                })?;
+            let compact = crate::catalog::read_script_signature(script.as_bytes(), &input.name)
+                .map_err(|e| PipelineError::Uninspectable {
+                    name: input.name.clone(),
                     message: match e {
                         crate::catalog::CatalogError::UninspectableArtifact { reason, .. } => {
                             reason
@@ -297,23 +334,42 @@ pub fn resolve_and_load(
                 kind,
                 resolved: None,
                 bytes,
+                script: None,
             })
         }
         Resolved::Cataloged {
             name_version,
             entry,
         } => {
-            let bytes = catalog.read_blob(&entry)?;
             let name = name_version
                 .split_once('@')
                 .map(|(n, _)| n)
                 .unwrap_or(&name_version)
                 .to_string();
+
+            if entry.kind == crate::catalog::ArtifactKind::Script {
+                let script_bytes = catalog.read_blob(&entry)?;
+                let script =
+                    String::from_utf8(script_bytes).map_err(|e| PipelineError::Uninspectable {
+                        name: name.clone(),
+                        message: format!("cataloged script is not valid UTF-8: {e}"),
+                    })?;
+                return Ok(ResolvedInput {
+                    name,
+                    kind: entry.kind,
+                    resolved: Some(name_version),
+                    bytes: crate::embedded_rhai_interpreter_bytes().to_vec(),
+                    script: Some(script),
+                });
+            }
+
+            let bytes = catalog.read_blob(&entry)?;
             Ok(ResolvedInput {
                 name,
                 kind: entry.kind,
                 resolved: Some(name_version),
                 bytes,
+                script: None,
             })
         }
     }

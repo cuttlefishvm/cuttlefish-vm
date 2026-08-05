@@ -30,6 +30,7 @@ fn resolved_for(dir: &Path, name: &str, input: &str, output: &str) -> ResolvedIn
         kind: ArtifactKind::Block,
         resolved: None,
         bytes: std::fs::read(&path).unwrap(),
+        script: None,
     }
 }
 

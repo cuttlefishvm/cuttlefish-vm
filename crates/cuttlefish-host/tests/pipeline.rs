@@ -34,6 +34,7 @@ fn direct(path: PathBuf) -> ResolvedInput {
         resolved: None,
         bytes: std::fs::read(&path)
             .unwrap_or_else(|e| panic!("reading fixture {}: {e}", path.display())),
+        script: None,
     }
 }
 
@@ -46,6 +47,7 @@ fn direct_bytes(name: &str, kind: ArtifactKind, bytes: Vec<u8>) -> ResolvedInput
         kind,
         resolved: None,
         bytes,
+        script: None,
     }
 }
 
@@ -225,6 +227,7 @@ fn read_stage_signature_matches_what_check_already_produced_for_a_block() {
         kind: ArtifactKind::Block,
         resolved: None,
         bytes: std::fs::read(&block).unwrap(),
+        script: None,
     };
 
     let sig = read_stage_signature(&Engine::default(), &input).unwrap();
@@ -550,4 +553,56 @@ fn a_missing_direct_path_names_the_path() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("block.wasm"), "{err}");
+}
+
+#[test]
+fn resolving_a_cataloged_script_yields_the_interpreter_bytes_and_the_script_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(tmp.path().join("catalog"));
+    let engine = Engine::default();
+
+    let script_path = tmp.path().join("echo.rhai");
+    std::fs::write(
+        &script_path,
+        "//! signature: {n: json} -> {n: json}\ninput\n",
+    )
+    .unwrap();
+    catalog.add("echo@1", &script_path, &engine).unwrap();
+
+    let resolved = resolve_and_load(
+        &catalog,
+        tmp.path(),
+        "echo@1",
+        ResolutionContext::Interactive,
+    )
+    .unwrap();
+
+    assert_eq!(resolved.kind, ArtifactKind::Script);
+    assert!(
+        !resolved.bytes.is_empty(),
+        "should resolve to the interpreter's own wasm bytes"
+    );
+    assert_eq!(
+        resolved.script.as_deref(),
+        Some("//! signature: {n: json} -> {n: json}\ninput\n")
+    );
+}
+
+#[test]
+fn resolving_a_block_never_populates_the_script_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(tmp.path().join("catalog"));
+    let engine = Engine::default();
+    let wasm_path = block_with(tmp.path(), "example", "text", "text");
+    catalog.add("example@1", &wasm_path, &engine).unwrap();
+
+    let resolved = resolve_and_load(
+        &catalog,
+        tmp.path(),
+        "example@1",
+        ResolutionContext::Interactive,
+    )
+    .unwrap();
+    assert_eq!(resolved.kind, ArtifactKind::Block);
+    assert!(resolved.script.is_none());
 }
