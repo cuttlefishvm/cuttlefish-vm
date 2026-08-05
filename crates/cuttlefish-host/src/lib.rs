@@ -54,17 +54,18 @@ pub mod pipeline;
 
 /// The shared Rhai interpreter's compiled bytes, embedded at compile time.
 ///
-/// Stub for now — returns a tiny placeholder wasm module (a real, valid,
-/// minimal module), not the real interpreter, so `pipeline::resolve_and_load`
-/// has something to resolve `Script`-kind entries to before the real
-/// interpreter exists. A later task replaces this function's body with a
-/// real `include_bytes!` of a checked-in interpreter asset — the same item,
-/// same signature, not a new one.
-// TODO(later task): replace with the real embedded interpreter.
+/// This is a checked-in binary asset (`assets/rhai-interpreter.wasm`), not
+/// built dynamically as part of an ordinary `cargo build --workspace` —
+/// `include_bytes!` is resolved by rustc while compiling *this* crate, so
+/// the file must already exist on disk before this crate compiles, and
+/// Cargo has no built-in way to cross-compile a sibling workspace member to
+/// `wasm32-unknown-unknown` first as part of building this one natively.
+/// Regenerate it with `scripts/rebuild-rhai-interpreter.sh` whenever
+/// `blocks/rhai-interpreter`'s source changes, and commit the result — CI
+/// independently checks the asset hasn't drifted (see
+/// `.github/workflows/ci.yml`).
 pub fn embedded_rhai_interpreter_bytes() -> &'static [u8] {
-    // The smallest valid wasm module: magic bytes + version, no sections.
-    const MINIMAL_VALID_WASM: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
-    MINIMAL_VALID_WASM
+    include_bytes!("../assets/rhai-interpreter.wasm")
 }
 /// Rendering PDF pages out-of-process, so a renderer crash cannot take the
 /// daemon with it.

@@ -475,6 +475,7 @@ pub async fn run_job(
                     &backend,
                     &node.module_bytes,
                     current_input.clone(),
+                    node.script.as_deref(),
                     &job.caps,
                     &mut handles,
                     &events,
@@ -664,6 +665,7 @@ async fn run_stage(
     backend: &Arc<dyn InferBackend>,
     module_bytes: &[u8],
     input: serde_json::Value,
+    script: Option<&str>,
     caps: &Capabilities,
     handles: &mut Handles,
     events: &mpsc::Sender<JobEvent>,
@@ -696,6 +698,20 @@ async fn run_stage(
                 usage.clone(),
             ))
         }
+    };
+
+    // A Script-kind stage's `module_bytes` is always the shared interpreter
+    // (see `pipeline::resolve_and_load`), which expects its script text
+    // wrapped alongside the real job input — the interpreter itself never
+    // receives the raw input directly, and this is the one place per job
+    // where that wrapping actually happens, since the script is fixed at
+    // catalog time but the input is only known per job.
+    let input = match script {
+        Some(script) => serde_json::json!({
+            "__cuttlefish_script": script,
+            "input": input,
+        }),
+        None => input,
     };
 
     let mut command = match guest.call_init(&input) {

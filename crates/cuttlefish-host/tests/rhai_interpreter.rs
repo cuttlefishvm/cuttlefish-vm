@@ -6,11 +6,13 @@
 mod support;
 
 use cuttlefish_abi::JobStatus;
+use cuttlefish_core::graph::{Branches, Node, NodeGraph};
 use cuttlefish_host::caps::Capabilities;
-use cuttlefish_host::catalog::ArtifactKind;
-use cuttlefish_host::dag::CheckedNode;
+use cuttlefish_host::catalog::{ArtifactKind, Catalog, ResolutionContext};
+use cuttlefish_host::dag::{check_graph, CheckedNode};
 use cuttlefish_host::infer::StubBackend;
 use cuttlefish_host::module_cache::ModuleCache;
+use cuttlefish_host::pipeline::resolve_and_load;
 use cuttlefish_host::runner::{run_job, JobSpec};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -65,24 +67,18 @@ fn script_node(script_field_value: &str) -> CheckedNode {
     }
 }
 
-/// Wraps `real_input` in the `{"__cuttlefish_script": ..., "input": ...}`
-/// shape `run_stage` constructs for a Script-kind node — this test drives
-/// `run_job` directly (below `run_stage`'s own injection point, which isn't
-/// wired until a later task), so it has to build that shape itself for now.
-fn wrapped_input(script: &str, real_input: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "__cuttlefish_script": script,
-        "input": real_input,
-    })
-}
-
 #[tokio::test]
 async fn a_rhai_scripted_block_computes_pure_output_through_the_real_host() {
     let (tx, _rx) = mpsc::channel(64);
     let job = JobSpec {
         nodes: vec![script_node("#{ doubled: input.n * 2 }")],
         exclusive_to: HashMap::new(),
-        input: wrapped_input("#{ doubled: input.n * 2 }", serde_json::json!({ "n": 21 })),
+        // Raw job input, exactly as a real submitter would supply it —
+        // `run_stage` (not this test) wraps it in `{__cuttlefish_script,
+        // input}` before the guest ever sees it, since a Script-kind
+        // node's script is fixed at catalog time, never re-supplied by
+        // whoever submits the job.
+        input: serde_json::json!({ "n": 21 }),
         caps: Capabilities::new(Vec::new()),
     };
 
@@ -113,7 +109,7 @@ async fn a_rhai_script_can_round_trip_an_infer_call_through_the_real_host() {
     let job = JobSpec {
         nodes: vec![script_node(script)],
         exclusive_to: HashMap::new(),
-        input: wrapped_input(script, serde_json::json!({ "text": "some document text" })),
+        input: serde_json::json!({ "text": "some document text" }),
         caps: Capabilities::new(Vec::new()),
     };
 
@@ -135,4 +131,84 @@ async fn a_rhai_script_can_round_trip_an_infer_call_through_the_real_host() {
     assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
     let result = envelope.result.expect("a completed job carries a result");
     assert_eq!(result["summary"], "a stub summary");
+}
+
+/// The full real path: catalog a `.rhai` file, resolve it via
+/// `resolve_and_load`, check it into a `CheckedNode` via `check_graph`, run
+/// a real job against it via `run_job` — asserting the result matches what
+/// the script computes from the job's real input, WITHOUT the job
+/// submitter ever mentioning `__cuttlefish_script` themselves. That's
+/// `run_stage`'s job to inject, proven here end to end rather than by
+/// hand-constructing a `CheckedNode` with `script` already set (as the
+/// other two tests in this file do, for a narrower unit of coverage).
+#[tokio::test]
+async fn a_script_node_resolved_from_the_catalog_and_run_through_run_job_gets_its_script_injected()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(tmp.path().join("catalog"));
+    let engine = Engine::default();
+
+    let script_path = tmp.path().join("triple.rhai");
+    std::fs::write(
+        &script_path,
+        "//! signature: {n: json} -> {tripled: json}\n#{ tripled: input.n * 3 }\n",
+    )
+    .unwrap();
+    catalog.add("triple@1", &script_path, &engine).unwrap();
+
+    let resolved_input = resolve_and_load(
+        &catalog,
+        tmp.path(),
+        "triple@1",
+        ResolutionContext::Interactive,
+    )
+    .unwrap();
+
+    let mut resolved = HashMap::new();
+    resolved.insert("triple".to_string(), resolved_input);
+
+    let graph = NodeGraph {
+        nodes: vec![(
+            "triple".to_string(),
+            Node {
+                block: std::path::PathBuf::new(),
+                input: None,
+                repeat_until: None,
+                max_iterations: None,
+            },
+        )],
+    };
+
+    let checked = check_graph(&engine, &graph, &Branches::default(), &resolved)
+        .expect("a single Script node with a valid signature header must typecheck");
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: checked.nodes,
+        exclusive_to: checked.exclusive_to,
+        // The real job input — nothing here mentions __cuttlefish_script;
+        // run_stage constructs that wrapper on its own from the node's
+        // script field.
+        input: serde_json::json!({ "n": 14 }),
+        caps: Capabilities::new(Vec::new()),
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(engine),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["tripled"], 42);
 }
