@@ -2202,4 +2202,36 @@ mod tests {
              constructed, got {err:?}"
         );
     }
+
+    #[test]
+    fn a_simple_lowercase_name_is_valid() {
+        assert!(validate_block_name("my-block").is_ok());
+    }
+
+    #[test]
+    fn a_name_with_a_dot_is_rejected() {
+        let err = validate_block_name("my.block").unwrap_err();
+        assert!(err.to_string().contains('.'), "{err}");
+    }
+
+    #[test]
+    fn a_name_starting_with_a_digit_is_rejected() {
+        assert!(validate_block_name("1block").is_err());
+    }
+
+    #[test]
+    fn a_windows_reserved_device_name_is_rejected_case_insensitively() {
+        for bad in ["con", "CON", "Con", "aux", "nul", "com1", "lpt9"] {
+            assert!(
+                validate_block_name(bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_only_resembles_a_reserved_name_is_accepted() {
+        assert!(validate_block_name("console").is_ok());
+        assert!(validate_block_name("commander").is_ok());
+    }
 }
