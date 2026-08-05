@@ -516,6 +516,28 @@ pub async fn run_job(
                 }
             };
 
+            // Nothing checked a block's *actual* output against what it
+            // declared until this existed: a Script or Rust block could
+            // claim `{summary: text}` and return `{text: "..."}` and the
+            // job would still complete "successfully", silently handing
+            // whatever consumed `summary` a `null`. `matches_value` is
+            // deliberately permissive about `bytes`/`image`/`document` (see
+            // its own doc comment) so this only ever catches genuine shape
+            // mismatches, not false positives on types this protocol has no
+            // fixed JSON encoding for.
+            if !node.signature.output.matches_value(&result) {
+                usage.duration_ms = started.elapsed().as_millis() as u64;
+                break 'run fail(
+                    error_codes::SCHEMA_VALIDATION_FAILED,
+                    format!(
+                        "node `{}` declared its output as `{}` but produced {result}, which \
+                         doesn't match",
+                        node.name, node.signature.output
+                    ),
+                    usage,
+                );
+            }
+
             // A branching node: read its `route` field and record the
             // decision for later nodes' branch-skip check (top of this
             // loop).

@@ -110,6 +110,36 @@ impl Ty {
         }
     }
 
+    /// Whether a live JSON value could plausibly be an instance of this
+    /// type — a runtime counterpart to [`Self::assignable_to`], which only
+    /// ever compares two declared `Ty`s against each other. Nothing in the
+    /// host checked a block's *actual* output against what it declared
+    /// until this existed: a block could claim `{summary: text}` and return
+    /// `{text: "..."}` and nothing downstream would notice until whatever
+    /// consumed `summary` got `null`.
+    ///
+    /// Deliberately permissive, not a full validator: [`Ty::Bytes`],
+    /// [`Ty::Image`], and [`Ty::Document`] have no fixed JSON shape defined
+    /// anywhere in this protocol (unlike [`Ty::Text`]/[`Ty::List`]/
+    /// [`Ty::Record`], which map onto JSON strings/arrays/objects
+    /// unambiguously) — inventing a shape for them here risks rejecting
+    /// legitimate values a real block already produces. Those three, like
+    /// [`Ty::Json`], accept anything.
+    pub fn matches_value(&self, value: &serde_json::Value) -> bool {
+        match self {
+            Ty::Json | Ty::Bytes | Ty::Image | Ty::Document => true,
+            Ty::Text => value.is_string(),
+            Ty::List(inner) => value
+                .as_array()
+                .is_some_and(|items| items.iter().all(|v| inner.matches_value(v))),
+            Ty::Record(fields) => value.as_object().is_some_and(|obj| {
+                fields
+                    .iter()
+                    .all(|(name, want)| obj.get(name).is_some_and(|v| want.matches_value(v)))
+            }),
+        }
+    }
+
     /// A short human-readable rendering, for error messages.
     pub fn describe(&self) -> String {
         match self {
@@ -633,5 +663,50 @@ mod tests {
     #[test]
     fn a_signature_with_an_unparseable_side_is_rejected() {
         assert!("text -> not a type".parse::<Signature>().is_err());
+    }
+
+    #[test]
+    fn text_matches_a_json_string_only() {
+        assert!(Ty::Text.matches_value(&serde_json::json!("hello")));
+        assert!(!Ty::Text.matches_value(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn json_matches_anything() {
+        assert!(Ty::Json.matches_value(&serde_json::json!(null)));
+        assert!(Ty::Json.matches_value(&serde_json::json!([1, "two", {}])));
+    }
+
+    #[test]
+    fn a_record_missing_a_declared_field_does_not_match() {
+        let ty = Ty::Record([("summary".to_string(), Ty::Text)].into_iter().collect());
+        assert!(!ty.matches_value(&serde_json::json!({"text": "hello world"})));
+    }
+
+    #[test]
+    fn a_record_with_the_declared_field_present_and_well_typed_matches() {
+        let ty = Ty::Record([("summary".to_string(), Ty::Text)].into_iter().collect());
+        assert!(ty.matches_value(&serde_json::json!({"summary": "hi", "extra": 1})));
+    }
+
+    #[test]
+    fn a_record_with_a_wrong_typed_declared_field_does_not_match() {
+        let ty = Ty::Record([("summary".to_string(), Ty::Text)].into_iter().collect());
+        assert!(!ty.matches_value(&serde_json::json!({"summary": 42})));
+    }
+
+    #[test]
+    fn a_list_matches_only_when_every_element_matches_the_inner_type() {
+        let ty = Ty::List(Box::new(Ty::Text));
+        assert!(ty.matches_value(&serde_json::json!(["a", "b"])));
+        assert!(!ty.matches_value(&serde_json::json!(["a", 2])));
+        assert!(!ty.matches_value(&serde_json::json!("not a list")));
+    }
+
+    #[test]
+    fn bytes_image_and_document_accept_anything() {
+        for ty in [Ty::Bytes, Ty::Image, Ty::Document] {
+            assert!(ty.matches_value(&serde_json::json!(123)));
+        }
     }
 }
