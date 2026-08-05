@@ -150,7 +150,7 @@ $ nix develop --command bash -c '
     cargo build -p cf-block-echo-summarize --target wasm32-unknown-unknown &&
     cargo build -p cuttlefishd -p cuttlefish &&
     ./target/debug/cuttlefishd examples/summarize.cuttlefish \
-      target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm /tmp/cf.sock &
+      --wasm target/wasm32-unknown-unknown/debug/cf_block_echo_summarize.wasm /tmp/cf.sock &
     until [ -S /tmp/cf.sock ]; do sleep 0.1; done
     ./target/debug/cuttlefish run --socket /tmp/cf.sock --spec summarize_docs \
       --input "{\"path\": \"examples/docs/a.txt\"}"
@@ -236,7 +236,7 @@ $ cxbottle --create --bottle cuttlefish --template win10_64   # once
 $ export CX_BOTTLE=cuttlefish WINEDEBUG=-all
 $ cp target/x86_64-pc-windows-gnu/debug/*.exe \
     ~/Library/Application\ Support/CrossOver/Bottles/cuttlefish/drive_c/
-$ wine 'c:\cuttlefishd.exe' 'c:\specs\summarize.cuttlefish' "" '\\.\pipe\cuttlefish' &
+$ wine 'c:\cuttlefishd.exe' 'c:\specs\summarize.cuttlefish' --wasm 'c:\blocks\summarize.wasm' '\\.\pipe\cuttlefish' &
 $ wine 'c:\cuttlefish.exe' specs --endpoint '\\.\pipe\cuttlefish'
 ```
 

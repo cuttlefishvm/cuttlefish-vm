@@ -22,7 +22,7 @@ use cuttlefish_host::{
 };
 use futures_util::{stream::Stream, StreamExt};
 use serde::Deserialize;
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wasmtime::Engine;
@@ -43,6 +43,12 @@ pub struct AppState {
     /// Which nodes are exclusive to which branch decision+label.
     pub exclusive_to:
         Arc<std::collections::HashMap<String, cuttlefish_host::dag::BranchExclusivity>>,
+    /// Notified once, by the `/shutdown` handler, to trigger axum's graceful
+    /// shutdown — see `serve::serve`. `Notify` (not a oneshot) because
+    /// `AppState` is `Clone` and cheaply shared across every handler; a
+    /// oneshot's single-consumption `Sender` doesn't fit a type that gets
+    /// cloned per-request.
+    pub shutdown: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// A job submission.
@@ -63,6 +69,7 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/jobs/{id}/events", get(job_events))
         .route("/jobs/{id}/resume", post(resume_job))
+        .route("/shutdown", post(shutdown))
         .with_state(state)
 }
 
@@ -364,6 +371,56 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
     });
 
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Ask the daemon to stop accepting new connections and exit cleanly, once
+/// any in-flight request finishes. Portable graceful-stop primitive for
+/// `cuttlefish-run`'s "stop the old daemon, start a new one for a different
+/// spec" flow — deliberately an HTTP route rather than a `SIGTERM` handler,
+/// since Windows (which this daemon already supports via named pipes) has
+/// no signal `cuttlefishd` could portably install a handler for.
+///
+/// A long-lived SSE subscriber on `/jobs/{id}/events` would otherwise block
+/// axum's graceful shutdown indefinitely — it only closes a connection once
+/// its current response finishes, and an SSE response doesn't finish until
+/// the job completes *and* the client disconnects (`job_events`'s stream
+/// stays open even after the job is done, so the store can still serve a
+/// replay to a client that attaches later). So this also schedules a bounded
+/// force-exit: if the process hasn't gone down gracefully within
+/// `shutdown_grace()`, it exits anyway, guaranteeing `/shutdown` always
+/// results in a bounded-time stop regardless of what any subscriber is doing.
+async fn shutdown(State(st): State<AppState>) -> impl IntoResponse {
+    st.shutdown.notify_one();
+    tokio::spawn(async move {
+        tokio::time::sleep(shutdown_grace()).await;
+        std::process::exit(0);
+    });
+    StatusCode::ACCEPTED
+}
+
+/// The env var [`shutdown_grace`] checks before falling back to its default.
+///
+/// Read rather than a bare `const` so a test can shrink the wait to something
+/// a test suite can afford to actually sit through — spawning the real
+/// `cuttlefishd` binary is the only honest way to prove a *process* actually
+/// exits (see `tests/api.rs`), and that test would otherwise cost the full
+/// ten-second default per run. Production never sets this, so it always gets
+/// the documented default.
+const SHUTDOWN_GRACE_MS_ENV: &str = "CUTTLEFISH_SHUTDOWN_GRACE_MS";
+
+/// How long `/shutdown` waits for axum's normal graceful path before forcing
+/// the process down (see `shutdown`). Ten seconds comfortably exceeds any
+/// single request this daemon serves — job submission, status checks, and
+/// event replay all return in well under a second — while still being short
+/// enough that the "stop the old daemon, start a new one" flow this
+/// mechanism exists for never stalls noticeably from an operator's or
+/// agent's point of view.
+fn shutdown_grace() -> Duration {
+    std::env::var(SHUTDOWN_GRACE_MS_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(10))
 }
 
 /// Live event stream, replaying anything already emitted.

@@ -819,12 +819,14 @@ impl Catalog {
     }
 }
 
-/// The bare `$CUTTLEFISH_HOME`/`~/.cuttlefish` root everything else in this
-/// crate's on-disk layout (the catalog, the jobs directory) is rooted under.
-/// `None` when neither `$CUTTLEFISH_HOME` nor a resolvable home directory is
-/// available — this library never exits the process on a caller's behalf, so
-/// reporting that is the caller's job (both `cuttlefish` and `cuttlefishd`
-/// already have their own error-reporting convention).
+/// The bare `$CUTTLEFISH_HOME`/`~/.cuttlefish` root the catalog and most of
+/// this crate's other on-disk layout is rooted under (the jobs directory is
+/// the exception: it honors `$CUTTLEFISH_JOBS_HOME` first, see
+/// `ledger::jobs_root`). `None` when neither `$CUTTLEFISH_HOME` nor a
+/// resolvable home directory is available — this library never exits the
+/// process on a caller's behalf, so reporting that is the caller's job (both
+/// `cuttlefish` and `cuttlefishd` already have their own error-reporting
+/// convention).
 pub(crate) fn cuttlefish_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("CUTTLEFISH_HOME") {
         return Some(PathBuf::from(home));

@@ -38,6 +38,7 @@ wasmtime = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+uuid = { workspace = true }
 
 [package.metadata.docs.rs]
 # Match the `--cfg docsrs` used by .github/workflows/docs.yml, so docs.rs and
