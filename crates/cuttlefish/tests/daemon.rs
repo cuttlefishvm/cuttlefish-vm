@@ -43,7 +43,7 @@ async fn submit_returns_a_job_id_immediately_without_waiting_for_completion() {
     std::fs::write(dir.path().join("block.wasm"), support::example_block()).unwrap();
 
     let endpoint = dir.path().join("daemon.sock");
-    let mut child = support::spawn_daemon(&spec_path, &endpoint).await;
+    let mut daemon = support::spawn_daemon(&spec_path, &endpoint).await;
 
     // A daemon's *first-ever* job submission pays a one-time cold cost (the
     // job's ledger/sqlite file gets created from scratch) that can run into
@@ -68,7 +68,10 @@ async fn submit_returns_a_job_id_immediately_without_waiting_for_completion() {
     .await;
     let elapsed = started.elapsed();
 
-    let _ = child.kill();
+    // Explicit at this test's natural end for clarity, though redundant with
+    // `DaemonGuard`'s `Drop` — which is what actually protects the panics
+    // above (e.g. the warm-up call's `.unwrap()`) from leaking the process.
+    daemon.kill();
 
     let output = result
         .expect(

@@ -5,6 +5,7 @@
 //! transport, nothing mocked.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 /// Build `cuttlefishd` once per test binary and return its compiled path.
 ///
@@ -77,18 +78,61 @@ pub fn ensure_test_cuttlefish_home() {
     });
 }
 
+/// A spawned `cuttlefishd` child that is killed automatically when this value
+/// is dropped — on a normal return, an early return, *or* a panic unwinding
+/// through the test that owns it.
+///
+/// `cuttlefishd` never exits on its own; it just listens forever. Without
+/// this guard, any fallible step between [`spawn_daemon`] and a test's own
+/// cleanup (e.g. an `.unwrap()` on a warm-up call) would skip straight past
+/// the manual `child.kill()` at the end and orphan the process.
+pub struct DaemonGuard {
+    child: std::process::Child,
+}
+
+impl DaemonGuard {
+    /// Kill the daemon early, ignoring errors (e.g. it already exited).
+    /// Calling this is optional — `Drop` kills it regardless — but doing so
+    /// explicitly at a test's natural end can make the intent clearer.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        // Best-effort: killing an already-exited child just errors, which we
+        // don't care about here.
+        let _ = self.child.kill();
+    }
+}
+
 /// Spawn `cuttlefishd` against `spec_path`/`endpoint`, wait (briefly,
 /// bounded) for it to actually accept connections before returning, and
-/// return the child so the caller can kill it in a cleanup step.
+/// return a [`DaemonGuard`] that kills it on drop no matter how the caller's
+/// test function exits.
+///
+/// The child's stdout/stderr are piped (not inherited), mirroring
+/// `crates/cuttlefishd/tests/api.rs`'s own `spawn_and_wait_ready` — otherwise
+/// `cuttlefishd`'s own log lines (e.g. "listening on ...") print straight
+/// into test output, bypassing the test harness's usual output capture.
 ///
 /// Panics (after killing the child) if the daemon never becomes ready, so
 /// callers only need to handle the happy path.
-pub async fn spawn_daemon(spec_path: &Path, endpoint: &Path) -> std::process::Child {
-    let mut child = std::process::Command::new(cuttlefishd_binary())
+pub async fn spawn_daemon(spec_path: &Path, endpoint: &Path) -> DaemonGuard {
+    let child = std::process::Command::new(cuttlefishd_binary())
         .arg(spec_path)
         .arg(endpoint)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("cuttlefishd failed to start");
+
+    // Wrap in the guard immediately, before any further fallible step (e.g.
+    // `client.build().unwrap()` below) — so a panic anywhere from here on
+    // still kills the child via `Drop`, rather than only the explicit
+    // `child.kill()` in the not-ready branch below covering it.
+    let mut guard = DaemonGuard { child };
 
     let builder = reqwest::Client::builder();
     #[cfg(unix)]
@@ -98,20 +142,20 @@ pub async fn spawn_daemon(spec_path: &Path, endpoint: &Path) -> std::process::Ch
     let client = builder.build().unwrap();
 
     let mut ready = false;
-    for _ in 0..50 {
+    for _ in 0..500 {
         if client.get("http://localhost/specs").send().await.is_ok() {
             ready = true;
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     if !ready {
-        let _ = child.kill();
+        guard.kill();
         panic!(
             "cuttlefishd did not become ready in time on {}",
             endpoint.display()
         );
     }
-    child
+    guard
 }
