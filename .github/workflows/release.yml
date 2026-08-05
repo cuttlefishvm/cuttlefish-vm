@@ -234,6 +234,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
 
+  # release-binaries uploads 5 archives with nothing to verify them against.
+  # Matrix jobs run in isolation and can't see each other's output, so this
+  # can't be a sixth matrix leg — it runs after all five, downloads what they
+  # uploaded, and hashes it in one place.
+  checksums:
+    name: Generate SHA256SUMS
+    needs: release-binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets and hash them
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir assets && cd assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern '*'
+          # A re-run of this job (after a prior partial failure, say) would
+          # re-download an already-uploaded SHA256SUMS alongside the
+          # binaries. Excluding it from the input list before hashing
+          # avoids a file hashing itself and the redirect target racing
+          # its own glob.
+          rm -f SHA256SUMS
+          sha256sum * > SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+
   # The release was created as a draft (see create-release) specifically so
   # every binary upload above lands before GitHub's immutable-releases
   # feature locks it — publishing (un-drafting) only happens here, once,
@@ -243,7 +271,7 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: release-binaries
+    needs: checksums
     runs-on: ubuntu-latest
     permissions:
       contents: write

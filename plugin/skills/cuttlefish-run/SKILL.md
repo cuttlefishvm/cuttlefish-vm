@@ -20,13 +20,8 @@ to use here.
 
 ## Build
 
-```bash
-nix develop --command cargo build -p cuttlefish -p cuttlefishd
-```
-
-Binaries land at `./target/debug/cuttlefish` and `./target/debug/cuttlefishd`.
-Always run cargo/the binaries through `nix develop --command ...` in this
-repo.
+**REQUIRED SUB-SKILL:** Use cuttlefish-cli to get the `cuttlefish`/
+`cuttlefishd` binaries before proceeding.
 
 ## State: `<project_root>/.cuttlefish/`
 
@@ -166,6 +161,29 @@ cuttlefish cancel --endpoint <endpoint> <job_id>
 `cuttlefish run` (unchanged, pre-existing) still blocks until one specific
 job finishes — use it only when actually waiting for a single result is
 the right thing to do, not as the default way to kick off work.
+
+## Running as a dispatched agent
+
+For an actual job run — not a quick one-off check like `cuttlefish jobs`
+— prefer dispatching a subagent (a plain `general-purpose` one; no custom
+subagent type is needed for this) via the `Agent` tool whose entire task
+is: follow this skill's ensure-daemon/submit/poll/auto-resume procedure
+for one spec + input, and report back the final job result. Two reasons:
+
+- **Transcript identity.** Driving the full lifecycle inline renders as
+  an anonymous run of collapsed "Ran N shell commands" entries,
+  indistinguishable from anything else the session did. A dispatched
+  subagent gets its own named, trackable block — the same rendering
+  `Agent`-dispatched work already gets everywhere else.
+- **Clean handoff.** The calling session's transcript reduces to
+  "dispatched a cuttlefish run, here's what it returned" instead of the
+  raw polling loop.
+
+This is a recommendation, not a requirement — a quick status check, or
+anything already running inside a test harness (`test-run.md` and the
+other `test-*.md` commands adversarially test *this checkout's* behavior
+directly and should keep doing so inline, not through a layer of dispatch
+that would obscure a failure's origin), still runs inline as before.
 
 ## Things worth knowing
 

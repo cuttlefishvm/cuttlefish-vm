@@ -13,6 +13,10 @@ distributable `.cfbundle`) plus a `/cuttlefish-agent-tools:test-build`
 command that drives an agent through an independent, adversarial exercise
 of the build CLI.
 
+These skills are plain bash/CLI instructions with no Claude-Code-specific
+tool references — usable by any coding agent that can run shell commands
+and read Markdown, not just Claude Code.
+
 ## Install (from this repo)
 
 ```

@@ -13,13 +13,8 @@ filesystem operations — no daemon, no network.
 
 ## Build
 
-```bash
-nix develop --command cargo build -p cuttlefish
-```
-
-Binary lands at `./target/debug/cuttlefish`. Always run cargo/the binary
-through `nix develop --command ...` in this repo — the system toolchain is a
-different, unsupported version.
+**REQUIRED SUB-SKILL:** Use cuttlefish-cli to get the `cuttlefish` binary
+before proceeding.
 
 ## Command
 

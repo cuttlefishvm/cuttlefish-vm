@@ -23,9 +23,8 @@ comfortably in a script.
 
 ## Build
 
-```bash
-nix develop --command cargo build -p cuttlefish
-```
+**REQUIRED SUB-SKILL:** Use cuttlefish-cli to get the `cuttlefish` binary
+before proceeding.
 
 Only `cuttlefish` itself is needed to run `block new`. Building a
 *scaffolded Rust block* additionally needs a real Rust toolchain — that's
@@ -185,6 +184,16 @@ directly. Always `catalog add` first, then reference by `name@version`.
 - Versions are immutable for scripts exactly as for compiled blocks —
   re-authoring means scaffolding (or hand-editing) a new version, never
   editing a cataloged one in place.
+- **An `infer()` answer that doesn't parse into what the script expects
+  should fail the job, not silently default.** A real script hit this: a
+  truncated model reply (from a `max_tokens` cap that was too low)
+  resolved to a fallback value that *looked* like a genuine judgment —
+  indistinguishable downstream from a real one, until the raw verdict was
+  added to the output and inspected by hand. `throw` on an unreadable
+  answer instead of defaulting; verify the failure path actually fires
+  against a `Stub` spec (a `Stub` model's literal reply text is easy to
+  make deliberately unparseable, which is exactly what proves the `throw`
+  path works before a real model ever hits it).
 
 ## Verifying end to end
 
