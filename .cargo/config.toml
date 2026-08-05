@@ -1,0 +1,10 @@
+# blocks/rhai-interpreter (the shared Rhai script interpreter proc-block)
+# pulls in `ahash` with `compile-time-rng`, which pulls in `getrandom`
+# unconditionally regardless of rhai's own feature flags. getrandom 0.3
+# refuses to pick a backend for wasm32-unknown-unknown by default (its
+# wasm_js backend needs JS glue imports, which the cuttlefish host's empty
+# wasmtime Linker cannot supply). Point it at the "custom" backend instead,
+# implemented in blocks/rhai-interpreter/src/lib.rs — we don't need real
+# entropy, just *a* hash seed, so a fixed/cheap fill is fine.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"custom\""]

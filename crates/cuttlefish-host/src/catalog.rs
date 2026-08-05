@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 /// when the *shape* of the index changes, never tied to this crate's version.
 const INDEX_VERSION: u32 = 1;
 
-/// Whether a cataloged artifact is a single wasm block or a multi-node bundle.
+/// Whether a cataloged artifact is a single wasm block, a multi-node
+/// bundle, or a Rhai script run by the shared interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
@@ -39,6 +40,10 @@ pub enum ArtifactKind {
     Block,
     /// A `.cfbundle` container produced by `cuttlefish build`.
     Bundle,
+    /// A Rhai script, run by the shared interpreter — see
+    /// `pipeline::resolve_and_load`'s `Script` handling for how this
+    /// becomes runnable.
+    Script,
 }
 
 /// One cataloged `name@version`.
@@ -46,7 +51,7 @@ pub enum ArtifactKind {
 pub struct Entry {
     /// Content hash of the artifact, as `sha256:<hex>`.
     pub hash: String,
-    /// Block or bundle.
+    /// Block, bundle, or script.
     pub kind: ArtifactKind,
     /// Compact `{input} -> {output}` signature string, cached at add-time so
     /// `list`/`show` never have to instantiate wasm just to answer "what does
@@ -134,6 +139,56 @@ fn validate_name_version(s: &str) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// Reserved Windows device basenames — case-insensitive, and reserved
+/// regardless of any extension (`con.txt` is just as invalid as `con`).
+/// None of these can be created as a directory or file name on Windows.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Validate a `cuttlefish block new` name: must be legal as a Cargo
+/// crate-name component (so `cf-block-<name>` is always a valid package
+/// name for the Rust authoring path, even when a script is what actually
+/// gets scaffolded) and safe as a directory basename on every platform this
+/// project supports.
+///
+/// Deliberately **not** the same validator as this catalog's own
+/// `name@version` name half: that one allows `.`, which Cargo forbids
+/// outright in a crate name — confirmed empirically (`cargo init --name
+/// "cf-block-my.block"` fails) during this feature's design. A block name
+/// must be valid under *both* authoring paths, not just whichever one
+/// happens to be requested, so a name is never valid under `--lang rhai`
+/// and invalid under `--lang rust`.
+pub fn validate_block_name(name: &str) -> Result<(), CatalogError> {
+    let invalid = |reason: String| CatalogError::InvalidBlockName {
+        name: name.to_string(),
+        reason,
+    };
+
+    if name.is_empty() {
+        return Err(invalid("the name is empty".to_string()));
+    }
+    if !name.chars().next().unwrap().is_ascii_alphabetic() {
+        return Err(invalid("must start with a letter".to_string()));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+    {
+        return Err(invalid(format!(
+            "contains {bad:?}; only letters, digits, '-' and '_' are allowed"
+        )));
+    }
+    if WINDOWS_RESERVED_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(invalid(format!(
+            "\"{name}\" is a reserved name on Windows and can't be used as a directory name there"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Something went wrong reading, writing, or resolving through the catalog.
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -148,6 +203,19 @@ pub enum CatalogError {
     InvalidNameVersion {
         /// The identifier that was rejected.
         name_version: String,
+        /// Why it was rejected, as a sentence fragment.
+        reason: String,
+    },
+    /// The name handed to `cuttlefish block new` isn't legal as a directory
+    /// basename on every platform this project supports, or wouldn't survive
+    /// as the crate-name component of `cf-block-<name>` under the Rust
+    /// authoring path. Distinct from `InvalidNameVersion`: a block name never
+    /// has an `@version` half, so reusing that variant's "is not a
+    /// name@version" wording here would misdescribe the failure.
+    #[error("{name:?} is not a valid block name ({reason})")]
+    InvalidBlockName {
+        /// The name that was rejected.
+        name: String,
         /// Why it was rejected, as a sentence fragment.
         reason: String,
     },
@@ -203,13 +271,17 @@ pub enum CatalogError {
         /// The first bytes actually seen.
         header: Vec<u8>,
     },
-    /// The artifact's magic bytes were recognised, but its contents could not
-    /// be read: a wasm-magic file whose module body is truncated or
-    /// otherwise invalid, or a bundle-magic file whose manifest JSON fails to
-    /// parse. Distinct from `CorruptIndex` (that's the catalog's own
-    /// bookkeeping file, not an input artifact) and from
-    /// `UnrecognizedArtifact` (that's the magic byte itself not matching
-    /// anything).
+    /// The artifact's kind was determined (by magic bytes for `Block`/
+    /// `Bundle`, or by `.rhai` extension for `Script`), but its contents
+    /// could not be read: a wasm-magic file whose module body is truncated
+    /// or otherwise invalid, a bundle-magic file whose manifest JSON fails
+    /// to parse, or a `.rhai` file with no (or an unparseable) `//!
+    /// signature: ...` header comment — `Script` has no magic bytes at all,
+    /// so this variant is not solely about magic-byte-recognized artifacts.
+    /// Distinct from `CorruptIndex` (that's the catalog's own bookkeeping
+    /// file, not an input artifact) and from `UnrecognizedArtifact` (that's
+    /// the artifact's kind not being identifiable at all — neither magic
+    /// bytes nor a recognized extension).
     #[error("{path}: {reason}")]
     UninspectableArtifact {
         /// The path that was handed to `add`, or a synthetic label standing
@@ -515,6 +587,72 @@ pub(crate) fn read_bundle_signature(bytes: &[u8], label: &str) -> Result<String,
         })
 }
 
+/// Recover a `.rhai` script's declared signature from its `//! signature:
+/// ...` header comment — the same role `read_bundle_signature` plays for a
+/// `.cfbundle`'s manifest, and re-derived every time it's needed rather
+/// than cached, for the same reason: the artifact itself is the source of
+/// truth, never a copy that could drift from it.
+///
+/// `block new`'s Rhai template writes this header at scaffold time (a later
+/// task); this function is what reads it back, both here at `add`-time (to
+/// populate `Entry.signature` for `list`/`show`) and later, identically, in
+/// `pipeline::read_stage_signature`'s `Script` arm (to typecheck the node
+/// at spec-load time).
+pub(crate) fn read_script_signature(bytes: &[u8], label: &str) -> Result<String, CatalogError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| CatalogError::UninspectableArtifact {
+        path: PathBuf::from(label),
+        reason: "not valid UTF-8 text".to_string(),
+    })?;
+
+    // Only the first HEADER_SCAN_LINES lines count as "header" — a header
+    // comment is meant to precede the script, not appear anywhere in it, so
+    // a `//! signature:`-shaped string a script's own logic might contain
+    // further down (in a string literal, say) is never mistaken for a
+    // second declaration.
+    const HEADER_SCAN_LINES: usize = 10;
+    let matches: Vec<&str> = text
+        .lines()
+        .take(HEADER_SCAN_LINES)
+        .filter_map(|line| line.trim().strip_prefix("//! signature:"))
+        .collect();
+
+    let header = match matches.as_slice() {
+        [] => {
+            return Err(CatalogError::UninspectableArtifact {
+                path: PathBuf::from(label),
+                reason: format!(
+                    "no `//! signature: <input> -> <output>` header comment found in the \
+                     first {HEADER_SCAN_LINES} lines"
+                ),
+            })
+        }
+        [only] => only.trim(),
+        _ => {
+            return Err(CatalogError::UninspectableArtifact {
+                path: PathBuf::from(label),
+                reason: format!(
+                    "found {} `//! signature: ...` header comments; a script must declare \
+                     exactly one",
+                    matches.len()
+                ),
+            })
+        }
+    };
+
+    // Round-trip through the real parser now, not just at check-time, so a
+    // malformed header is caught at `catalog add` — the earliest point a
+    // human or agent can act on it — rather than surfacing later as a
+    // confusing failure when a spec referencing this entry is checked.
+    header.parse::<cuttlefish_abi::Signature>().map_err(|e| {
+        CatalogError::UninspectableArtifact {
+            path: PathBuf::from(label),
+            reason: format!("signature header `{header}` does not parse: {e}"),
+        }
+    })?;
+
+    Ok(header.to_string())
+}
+
 /// Write `bytes` into the content-addressed blob store, deduplicating by
 /// hash (two names cataloging identical bytes cost nothing extra), and
 /// return the hash as `sha256:<hex>` — self-describing in the index even
@@ -562,7 +700,7 @@ pub struct Catalog {
 pub struct AddOutcome {
     /// The name@version now cataloged.
     pub name_version: String,
-    /// Block or bundle.
+    /// Block, bundle, or script.
     pub kind: ArtifactKind,
     /// The cached signature string.
     pub signature: String,
@@ -628,11 +766,16 @@ impl Catalog {
         validate_name_version(name_version)?;
 
         let bytes = fs::read(artifact_path)?;
-        let kind =
-            sniff_artifact_kind(&bytes).ok_or_else(|| CatalogError::UnrecognizedArtifact {
-                path: artifact_path.to_path_buf(),
-                header: bytes.iter().take(8).copied().collect(),
-            })?;
+        let kind = match sniff_artifact_kind(&bytes) {
+            Some(k) => k,
+            None if artifact_path.extension().is_some_and(|e| e == "rhai") => ArtifactKind::Script,
+            None => {
+                return Err(CatalogError::UnrecognizedArtifact {
+                    path: artifact_path.to_path_buf(),
+                    header: bytes.iter().take(8).copied().collect(),
+                })
+            }
+        };
 
         let (signature, is_permissive_default) = match kind {
             ArtifactKind::Block => {
@@ -651,6 +794,10 @@ impl Catalog {
             }
             ArtifactKind::Bundle => {
                 let sig = read_bundle_signature(&bytes, &artifact_path.to_string_lossy())?;
+                (sig, false)
+            }
+            ArtifactKind::Script => {
+                let sig = read_script_signature(&bytes, &artifact_path.to_string_lossy())?;
                 (sig, false)
             }
         };
@@ -2138,5 +2285,37 @@ mod tests {
             "an absolute-path-like hash must be rejected as MalformedHash before any path is \
              constructed, got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_simple_lowercase_name_is_valid() {
+        assert!(validate_block_name("my-block").is_ok());
+    }
+
+    #[test]
+    fn a_name_with_a_dot_is_rejected() {
+        let err = validate_block_name("my.block").unwrap_err();
+        assert!(err.to_string().contains('.'), "{err}");
+    }
+
+    #[test]
+    fn a_name_starting_with_a_digit_is_rejected() {
+        assert!(validate_block_name("1block").is_err());
+    }
+
+    #[test]
+    fn a_windows_reserved_device_name_is_rejected_case_insensitively() {
+        for bad in ["con", "CON", "Con", "aux", "nul", "com1", "lpt9"] {
+            assert!(
+                validate_block_name(bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_only_resembles_a_reserved_name_is_accepted() {
+        assert!(validate_block_name("console").is_ok());
+        assert!(validate_block_name("commander").is_ok());
     }
 }

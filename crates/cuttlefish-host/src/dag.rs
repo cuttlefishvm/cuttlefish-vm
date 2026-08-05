@@ -37,6 +37,9 @@ pub struct CheckedNode {
     pub repeat_until: Option<String>,
     /// Iteration bound, required alongside `repeat_until`.
     pub max_iterations: Option<u32>,
+    /// Threaded straight from `ResolvedInput::script`/`Stage::script` — see
+    /// `pipeline.rs`. `Some` only for a `Script`-kind node.
+    pub script: Option<String>,
 }
 
 /// A whole graph, typechecked and topologically ordered.
@@ -192,6 +195,7 @@ pub fn check_graph(
             input: node.input.clone(),
             repeat_until: node.repeat_until.clone(),
             max_iterations: node.max_iterations,
+            script: input_resolved.script.clone(),
         });
     }
 

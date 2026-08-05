@@ -269,6 +269,7 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
             input: None,
             repeat_until: None,
             max_iterations: None,
+            script: None,
         })
         .collect();
     let fingerprint = cuttlefish_host::dag::graph_fingerprint(&checked_nodes);
@@ -276,6 +277,7 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
     let jobs = JobStore::default();
     let state = api::AppState {
         engine: Arc::new(wasmtime::Engine::default()),
+        module_cache: Arc::new(cuttlefish_host::module_cache::ModuleCache::new()),
         backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
         jobs: jobs.clone(),
         spec: Arc::new(spec),
@@ -879,6 +881,7 @@ async fn shutdown_causes_serve_to_return() {
         input: None,
         repeat_until: None,
         max_iterations: None,
+        script: None,
     }];
 
     // A real `Notify`, distinct from the `std::future::pending()` every other
@@ -887,6 +890,7 @@ async fn shutdown_causes_serve_to_return() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let state = api::AppState {
         engine: Arc::new(wasmtime::Engine::default()),
+        module_cache: Arc::new(cuttlefish_host::module_cache::ModuleCache::new()),
         backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
         jobs: JobStore::default(),
         spec: Arc::new(spec),

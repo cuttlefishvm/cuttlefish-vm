@@ -12,6 +12,7 @@ members = [
     "crates/cuttlefish-host", # wasmtime host + capability enforcement
     "crates/cuttlefishd",     # the daemon
     "blocks/echo-summarize",  # example block; publish = false
+    "blocks/rhai-interpreter", # shared cuttlefish-author Script interpreter; publish = false
 ]
 
 [workspace.package]

@@ -92,8 +92,12 @@ struct Guest {
 }
 
 impl Guest {
-    fn new(engine: &Engine, module_bytes: &[u8]) -> anyhow::Result<Self> {
-        let module = Module::new(engine, module_bytes)?;
+    fn new(
+        engine: &Engine,
+        cache: &crate::module_cache::ModuleCache,
+        module_bytes: &[u8],
+    ) -> anyhow::Result<Self> {
+        let module = cache.compile(engine, module_bytes)?;
 
         // An empty linker, deliberately. Guest blocks are built for
         // `wasm32-unknown-unknown` and import nothing at all — a wasip1 guest
@@ -316,6 +320,7 @@ pub async fn run_job(
     events: mpsc::Sender<JobEvent>,
     cancel: CancellationToken,
     ledger: &crate::ledger::Ledger,
+    cache: &crate::module_cache::ModuleCache,
 ) -> Envelope {
     let started = Instant::now();
     let mut usage = Usage {
@@ -466,9 +471,11 @@ pub async fn run_job(
             let result = loop {
                 let r = match run_stage(
                     &engine,
+                    cache,
                     &backend,
                     &node.module_bytes,
                     current_input.clone(),
+                    node.script.as_deref(),
                     &job.caps,
                     &mut handles,
                     &events,
@@ -654,9 +661,11 @@ pub async fn run_job(
 #[allow(clippy::too_many_arguments)]
 async fn run_stage(
     engine: &Engine,
+    cache: &crate::module_cache::ModuleCache,
     backend: &Arc<dyn InferBackend>,
     module_bytes: &[u8],
     input: serde_json::Value,
+    script: Option<&str>,
     caps: &Capabilities,
     handles: &mut Handles,
     events: &mpsc::Sender<JobEvent>,
@@ -680,7 +689,7 @@ async fn run_stage(
     let mut doc_paths: std::collections::HashMap<u32, std::path::PathBuf> =
         std::collections::HashMap::new();
 
-    let mut guest = match Guest::new(engine, module_bytes) {
+    let mut guest = match Guest::new(engine, cache, module_bytes) {
         Ok(g) => g,
         Err(e) => {
             return Err(fail(
@@ -689,6 +698,20 @@ async fn run_stage(
                 usage.clone(),
             ))
         }
+    };
+
+    // A Script-kind stage's `module_bytes` is always the shared interpreter
+    // (see `pipeline::resolve_and_load`), which expects its script text
+    // wrapped alongside the real job input — the interpreter itself never
+    // receives the raw input directly, and this is the one place per job
+    // where that wrapping actually happens, since the script is fixed at
+    // catalog time but the input is only known per job.
+    let input = match script {
+        Some(script) => serde_json::json!({
+            "__cuttlefish_script": script,
+            "input": input,
+        }),
+        None => input,
     };
 
     let mut command = match guest.call_init(&input) {

@@ -30,6 +30,7 @@ fn resolved_for(dir: &Path, name: &str, input: &str, output: &str) -> ResolvedIn
         kind: ArtifactKind::Block,
         resolved: None,
         bytes: std::fs::read(&path).unwrap(),
+        script: None,
     }
 }
 
@@ -88,6 +89,54 @@ fn a_linear_two_node_graph_typechecks() {
         vec!["chunk", "summarize"],
         "topological order must run producer before consumer"
     );
+}
+
+#[test]
+fn a_checked_script_node_carries_its_script_text_through() {
+    let script_text = "//! signature: {n: json} -> {n: json}\ninput\n";
+    let mut resolved = HashMap::new();
+    resolved.insert(
+        "echo".to_string(),
+        ResolvedInput {
+            name: "echo".to_string(),
+            kind: ArtifactKind::Script,
+            resolved: Some("echo@1".to_string()),
+            bytes: cuttlefish_host::embedded_rhai_interpreter_bytes().to_vec(),
+            script: Some(script_text.to_string()),
+        },
+    );
+
+    let graph = NodeGraph {
+        nodes: vec![("echo".to_string(), node(None))],
+    };
+
+    let checked = check_graph(&Engine::default(), &graph, &Branches::default(), &resolved)
+        .expect("a single Script node with a valid signature header must typecheck");
+
+    assert_eq!(checked.nodes.len(), 1);
+    assert_eq!(checked.nodes[0].kind, ArtifactKind::Script);
+    assert_eq!(checked.nodes[0].script.as_deref(), Some(script_text));
+}
+
+#[test]
+fn a_checked_block_node_has_no_script_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut resolved = HashMap::new();
+    resolved.insert(
+        "block".to_string(),
+        resolved_for(dir.path(), "block", "json", "json"),
+    );
+
+    let graph = NodeGraph {
+        nodes: vec![("block".to_string(), node(None))],
+    };
+
+    let checked = check_graph(&Engine::default(), &graph, &Branches::default(), &resolved)
+        .expect("a single Block node must typecheck");
+
+    assert_eq!(checked.nodes.len(), 1);
+    assert_eq!(checked.nodes[0].kind, ArtifactKind::Block);
+    assert!(checked.nodes[0].script.is_none());
 }
 
 #[test]
@@ -584,6 +633,7 @@ fn checked_node(name: &str, signature: cuttlefish_abi::Signature) -> CheckedNode
         input: None,
         repeat_until: None,
         max_iterations: None,
+        script: None,
     }
 }
 

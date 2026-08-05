@@ -162,6 +162,48 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
 
+  # crates/cuttlefish-host/assets/rhai-interpreter.wasm is a checked-in
+  # binary artifact, not built as part of an ordinary `cargo build
+  # --workspace` (see its own doc comment in cuttlefish-host/src/lib.rs for
+  # why `include_bytes!` requires this). That means it's possible to edit
+  # blocks/rhai-interpreter's source and forget to regenerate/recommit the
+  # asset — this job catches exactly that.
+  #
+  # Checks a SOURCE hash, not the wasm bytes — deliberately, after a real
+  # failure: this job used to rebuild the interpreter and byte-compare the
+  # result, which failed on the very first real run because a wasm build is
+  # not reproducible across different rustc/LLVM versions, and this repo's
+  # CI jobs (this one included) all use `dtolnay/rust-toolchain@stable` —
+  # a materially different, independently-drifting toolchain from the
+  # pinned one `scripts/rebuild-rhai-interpreter.sh` uses locally via `nix
+  # develop`. Even `--remap-path-prefix` (ruling out embedded-absolute-path
+  # drift) didn't fix it — the two toolchains just don't emit identical
+  # code. Comparing
+  # crates/cuttlefish-host/assets/rhai-interpreter.wasm.source-sha256 (a
+  # hash of blocks/rhai-interpreter's own source, written by the same
+  # rebuild script) against a freshly-computed hash of that same source
+  # sidesteps toolchain reproducibility entirely — it only asks "does the
+  # checked-in wasm still correspond to this exact source," and needs no
+  # Rust toolchain at all to answer that.
+  rhai-interpreter-asset-is-up-to-date:
+    name: Rhai interpreter asset is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check source hash
+        run: |
+          set -euo pipefail
+          expected="$(cat crates/cuttlefish-host/assets/rhai-interpreter.wasm.source-sha256)"
+          actual="$(find blocks/rhai-interpreter -type f \( -name '*.toml' -o -name '*.rs' \) \
+                     | sort | xargs cat | shasum -a 256 | cut -d' ' -f1)"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::crates/cuttlefish-host/assets/rhai-interpreter.wasm is stale — \
+                  rebuild it with ./scripts/rebuild-rhai-interpreter.sh and commit the result \
+                  (expected source hash $expected, blocks/rhai-interpreter's source now hashes \
+                  to $actual)"
+            exit 1
+          fi
+
 # API docs are built and published by .github/workflows/docs.yml. Since this
 # project keeps its documentation in the code, that workflow is the docs build
 # — it is deliberately separate so a docs failure is legible as such.

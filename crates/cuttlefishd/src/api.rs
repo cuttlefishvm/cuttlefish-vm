@@ -32,6 +32,11 @@ use wasmtime::Engine;
 pub struct AppState {
     /// Compiles and runs guest modules.
     pub engine: Arc<Engine>,
+    /// Compiled-module cache, scoped to this process's single `engine` — see
+    /// `cuttlefish_host::module_cache::ModuleCache`'s own doc comment for
+    /// the invariant this depends on (never share one cache across two
+    /// different `Engine`s).
+    pub module_cache: Arc<cuttlefish_host::module_cache::ModuleCache>,
     /// Serves inference.
     pub backend: Arc<dyn InferBackend>,
     /// Job bookkeeping.
@@ -177,14 +182,24 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         }
     });
 
-    let (engine, backend, store, job_id) = (
+    let (engine, module_cache, backend, store, job_id) = (
         st.engine.clone(),
+        st.module_cache.clone(),
         st.backend.clone(),
         st.jobs.clone(),
         id.clone(),
     );
     tokio::spawn(async move {
-        let envelope = run_job(engine, backend, job_spec, tx, cancel, &ledger).await;
+        let envelope = run_job(
+            engine,
+            backend,
+            job_spec,
+            tx,
+            cancel,
+            &ledger,
+            &module_cache,
+        )
+        .await;
         store
             .publish(
                 &job_id,
@@ -354,8 +369,9 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
             .into_response();
     }
 
-    let (engine, backend, store, job_id) = (
+    let (engine, module_cache, backend, store, job_id) = (
         st.engine.clone(),
+        st.module_cache.clone(),
         st.backend.clone(),
         st.jobs.clone(),
         id.clone(),
@@ -366,7 +382,16 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
         // `/jobs/{id}/events` mid-crash has already lost that stream; the
         // result still lands durably via `finish`, same as any other job.
         let (tx, _rx) = mpsc::channel::<JobEvent>(256);
-        let envelope = run_job(engine, backend, job_spec, tx, cancel, &ledger).await;
+        let envelope = run_job(
+            engine,
+            backend,
+            job_spec,
+            tx,
+            cancel,
+            &ledger,
+            &module_cache,
+        )
+        .await;
         store.finish(&job_id, envelope).await;
     });
 
