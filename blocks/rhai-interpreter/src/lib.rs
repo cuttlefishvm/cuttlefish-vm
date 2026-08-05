@@ -187,6 +187,28 @@ impl RhaiBlock {
             return cmd;
         }
 
+        // The script finished (Done or a real script error) without
+        // suspending on a new infer() call -- but if it also finished
+        // *without consuming every already-answered log entry*, that's
+        // still a divergence the per-call comparison above can't see: this
+        // run's control flow needed fewer infer() answers than a prior run
+        // did to reach the same point, which is only possible if something
+        // other than `input`/the log influenced it. Silently returning
+        // whatever this run computed would be exactly the silent-wrong-
+        // result failure mode this whole mechanism exists to prevent.
+        let consumed = *call_index.borrow();
+        if consumed < self.log.len() {
+            return Command::Fail {
+                code: "nondeterministic_replay".into(),
+                message: format!(
+                    "replay diverged: this run finished after {consumed} infer() call(s), but \
+                     {} were already answered from a prior run -- a script's control flow must \
+                     depend only on `input` and previously-answered infer() calls",
+                    self.log.len()
+                ),
+            };
+        }
+
         match result {
             Ok(value) => match rhai::serde::from_dynamic::<serde_json::Value>(&value) {
                 Ok(json) => Command::Done { result: json },
@@ -310,5 +332,37 @@ mod tests {
                 result: serde_json::json!("the memoized answer")
             }
         );
+    }
+
+    #[test]
+    fn a_replay_that_finishes_without_consuming_every_logged_answer_fails_loudly() {
+        // A script whose control flow, on this run, finishes (evaluates to
+        // a plain literal) without ever calling infer() at all -- despite
+        // the log already holding one answered call from a prior run of
+        // (nominally) the same script. Finishing "early" like this is just
+        // as much a divergence as a per-call mismatch: this run needed
+        // fewer answers to reach a result than a prior run of the same
+        // script/input did.
+        let block = RhaiBlock {
+            script: "42".to_string(),
+            input: serde_json::Value::Null,
+            log: vec![(
+                Command::Infer {
+                    prompt: "a prompt from a prior, apparently different run".to_string(),
+                    max_tokens: 16,
+                    images: Vec::new(),
+                },
+                serde_json::json!("some prior answer"),
+            )],
+            pending_command: None,
+        };
+
+        match block.run() {
+            Command::Fail { code, message } => {
+                assert_eq!(code, "nondeterministic_replay");
+                assert!(message.contains("diverged"), "{message}");
+            }
+            other => panic!("expected a nondeterministic_replay Fail, got {other:?}"),
+        }
     }
 }
