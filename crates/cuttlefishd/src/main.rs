@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     // of any one job, so it should stop startup rather than fail every job
     // identically once traffic arrives.
     let engine = Arc::new(wasmtime::Engine::default());
+    let module_cache = Arc::new(cuttlefish_host::module_cache::ModuleCache::new());
     // A home directory must be discoverable even for a pipeline made entirely
     // of direct `.wasm` paths that will never touch the catalog — resolving
     // it lazily, only for specs that turn out to need a catalog lookup, would
@@ -139,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = api::AppState {
         engine,
+        module_cache,
         backend,
         jobs,
         spec: Arc::new(spec),

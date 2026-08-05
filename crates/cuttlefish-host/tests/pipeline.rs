@@ -357,6 +357,7 @@ async fn a_pipeline_threads_each_result_into_the_next_block() {
         tx,
         tokio_util::sync::CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -410,6 +411,7 @@ async fn a_failing_stage_ends_the_job_and_names_the_stage() {
         tx,
         tokio_util::sync::CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 

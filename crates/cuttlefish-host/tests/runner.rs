@@ -128,6 +128,7 @@ async fn runs_a_job_end_to_end() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -161,6 +162,7 @@ async fn denies_a_read_outside_the_granted_capability() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -194,6 +196,7 @@ async fn a_guest_stop_verdict_truncates_generation() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -229,6 +232,7 @@ async fn cancelling_before_the_job_starts_yields_cancelled() {
         tx,
         cancel,
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -251,6 +255,7 @@ async fn malformed_input_fails_with_a_code_rather_than_trapping() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -279,6 +284,7 @@ async fn a_module_that_is_not_wasm_fails_as_a_trap() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -302,6 +308,7 @@ async fn a_multibyte_document_survives_the_slice_boundary() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -351,6 +358,7 @@ async fn images_sent_to_a_text_only_backend_fail_loudly() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -387,6 +395,7 @@ async fn images_reach_a_backend_that_accepts_them() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -521,6 +530,7 @@ async fn a_fan_in_node_receives_both_upstream_outputs() {
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -586,6 +596,7 @@ export_block!(NeverDone);
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -652,6 +663,7 @@ export_block!(DoneFirst);
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -750,6 +762,7 @@ export_block!(MustNotRun);
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -849,6 +862,7 @@ export_block!(MustNotRun);
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -951,6 +965,7 @@ export_block!(MustNotRun);
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -1030,6 +1045,7 @@ export_block!(MustNotRun);
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 
@@ -1150,6 +1166,7 @@ export_block!(MustNotRun);
         tx,
         CancellationToken::new(),
         &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
     )
     .await;
 

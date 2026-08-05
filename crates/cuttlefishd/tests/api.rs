@@ -277,6 +277,7 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
     let jobs = JobStore::default();
     let state = api::AppState {
         engine: Arc::new(wasmtime::Engine::default()),
+        module_cache: Arc::new(cuttlefish_host::module_cache::ModuleCache::new()),
         backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
         jobs: jobs.clone(),
         spec: Arc::new(spec),
@@ -889,6 +890,7 @@ async fn shutdown_causes_serve_to_return() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let state = api::AppState {
         engine: Arc::new(wasmtime::Engine::default()),
+        module_cache: Arc::new(cuttlefish_host::module_cache::ModuleCache::new()),
         backend: Arc::new(cuttlefish_host::infer::StubBackend::default()),
         jobs: JobStore::default(),
         spec: Arc::new(spec),

@@ -48,6 +48,7 @@ pub mod infer;
 pub mod ledger;
 #[cfg(feature = "llamacpp")]
 pub mod llamacpp;
+pub mod module_cache;
 pub mod ollama;
 pub mod pipeline;
 
