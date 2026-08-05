@@ -10,9 +10,13 @@ description: Use when starting cuttlefishd, submitting a job without waiting for
 Drives a live `cuttlefishd` end to end: starts one if none is running for
 the spec you need, submits jobs without blocking, and picks crashed work
 back up automatically. Project-scoped — every project directory gets its
-own daemon and job history under `<project>/.cuttlefish/`, so two
-different repos never collide and two Claude Code sessions in the same
-repo share one daemon and see the same jobs.
+own daemon, endpoint, and job history under `<project>/.cuttlefish/`, so
+two different repos never collide and two Claude Code sessions in the same
+repo share one daemon and see the same jobs. That isolation depends on
+always starting the daemon on an explicit, project-scoped endpoint — see
+"Starting" below; the platform default endpoint is a single fixed
+path/pipe name shared by every project on the machine and is never safe
+to use here.
 
 ## Build
 
@@ -65,18 +69,43 @@ Before submitting a job against `<spec>`, run this procedure:
 
 **Starting:**
 
+Always pass an explicit, project-scoped `[endpoint]` — never omit it.
+`cuttlefishd`'s platform default endpoint
+(`cuttlefish_core::endpoint::default_endpoint()`) is a single fixed path
+(`/tmp/cuttlefish.sock` on unix) or pipe name shared by *every* project on
+the machine, not scoped per project. Worse, on unix `cuttlefishd` does an
+unconditional `std::fs::remove_file` on its endpoint before binding, with
+no check for a live process still listening there — so a second project
+started at the default endpoint silently unlinks and steals the first
+project's socket, orphaning the first daemon as an unreachable zombie
+instead of failing loudly. This is exactly the collision the Overview
+promises never happens, and it only doesn't happen if every daemon gets
+its own endpoint.
+
+On unix, scope the endpoint to the project directory itself:
+
 ```bash
+ENDPOINT="<project_root>/.cuttlefish/daemon.sock"
 CUTTLEFISH_JOBS_HOME="<project_root>/.cuttlefish/jobs" \
-  ./target/debug/cuttlefishd <spec> [endpoint] \
+  ./target/debug/cuttlefishd <spec> "$ENDPOINT" \
   > <project_root>/.cuttlefish/daemon.log 2>&1 &
 echo $! # the PID to record
 ```
 
+On Windows a named pipe has no filesystem nesting — it's a flat name in
+the pipe namespace, not a path under `<project_root>`. Derive a
+project-unique name instead, e.g. a short hash of the canonicalized
+project root: `\\.\pipe\cuttlefish-<hash-of-project-root>`.
+(`cuttlefishd`'s named-pipe listener binds with `first_pipe_instance`, so
+on Windows an actual name collision fails loudly at startup rather than
+silently taking over the way unix's `remove_file` does — but a
+project-unique name avoids ever hitting that failure in the first place,
+and keeps the same one-daemon-per-project guarantee unix gets from a
+project-scoped socket path.)
+
 (`CUTTLEFISH_HOME` is left unset/inherited — the catalog stays global.
-Omit `[endpoint]` to use the platform default, or pick an explicit one if
-running multiple projects' daemons needs to coexist; `--wasm <path>` is
-never passed here — it's only for overriding a node's compiled bytes,
-which this flow never needs.)
+`--wasm <path>` is never passed here — it's only for overriding a node's
+compiled bytes, which this flow never needs.)
 
 Write `daemon.json` with the new `{pid, spec_path, endpoint, started_at}`.
 Wait (briefly, bounded) for `cuttlefish specs --endpoint <endpoint>` to
@@ -96,14 +125,25 @@ cuttlefish jobs --endpoint <endpoint>
 For every job in the result with `"status": "interrupted"`:
 
 ```bash
-cuttlefish resume --endpoint <endpoint> <job_id>
+cuttlefish resume --endpoint <endpoint> <job_id> || true
 ```
 
 This is deliberately cheap to repeat on every invocation, not just once
-per process launch: `jobs` is a cheap read, and the daemon's own resume
-endpoint already refuses (with a harmless rejection) a job that isn't
-`Interrupted` — calling `resume` again on something a prior invocation
-already picked up is a no-op, not a duplicate run.
+per process launch: `jobs` is a cheap read, and the daemon refuses (`409
+Conflict`) a `resume` against a job that isn't `Interrupted` anymore. That
+refusal is **not silent at the CLI** — `cuttlefish resume` exits non-zero
+and prints something like `Error: daemon rejected the resume: 409
+Conflict {"error":"only an Interrupted job can be resumed"}` to stderr.
+Because multiple sessions can share one daemon (see Overview), this is an
+expected race, not a bug: two sessions can both see the same job sitting
+at `Interrupted` and both call `resume` on it — the loser gets exactly
+this 409. Treat *only* this specific failure as ignorable in the
+auto-resume loop (the `|| true` above, or whatever's equivalent for the
+loop actually driving this) — it means someone else already resumed the
+job, not that anything went wrong. Do not broaden this into ignoring
+`resume` errors in general: a resume that fails for some other reason
+(daemon unreachable, unknown job_id, wrong spec) should still surface as
+the fatal error it is.
 
 `cuttlefishd` itself never does this unprompted — this auto-resume step
 *is* the "someone decided to resume it" signal the daemon's design
