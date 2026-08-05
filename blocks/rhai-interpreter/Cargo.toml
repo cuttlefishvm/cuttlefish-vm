@@ -1,0 +1,34 @@
+[package]
+name = "cf-block-rhai-interpreter"
+description = "The shared Rhai script interpreter every cuttlefish-author Script-kind block runs through"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Never goes to crates.io. This is the single interpreter every cataloged
+# Rhai script runs through — its compiled wasm gets embedded directly into
+# the cuttlefish/cuttlefishd binaries (see crates/cuttlefish-host/src/lib.rs)
+# rather than published or fetched separately.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cuttlefish-sdk = { workspace = true }
+serde_json = { workspace = true }
+# no_time: rhai's timestamp() builtin pulls in web-time, which on
+# wasm32-unknown-unknown means js-sys/wasm-bindgen imports for
+# performance.now() -- imports the cuttlefish host's empty wasmtime Linker
+# cannot satisfy (it deliberately imports nothing; see runner.rs). Disabling
+# the wall-clock package sidesteps that entirely, and doubles as a
+# determinism guard: a script's control flow must be a pure function of its
+# input and the replay log (see the module doc in src/lib.rs), so nothing
+# wall-clock-dependent should be reachable from script code at all.
+rhai = { version = "1", features = ["serde", "no_time"] }
+# Only needed to supply the "custom" backend rhai's transitive `getrandom`
+# dependency requires on wasm32-unknown-unknown; see ../../.cargo/config.toml.
+getrandom = "0.3"
