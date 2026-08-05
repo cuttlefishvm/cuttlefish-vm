@@ -66,3 +66,58 @@ fn concurrent_add_of_different_blocks_never_corrupts_the_index() {
         "both concurrent adds must land: {entries:?}"
     );
 }
+
+use std::io::Write;
+
+fn write_script(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(contents.as_bytes()).unwrap();
+    path
+}
+
+#[test]
+fn adding_a_rhai_file_catalogs_it_as_script_kind_with_its_declared_signature() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = cuttlefish_host::catalog::Catalog::open(tmp.path().join("catalog"));
+    let engine = wasmtime::Engine::default();
+
+    let script_path = write_script(
+        tmp.path(),
+        "greet.rhai",
+        "//! signature: {name: text} -> {greeting: text}\n\
+         #{ greeting: \"hello \" + input.name }\n",
+    );
+
+    let outcome = catalog.add("greet@1", &script_path, &engine).unwrap();
+    assert_eq!(outcome.kind, cuttlefish_host::catalog::ArtifactKind::Script);
+    assert_eq!(outcome.signature, "{name: text} -> {greeting: text}");
+}
+
+#[test]
+fn a_rhai_file_with_no_signature_header_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = cuttlefish_host::catalog::Catalog::open(tmp.path().join("catalog"));
+    let engine = wasmtime::Engine::default();
+    let script_path = write_script(tmp.path(), "no_sig.rhai", "#{ x: 1 }\n");
+
+    let err = catalog.add("no-sig@1", &script_path, &engine).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("signature"),
+        "expected a signature-related error, got: {err}"
+    );
+}
+
+#[test]
+fn a_rhai_file_with_an_unparseable_signature_header_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = cuttlefish_host::catalog::Catalog::open(tmp.path().join("catalog"));
+    let engine = wasmtime::Engine::default();
+    let script_path = write_script(
+        tmp.path(),
+        "bad_sig.rhai",
+        "//! signature: this is not a real signature\n#{ x: 1 }\n",
+    );
+
+    assert!(catalog.add("bad-sig@1", &script_path, &engine).is_err());
+}

@@ -39,6 +39,10 @@ pub enum ArtifactKind {
     Block,
     /// A `.cfbundle` container produced by `cuttlefish build`.
     Bundle,
+    /// A Rhai script, run by the shared interpreter — see
+    /// `pipeline::resolve_and_load`'s `Script` handling for how this
+    /// becomes runnable.
+    Script,
 }
 
 /// One cataloged `name@version`.
@@ -578,6 +582,45 @@ pub(crate) fn read_bundle_signature(bytes: &[u8], label: &str) -> Result<String,
         })
 }
 
+/// Recover a `.rhai` script's declared signature from its `//! signature:
+/// ...` header comment — the same role `read_bundle_signature` plays for a
+/// `.cfbundle`'s manifest, and re-derived every time it's needed rather
+/// than cached, for the same reason: the artifact itself is the source of
+/// truth, never a copy that could drift from it.
+///
+/// `block new`'s Rhai template writes this header at scaffold time (a later
+/// task); this function is what reads it back, both here at `add`-time (to
+/// populate `Entry.signature` for `list`/`show`) and later, identically, in
+/// `pipeline::read_stage_signature`'s `Script` arm (to typecheck the node
+/// at spec-load time).
+pub(crate) fn read_script_signature(bytes: &[u8], label: &str) -> Result<String, CatalogError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| CatalogError::UninspectableArtifact {
+        path: PathBuf::from(label),
+        reason: "not valid UTF-8 text".to_string(),
+    })?;
+    let header = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("//! signature:"))
+        .ok_or_else(|| CatalogError::UninspectableArtifact {
+            path: PathBuf::from(label),
+            reason: "no `//! signature: <input> -> <output>` header comment found".to_string(),
+        })?
+        .trim();
+
+    // Round-trip through the real parser now, not just at check-time, so a
+    // malformed header is caught at `catalog add` — the earliest point a
+    // human or agent can act on it — rather than surfacing later as a
+    // confusing failure when a spec referencing this entry is checked.
+    header.parse::<cuttlefish_abi::Signature>().map_err(|e| {
+        CatalogError::UninspectableArtifact {
+            path: PathBuf::from(label),
+            reason: format!("signature header `{header}` does not parse: {e}"),
+        }
+    })?;
+
+    Ok(header.to_string())
+}
+
 /// Write `bytes` into the content-addressed blob store, deduplicating by
 /// hash (two names cataloging identical bytes cost nothing extra), and
 /// return the hash as `sha256:<hex>` — self-describing in the index even
@@ -691,11 +734,16 @@ impl Catalog {
         validate_name_version(name_version)?;
 
         let bytes = fs::read(artifact_path)?;
-        let kind =
-            sniff_artifact_kind(&bytes).ok_or_else(|| CatalogError::UnrecognizedArtifact {
-                path: artifact_path.to_path_buf(),
-                header: bytes.iter().take(8).copied().collect(),
-            })?;
+        let kind = match sniff_artifact_kind(&bytes) {
+            Some(k) => k,
+            None if artifact_path.extension().is_some_and(|e| e == "rhai") => ArtifactKind::Script,
+            None => {
+                return Err(CatalogError::UnrecognizedArtifact {
+                    path: artifact_path.to_path_buf(),
+                    header: bytes.iter().take(8).copied().collect(),
+                })
+            }
+        };
 
         let (signature, is_permissive_default) = match kind {
             ArtifactKind::Block => {
@@ -714,6 +762,10 @@ impl Catalog {
             }
             ArtifactKind::Bundle => {
                 let sig = read_bundle_signature(&bytes, &artifact_path.to_string_lossy())?;
+                (sig, false)
+            }
+            ArtifactKind::Script => {
+                let sig = read_script_signature(&bytes, &artifact_path.to_string_lossy())?;
                 (sig, false)
             }
         };
