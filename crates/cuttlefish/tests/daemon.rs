@@ -120,6 +120,10 @@ spec cancel_test = {
 
 #[tokio::test]
 async fn submit_returns_a_job_id_immediately_without_waiting_for_completion() {
+    // Held for this test's entire body — see `daemon_test_guard`'s doc
+    // comment for why these tests can't cold-start their daemons
+    // concurrently on a contended CI runner.
+    let _daemon_guard = support::daemon_test_guard().await;
     support::ensure_test_cuttlefish_home();
 
     let dir = tempfile::tempdir().unwrap();
@@ -205,6 +209,7 @@ async fn submit_returns_a_job_id_immediately_without_waiting_for_completion() {
 
 #[tokio::test]
 async fn jobs_lists_a_submitted_job() {
+    let _daemon_guard = support::daemon_test_guard().await;
     support::ensure_test_cuttlefish_home();
 
     let dir = tempfile::tempdir().unwrap();
@@ -242,6 +247,7 @@ async fn jobs_lists_a_submitted_job() {
 
 #[tokio::test]
 async fn resume_on_a_non_interrupted_job_reports_the_daemons_rejection() {
+    let _daemon_guard = support::daemon_test_guard().await;
     support::ensure_test_cuttlefish_home();
 
     let dir = tempfile::tempdir().unwrap();
@@ -283,6 +289,7 @@ async fn resume_on_a_non_interrupted_job_reports_the_daemons_rejection() {
 
 #[tokio::test]
 async fn cancel_stops_a_job() {
+    let _daemon_guard = support::daemon_test_guard().await;
     support::ensure_test_cuttlefish_home();
 
     let dir = tempfile::tempdir().unwrap();
@@ -355,6 +362,7 @@ async fn cancel_stops_a_job() {
 
 #[tokio::test]
 async fn shutdown_causes_the_daemon_process_to_exit() {
+    let _daemon_guard = support::daemon_test_guard().await;
     support::ensure_test_cuttlefish_home();
 
     let dir = tempfile::tempdir().unwrap();

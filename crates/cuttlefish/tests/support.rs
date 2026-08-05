@@ -78,6 +78,40 @@ pub fn ensure_test_cuttlefish_home() {
     });
 }
 
+/// Serializes every test in this binary that spawns a real `cuttlefishd`.
+///
+/// Each spawned daemon does real cold-start work (wasmtime engine init,
+/// sqlite ledger setup) before it can answer its first request. On a
+/// developer's fast, mostly-idle machine, five of these cold-starting
+/// concurrently (this binary's default `cargo test` parallelism) comfortably
+/// clears the readiness-poll bound below. On a resource-constrained CI
+/// runner, the same five daemons genuinely contend for CPU, and each one's
+/// cold start can individually run long enough to blow that bound — this
+/// showed up in CI as 3-4 of 5 daemon tests failing with "did not become
+/// ready in time" on every platform in the matrix at once, not as an
+/// isolated flake. Acquiring this guard before spawning ensures at most one
+/// `cuttlefishd` is ever cold-starting (or running) at a time in this binary,
+/// which is the fundamental fix; the generous readiness bound below is
+/// defense in depth on top of that, not a substitute for it.
+///
+/// `tokio::sync::Mutex`, not `std::sync::Mutex`: callers hold the returned
+/// guard across `.await` points for a test's entire body, which is exactly
+/// the pattern `clippy::await_holding_lock` flags for a std mutex. Compare
+/// `crates/cuttlefish-host/tests/ledger.rs`'s `ENV_GUARD`, which uses a std
+/// `Mutex` because it's only ever held across non-async sections.
+static DAEMON_SERIAL_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Acquire the daemon-spawning serialization guard described on
+/// [`DAEMON_SERIAL_GUARD`]. Call this as the first line of any test that
+/// calls [`spawn_daemon`], and keep the returned guard alive (bound to a
+/// local, e.g. `let _daemon_guard = ...`) for the test's entire body — not
+/// just around the `spawn_daemon` call — so no other daemon-spawning test can
+/// start its own cold start until this one's daemon is fully done with, not
+/// merely started.
+pub async fn daemon_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    DAEMON_SERIAL_GUARD.lock().await
+}
+
 /// A spawned `cuttlefishd` child that is killed automatically when this value
 /// is dropped — on a normal return, an early return, *or* a panic unwinding
 /// through the test that owns it.
@@ -117,10 +151,13 @@ impl Drop for DaemonGuard {
     }
 }
 
-/// Spawn `cuttlefishd` against `spec_path`/`endpoint`, wait (briefly,
-/// bounded) for it to actually accept connections before returning, and
-/// return a [`DaemonGuard`] that kills it on drop no matter how the caller's
-/// test function exits.
+/// Spawn `cuttlefishd` against `spec_path`/`endpoint`, wait (bounded, but
+/// generously — see the 30s bound below) for it to actually accept
+/// connections before returning, and return a [`DaemonGuard`] that kills it
+/// on drop no matter how the caller's test function exits.
+///
+/// Callers should hold [`daemon_test_guard`]'s guard before calling this —
+/// see its doc comment for why.
 ///
 /// The child's stdout/stderr are piped (not inherited), mirroring
 /// `crates/cuttlefishd/tests/api.rs`'s own `spawn_and_wait_ready` — otherwise
@@ -151,8 +188,13 @@ pub async fn spawn_daemon(spec_path: &Path, endpoint: &Path) -> DaemonGuard {
     let builder = builder.windows_named_pipe(endpoint);
     let client = builder.build().unwrap();
 
+    // 30s (3000 * 10ms), not the 5s this used to be: that bound was sized for
+    // a fast, idle dev machine, and a genuinely slow or contended CI runner
+    // (see `DAEMON_SERIAL_GUARD`'s doc comment) needs real headroom above a
+    // single daemon's own cold-start cost. Still bounded, so an actual hang
+    // fails in well under a minute rather than wedging the job indefinitely.
     let mut ready = false;
-    for _ in 0..500 {
+    for _ in 0..3000 {
         if client.get("http://localhost/specs").send().await.is_ok() {
             ready = true;
             break;
