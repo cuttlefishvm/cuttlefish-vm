@@ -17,9 +17,10 @@
 //!
 //! `cli` holds the argument parsing and the commands that touch nothing but
 //! the filesystem (`catalog`, `build`); `daemon` holds the ones that talk to
-//! the daemon (`run`, `specs`). The split is by dependency, and it is no
-//! longer a platform boundary: both halves compile everywhere now that the
-//! transport has a named-pipe implementation on Windows.
+//! the daemon (`run`, `submit`, `jobs`, `resume`, `cancel`, `shutdown`,
+//! `specs`). The split is by dependency, and it is no longer a platform
+//! boundary: both halves compile everywhere now that the transport has a
+//! named-pipe implementation on Windows.
 //!
 //! Argument parsing is deliberately not split: one `clap` derive covers every
 //! subcommand on every platform.
@@ -80,6 +81,52 @@ mod cli {
             /// Job input, as a JSON object.
             #[arg(long)]
             input: String,
+        },
+        /// List every job the daemon knows about, including any Interrupted
+        /// ones from a prior crash.
+        Jobs {
+            /// Where the daemon listens: a unix socket path, or a named
+            /// pipe on Windows. Defaults per platform.
+            ///
+            /// `--socket` is kept as an alias so existing scripts and docs
+            /// keep working; the name is simply wrong on Windows.
+            #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
+            endpoint: PathBuf,
+        },
+        /// Resume a job the daemon reports as Interrupted.
+        Resume {
+            /// Where the daemon listens: a unix socket path, or a named
+            /// pipe on Windows. Defaults per platform.
+            ///
+            /// `--socket` is kept as an alias so existing scripts and docs
+            /// keep working; the name is simply wrong on Windows.
+            #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
+            endpoint: PathBuf,
+            /// The job to resume.
+            job_id: String,
+        },
+        /// Cancel a running (or interrupted) job.
+        Cancel {
+            /// Where the daemon listens: a unix socket path, or a named
+            /// pipe on Windows. Defaults per platform.
+            ///
+            /// `--socket` is kept as an alias so existing scripts and docs
+            /// keep working; the name is simply wrong on Windows.
+            #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
+            endpoint: PathBuf,
+            /// The job to cancel.
+            job_id: String,
+        },
+        /// Ask the daemon to stop, gracefully, once any in-flight request
+        /// finishes.
+        Shutdown {
+            /// Where the daemon listens: a unix socket path, or a named
+            /// pipe on Windows. Defaults per platform.
+            ///
+            /// `--socket` is kept as an alias so existing scripts and docs
+            /// keep working; the name is simply wrong on Windows.
+            #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
+            endpoint: PathBuf,
         },
         /// List what the daemon can run.
         Specs {
@@ -147,6 +194,10 @@ mod cli {
                 spec,
                 input,
             } => crate::daemon::submit(&endpoint, &spec, &input).await,
+            Cmd::Jobs { endpoint } => crate::daemon::jobs(&endpoint).await,
+            Cmd::Resume { endpoint, job_id } => crate::daemon::resume(&endpoint, &job_id).await,
+            Cmd::Cancel { endpoint, job_id } => crate::daemon::cancel(&endpoint, &job_id).await,
+            Cmd::Shutdown { endpoint } => crate::daemon::shutdown(&endpoint).await,
             Cmd::Catalog { action } => catalog_cmd(action),
             Cmd::Build { spec, output } => build_cmd(&spec, output),
         }
@@ -383,6 +434,73 @@ mod daemon {
     pub async fn submit(socket: &Path, spec: &str, input: &str) -> anyhow::Result<()> {
         let job_id = submit_job(&client(socket)?, socket, spec, input).await?;
         println!("{job_id}");
+        Ok(())
+    }
+
+    /// List every job the daemon knows about — the raw pretty-printed `GET
+    /// /jobs` response, same convention `specs` already uses: no derived
+    /// one-line summary formatter, since that's not what's been asked for.
+    pub async fn jobs(socket: &Path) -> anyhow::Result<()> {
+        let body: serde_json::Value = client(socket)?
+            .get("http://localhost/jobs")
+            .send()
+            .await
+            .with_context(|| format!("connecting to daemon at {}", socket.display()))?
+            .json()
+            .await?;
+
+        println!("{}", serde_json::to_string_pretty(&body)?);
+        Ok(())
+    }
+
+    /// Resume a job the daemon reports as `Interrupted`. Deliberately not
+    /// automatic — the daemon rejects a resume of anything else, and that
+    /// rejection is surfaced here rather than swallowed.
+    pub async fn resume(socket: &Path, job_id: &str) -> anyhow::Result<()> {
+        let resp = client(socket)?
+            .post(format!("http://localhost/jobs/{job_id}/resume"))
+            .send()
+            .await
+            .with_context(|| format!("connecting to daemon at {}", socket.display()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            bail!(
+                "daemon rejected the resume: {status} {}",
+                resp.text().await?
+            );
+        }
+
+        println!("resuming {job_id}");
+        Ok(())
+    }
+
+    /// Cancel a running (or interrupted) job.
+    pub async fn cancel(socket: &Path, job_id: &str) -> anyhow::Result<()> {
+        let resp = client(socket)?
+            .delete(format!("http://localhost/jobs/{job_id}"))
+            .send()
+            .await
+            .with_context(|| format!("connecting to daemon at {}", socket.display()))?;
+
+        if !resp.status().is_success() {
+            bail!("daemon rejected the cancel: {}", resp.status());
+        }
+
+        println!("cancelled {job_id}");
+        Ok(())
+    }
+
+    /// Ask the daemon to stop, gracefully, once any in-flight request
+    /// finishes.
+    pub async fn shutdown(socket: &Path) -> anyhow::Result<()> {
+        client(socket)?
+            .post("http://localhost/shutdown")
+            .send()
+            .await
+            .with_context(|| format!("connecting to daemon at {}", socket.display()))?;
+
+        println!("shutdown requested");
         Ok(())
     }
 

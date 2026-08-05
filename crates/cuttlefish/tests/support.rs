@@ -97,6 +97,16 @@ impl DaemonGuard {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
+
+    /// Poll whether the daemon process has exited, without blocking.
+    ///
+    /// Exists for tests that need to observe an actual OS process exit (e.g.
+    /// after `cuttlefish shutdown`) rather than merely a response from an
+    /// HTTP call — proving the *process* went down, not just that it
+    /// answered one more request before doing so.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
 }
 
 impl Drop for DaemonGuard {
