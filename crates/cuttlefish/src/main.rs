@@ -323,6 +323,26 @@ mod cli {
         let checked = cuttlefish_host::pipeline::check(&engine, &resolved)
             .with_context(|| format!("checking the pipeline for `{}`", spec.name))?;
 
+        // `bundle::build` has no field to carry a Script node's actual
+        // script text — it copies `module_bytes` verbatim into the
+        // `.cfbundle` body, which for a Script node is the shared
+        // interpreter's bytes, not the script. Bundling one would silently
+        // embed a redundant interpreter copy and drop the script itself.
+        // Reject explicitly, before any bundle output is written, the same
+        // "fail loudly on what's not supported yet" precedent cuttlefishd's
+        // startup check already applies to Bundle-kind nodes.
+        if let Some(stage) = checked
+            .stages()
+            .iter()
+            .find(|s| s.kind == cuttlefish_host::catalog::ArtifactKind::Script)
+        {
+            bail!(
+                "node `{}` is a Rhai script. `cuttlefish build` doesn't support packaging a \
+                 Script node into a bundle yet — run it via cuttlefishd instead.",
+                stage.name
+            );
+        }
+
         for stage in checked.stages() {
             println!(
                 "checking node `{}`      ... ok  ({})",

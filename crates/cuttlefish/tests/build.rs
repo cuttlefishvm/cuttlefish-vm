@@ -76,3 +76,73 @@ fn build_refuses_a_fan_in_graph_before_touching_the_catalog() {
     // No bundle should have been written for a spec that was refused.
     assert!(!spec_path.with_extension("cfbundle").exists());
 }
+
+/// A minimal, valid `.rhai` script with a signature header — enough for
+/// `catalog add`/`resolve_and_load`/`check` to accept it as a `Script`-kind
+/// node; the interpreter itself is never instantiated during `check` (a
+/// `Script` node's signature comes from its header comment, not wasm
+/// introspection), so this test needs no real interpreter wasm to exist.
+const SCRIPT_TEXT: &str = "//! signature: {n: json} -> {n: json}\ninput\n";
+
+/// `cuttlefish build` must refuse a spec containing a `Script` node with a
+/// clear error, rather than silently embedding a redundant copy of the
+/// shared interpreter and dropping the actual script — `bundle::build`
+/// has no field to carry script text at all, so doing so would either
+/// panic or corrupt the bundle.
+#[test]
+fn build_refuses_a_spec_with_a_script_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("echo.rhai");
+    std::fs::write(&script_path, SCRIPT_TEXT).unwrap();
+
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let add = Command::new(CUTTLEFISH)
+        .args(["catalog", "add", "echo@1"])
+        .arg(&script_path)
+        .env("CUTTLEFISH_HOME", &home)
+        .output()
+        .expect("the cuttlefish binary under test must be spawnable");
+    assert!(
+        add.status.success(),
+        "cataloging the fixture script failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let spec_path = dir.path().join("script_node.cuttlefish");
+    std::fs::write(
+        &spec_path,
+        r#"
+spec script_node_spec = {
+  description = "A spec with a Script node, used to test cuttlefish build's refusal.";
+  model = Path "./models/stub.gguf";
+  data_policy = Any;
+  capabilities = [ ];
+  nodes = {
+    echo = { block = "echo@1" };
+  };
+}
+"#,
+    )
+    .unwrap();
+
+    let out = Command::new(CUTTLEFISH)
+        .args(["build"])
+        .arg(&spec_path)
+        .env("CUTTLEFISH_HOME", &home)
+        .output()
+        .expect("the cuttlefish binary under test must be spawnable");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "build must refuse a Script node: stdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr.contains("echo") && stderr.to_lowercase().contains("script"),
+        "the refusal must name the node and mention it's a script: {stderr}"
+    );
+    assert!(!spec_path.with_extension("cfbundle").exists());
+}
