@@ -226,12 +226,20 @@ Two concrete rules follow from this:
 2. **Never wrap a host call in `try { } catch { }`.** The suspend
    mechanism works by the native function raising an error that aborts
    evaluation; Rhai gives native functions no way to raise an error a
-   script genuinely can't catch, so a `try`/`catch` around the call would
-   intercept the suspend signal as an ordinary script error instead of
-   letting it propagate — corrupting the replay. If any of `infer`,
-   `open`, `slice`, `slice_bytes`, `page_text`, or `page_image` is ever
-   wrapped this way, behavior is undefined; don't do it. (`parse_json` is
-   not a host call — it's fine to wrap.)
+   script genuinely can't catch, so a `try`/`catch` around the call
+   intercepts the suspend signal as an ordinary script error instead of
+   letting it propagate. This doesn't corrupt every replay silently — it
+   only breaks something when the `catch` body goes on to change control
+   flow before a *later* host call (e.g. setting a variable in `catch` that
+   a subsequent prompt depends on). When it does, replay diverges and the
+   job fails loudly with `nondeterministic_replay` (see below) rather than
+   returning a wrong answer. Still don't do it — a script that happens to
+   work today because its `catch` body is a no-op breaks the moment someone
+   adds a line to it, and there's no way to tell which scripts are "safe"
+   without re-deriving this reasoning. This applies to all of `infer`,
+   `open`, `slice`, `slice_bytes`, `page_text`, and `page_image`.
+   (`parse_json` and the `regex_*` functions are not host calls — they're
+   ordinary synchronous functions, and wrapping those is fine.)
 
 If replay-vs-original ever produces a genuinely different host-call
 sequence (almost always because a script read something other than `input`
@@ -252,7 +260,10 @@ Otherwise identical to the existing catalog flow — same immutable-versions
 rule (a changed script or block is a new version, never an edit in place),
 same `list`/`show`/`rm`. A `.rhai` file's signature is read back from its
 `//! signature: ...` header at `catalog add` time; a missing or
-unparseable header is rejected there, not later.
+unparseable header is rejected there, not later. `catalog add` also parses
+the whole script body at that point (not just the header) — a script with a
+syntax error is rejected immediately, rather than cataloging fine and only
+failing the first time a job actually runs it.
 
 **A script must be cataloged before a spec can reference it** — a spec node
 pointing directly at an uncataloged `.rhai` path (bypassing `catalog add`)
