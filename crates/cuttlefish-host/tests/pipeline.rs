@@ -559,6 +559,30 @@ fn a_missing_direct_path_names_the_path() {
 }
 
 #[test]
+fn a_direct_path_to_an_uncataloged_rhai_script_hints_at_the_fix() {
+    let spec_dir = tempfile::tempdir().unwrap();
+    let catalog = Catalog::open(spec_dir.path().join("unused-catalog"));
+    std::fs::write(
+        spec_dir.path().join("stray.rhai"),
+        "//! signature: {n: json} -> {n: json}\ninput\n",
+    )
+    .unwrap();
+
+    let err = resolve_and_load(
+        &catalog,
+        spec_dir.path(),
+        "stray.rhai",
+        ResolutionContext::Interactive,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("catalog add"),
+        "expected a hint to catalog the script first, got: {msg}"
+    );
+}
+
+#[test]
 fn resolving_a_cataloged_script_yields_the_interpreter_bytes_and_the_script_text() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = Catalog::open(tmp.path().join("catalog"));
