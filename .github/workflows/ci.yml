@@ -167,40 +167,40 @@ jobs:
   # --workspace` (see its own doc comment in cuttlefish-host/src/lib.rs for
   # why `include_bytes!` requires this). That means it's possible to edit
   # blocks/rhai-interpreter's source and forget to regenerate/recommit the
-  # asset — this job catches exactly that: it rebuilds the interpreter
-  # fresh and fails if the result differs from what's checked in, the same
-  # "kept in lockstep, fix code or bump deliberately" pattern the `msrv` job
-  # above already applies to the rust-version pin.
+  # asset — this job catches exactly that.
+  #
+  # Checks a SOURCE hash, not the wasm bytes — deliberately, after a real
+  # failure: this job used to rebuild the interpreter and byte-compare the
+  # result, which failed on the very first real run because a wasm build is
+  # not reproducible across different rustc/LLVM versions, and this repo's
+  # CI jobs (this one included) all use `dtolnay/rust-toolchain@stable` —
+  # a materially different, independently-drifting toolchain from the
+  # pinned one `scripts/rebuild-rhai-interpreter.sh` uses locally via `nix
+  # develop`. Even `--remap-path-prefix` (ruling out embedded-absolute-path
+  # drift) didn't fix it — the two toolchains just don't emit identical
+  # code. Comparing
+  # crates/cuttlefish-host/assets/rhai-interpreter.wasm.source-sha256 (a
+  # hash of blocks/rhai-interpreter's own source, written by the same
+  # rebuild script) against a freshly-computed hash of that same source
+  # sidesteps toolchain reproducibility entirely — it only asks "does the
+  # checked-in wasm still correspond to this exact source," and needs no
+  # Rust toolchain at all to answer that.
   rhai-interpreter-asset-is-up-to-date:
     name: Rhai interpreter asset is up to date
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-      - name: Rebuild and diff
-        # RUSTFLAGS here must match scripts/rebuild-rhai-interpreter.sh's
-        # exactly — both remap this checkout's real absolute path to the
-        # same fixed placeholder, so the two rebuilds (this one and
-        # whoever ran the script locally) embed identical panic-location
-        # strings and produce byte-identical output despite running from
-        # different absolute paths. Confirmed empirically: without the
-        # remap, this job failed on the first real run because CI's
-        # checkout path (/home/runner/work/...) differs from any local
-        # checkout path. Also re-declares the getrandom_backend cfg flag
-        # from .cargo/config.toml, since setting RUSTFLAGS here replaces
-        # (does not merge with) that file's own target rustflags.
+      - name: Check source hash
         run: |
           set -euo pipefail
-          export RUSTFLAGS='--cfg getrandom_backend="custom" --remap-path-prefix='"$(pwd)"'=/cuttlefishvm'
-          cargo build --release -p cf-block-rhai-interpreter --target wasm32-unknown-unknown --locked
-          if ! cmp -s target/wasm32-unknown-unknown/release/cf_block_rhai_interpreter.wasm \
-                      crates/cuttlefish-host/assets/rhai-interpreter.wasm; then
+          expected="$(cat crates/cuttlefish-host/assets/rhai-interpreter.wasm.source-sha256)"
+          actual="$(find blocks/rhai-interpreter -type f \( -name '*.toml' -o -name '*.rs' \) \
+                     | sort | xargs cat | shasum -a 256 | cut -d' ' -f1)"
+          if [ "$expected" != "$actual" ]; then
             echo "::error::crates/cuttlefish-host/assets/rhai-interpreter.wasm is stale — \
-                  rebuild it with ./scripts/rebuild-rhai-interpreter.sh and commit the result"
+                  rebuild it with ./scripts/rebuild-rhai-interpreter.sh and commit the result \
+                  (expected source hash $expected, blocks/rhai-interpreter's source now hashes \
+                  to $actual)"
             exit 1
           fi
 
