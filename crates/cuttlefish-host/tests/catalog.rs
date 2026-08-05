@@ -121,3 +121,23 @@ fn a_rhai_file_with_an_unparseable_signature_header_is_rejected() {
 
     assert!(catalog.add("bad-sig@1", &script_path, &engine).is_err());
 }
+
+#[test]
+fn a_rhai_file_with_two_signature_headers_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = cuttlefish_host::catalog::Catalog::open(tmp.path().join("catalog"));
+    let engine = wasmtime::Engine::default();
+    let script_path = write_script(
+        tmp.path(),
+        "dup_sig.rhai",
+        "//! signature: {n: json} -> {n: json}\n\
+         //! signature: {n: json} -> {n: json}\n\
+         input\n",
+    );
+
+    let err = catalog.add("dup-sig@1", &script_path, &engine).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("exactly one"),
+        "expected an error about multiple signature headers, got: {err}"
+    );
+}

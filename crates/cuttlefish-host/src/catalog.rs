@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 /// when the *shape* of the index changes, never tied to this crate's version.
 const INDEX_VERSION: u32 = 1;
 
-/// Whether a cataloged artifact is a single wasm block or a multi-node bundle.
+/// Whether a cataloged artifact is a single wasm block, a multi-node
+/// bundle, or a Rhai script run by the shared interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
@@ -50,7 +51,7 @@ pub enum ArtifactKind {
 pub struct Entry {
     /// Content hash of the artifact, as `sha256:<hex>`.
     pub hash: String,
-    /// Block or bundle.
+    /// Block, bundle, or script.
     pub kind: ArtifactKind,
     /// Compact `{input} -> {output}` signature string, cached at add-time so
     /// `list`/`show` never have to instantiate wasm just to answer "what does
@@ -270,13 +271,17 @@ pub enum CatalogError {
         /// The first bytes actually seen.
         header: Vec<u8>,
     },
-    /// The artifact's magic bytes were recognised, but its contents could not
-    /// be read: a wasm-magic file whose module body is truncated or
-    /// otherwise invalid, or a bundle-magic file whose manifest JSON fails to
-    /// parse. Distinct from `CorruptIndex` (that's the catalog's own
-    /// bookkeeping file, not an input artifact) and from
-    /// `UnrecognizedArtifact` (that's the magic byte itself not matching
-    /// anything).
+    /// The artifact's kind was determined (by magic bytes for `Block`/
+    /// `Bundle`, or by `.rhai` extension for `Script`), but its contents
+    /// could not be read: a wasm-magic file whose module body is truncated
+    /// or otherwise invalid, a bundle-magic file whose manifest JSON fails
+    /// to parse, or a `.rhai` file with no (or an unparseable) `//!
+    /// signature: ...` header comment — `Script` has no magic bytes at all,
+    /// so this variant is not solely about magic-byte-recognized artifacts.
+    /// Distinct from `CorruptIndex` (that's the catalog's own bookkeeping
+    /// file, not an input artifact) and from `UnrecognizedArtifact` (that's
+    /// the artifact's kind not being identifiable at all — neither magic
+    /// bytes nor a recognized extension).
     #[error("{path}: {reason}")]
     UninspectableArtifact {
         /// The path that was handed to `add`, or a synthetic label standing
@@ -598,14 +603,41 @@ pub(crate) fn read_script_signature(bytes: &[u8], label: &str) -> Result<String,
         path: PathBuf::from(label),
         reason: "not valid UTF-8 text".to_string(),
     })?;
-    let header = text
+
+    // Only the first HEADER_SCAN_LINES lines count as "header" — a header
+    // comment is meant to precede the script, not appear anywhere in it, so
+    // a `//! signature:`-shaped string a script's own logic might contain
+    // further down (in a string literal, say) is never mistaken for a
+    // second declaration.
+    const HEADER_SCAN_LINES: usize = 10;
+    let matches: Vec<&str> = text
         .lines()
-        .find_map(|line| line.trim().strip_prefix("//! signature:"))
-        .ok_or_else(|| CatalogError::UninspectableArtifact {
-            path: PathBuf::from(label),
-            reason: "no `//! signature: <input> -> <output>` header comment found".to_string(),
-        })?
-        .trim();
+        .take(HEADER_SCAN_LINES)
+        .filter_map(|line| line.trim().strip_prefix("//! signature:"))
+        .collect();
+
+    let header = match matches.as_slice() {
+        [] => {
+            return Err(CatalogError::UninspectableArtifact {
+                path: PathBuf::from(label),
+                reason: format!(
+                    "no `//! signature: <input> -> <output>` header comment found in the \
+                     first {HEADER_SCAN_LINES} lines"
+                ),
+            })
+        }
+        [only] => only.trim(),
+        _ => {
+            return Err(CatalogError::UninspectableArtifact {
+                path: PathBuf::from(label),
+                reason: format!(
+                    "found {} `//! signature: ...` header comments; a script must declare \
+                     exactly one",
+                    matches.len()
+                ),
+            })
+        }
+    };
 
     // Round-trip through the real parser now, not just at check-time, so a
     // malformed header is caught at `catalog add` — the earliest point a
@@ -668,7 +700,7 @@ pub struct Catalog {
 pub struct AddOutcome {
     /// The name@version now cataloged.
     pub name_version: String,
-    /// Block or bundle.
+    /// Block, bundle, or script.
     pub kind: ArtifactKind,
     /// The cached signature string.
     pub signature: String,
