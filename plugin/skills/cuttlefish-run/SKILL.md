@@ -77,20 +77,35 @@ instead of failing loudly. This is exactly the collision the Overview
 promises never happens, and it only doesn't happen if every daemon gets
 its own endpoint.
 
-On unix, scope the endpoint to the project directory itself:
+On unix, derive a short, project-unique path under `$TMPDIR` (falling
+back to `/tmp`) — **not** literally under `<project_root>/.cuttlefish/`.
+A unix domain socket path has a real, low ceiling (`sizeof(sun_path)`,
+~104 bytes on macOS, ~108 on Linux) that a project nested a few
+directories deep — or running from a session scratchpad, which is
+already a long path — blows through easily; `cuttlefishd` fails loudly
+when it does, but it's an entirely avoidable failure:
 
 ```bash
-ENDPOINT="<project_root>/.cuttlefish/daemon.sock"
+HASH=$(pwd -P | shasum -a 256 | cut -c1-16)
+ENDPOINT="${TMPDIR:-/tmp}/cuttlefish-$HASH.sock"
 CUTTLEFISH_JOBS_HOME="<project_root>/.cuttlefish/jobs" \
   ./target/debug/cuttlefishd <spec> "$ENDPOINT" \
   > <project_root>/.cuttlefish/daemon.log 2>&1 &
 echo $! # the PID to record
 ```
 
+`pwd -P` (not `pwd`) so two different-looking paths to the same project
+(through a symlink, say) hash to the same endpoint rather than
+colliding on two live daemons for one project. Still write the resolved
+`$ENDPOINT` into `<project_root>/.cuttlefish/daemon.json` as usual —
+only the socket file itself moves out of the project tree; every other
+piece of state (`daemon.json`, `jobs/`, `daemon.log`) stays exactly
+where the rest of this doc says.
+
 On Windows a named pipe has no filesystem nesting — it's a flat name in
 the pipe namespace, not a path under `<project_root>`. Derive a
-project-unique name instead, e.g. a short hash of the canonicalized
-project root: `\\.\pipe\cuttlefish-<hash-of-project-root>`.
+project-unique name the same way as above: a short hash of the
+canonicalized project root, `\\.\pipe\cuttlefish-<hash-of-project-root>`.
 (`cuttlefishd`'s named-pipe listener binds with `first_pipe_instance`, so
 on Windows an actual name collision fails loudly at startup rather than
 silently taking over the way unix's `remove_file` does — but a
