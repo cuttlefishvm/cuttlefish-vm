@@ -95,16 +95,28 @@ struct RhaiBlock {
     /// from the wrapper object (`{__cuttlefish_script, input}`) `start`
     /// actually receives.
     input: serde_json::Value,
-    /// Answers to host commands already issued, in the order `infer()` was
-    /// called. Replayed into the script on every re-run; see the module
-    /// doc.
-    log: Vec<serde_json::Value>,
+    /// Host commands already issued and answered, in call order: the exact
+    /// `Command` that was sent, paired with the answer that came back.
+    /// Replayed into the script on every re-run; see the module doc. The
+    /// recorded `Command` (not just the answer) is what makes divergence
+    /// detection possible -- see `run()`'s `infer` closure.
+    log: Vec<(Command, serde_json::Value)>,
+    /// The `Command` `run()` last suspended on, so the next `step()` call
+    /// knows what to pair the answering `Event` with in `log`. `None`
+    /// whenever no command is in flight (before the first call, or right
+    /// after the script finished).
+    pending_command: Option<Command>,
 }
 
 impl RhaiBlock {
     /// (Re-)run the whole script from the top. Returns the next `Command`:
     /// `Infer` if the script (this time) ran into an `infer()` call with no
     /// memoized answer yet, `Done`/`Fail` if it ran to completion.
+    ///
+    /// Callers (`start`/`step`) are responsible for stashing the return
+    /// value into `self.pending_command` when it's an `Infer` -- `run`
+    /// itself takes `&self`, not `&mut self`, so it can't do that stashing
+    /// on its own.
     fn run(&self) -> Command {
         let mut engine = rhai::Engine::new();
         let mut scope = rhai::Scope::new();
@@ -128,16 +140,39 @@ impl RhaiBlock {
                       max_tokens: i64|
                       -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
                     let idx = *call_index.borrow();
-                    if let Some(answer) = log.get(idx) {
+                    let requested = Command::Infer {
+                        prompt: prompt.to_string(),
+                        max_tokens: max_tokens.max(0) as u32,
+                        images: Vec::new(),
+                    };
+
+                    if let Some((recorded_command, answer)) = log.get(idx) {
+                        // Replay only produces a correct result if the
+                        // sequence of infer() calls is identical to the
+                        // original run -- same prompt, same max_tokens, at
+                        // the same call index. If it isn't, the script's
+                        // control flow depended on something other than
+                        // `input` and the prior answers (see the module
+                        // doc), and continuing would silently return a
+                        // wrong result rather than failing loudly.
+                        if recorded_command != &requested {
+                            *pending.borrow_mut() = Some(Command::Fail {
+                                code: "nondeterministic_replay".into(),
+                                message: format!(
+                                    "replay diverged at infer() call {idx}: originally \
+                                     {recorded_command:?}, now {requested:?} -- a script's \
+                                     control flow before an infer() call must depend only on \
+                                     `input` and previously-answered infer() calls"
+                                ),
+                            });
+                            return Err("__cf_suspend_for_host_command".into());
+                        }
                         *call_index.borrow_mut() += 1;
                         return rhai::serde::to_dynamic(answer)
                             .map_err(|e| format!("replaying infer() answer: {e}").into());
                     }
-                    *pending.borrow_mut() = Some(Command::Infer {
-                        prompt: prompt.to_string(),
-                        max_tokens: max_tokens.max(0) as u32,
-                        images: Vec::new(),
-                    });
+
+                    *pending.borrow_mut() = Some(requested);
                     // Aborts Engine::eval() right here. See the module doc's
                     // caveat: a script-level try/catch around this call
                     // would intercept it instead of letting it propagate.
@@ -160,6 +195,17 @@ impl RhaiBlock {
             Err(e) => fail(format!("script error: {e}")),
         }
     }
+
+    /// Run the script and, if it suspended on a new `Infer` command (not a
+    /// `nondeterministic_replay` `Fail`, which also flows through `run`'s
+    /// `pending` mechanism but must never be stashed as if it were a real
+    /// in-flight command), remember it so the next `step()` can pair the
+    /// answering `Event` with it in `log`.
+    fn run_and_track_pending(&mut self) -> Command {
+        let cmd = self.run();
+        self.pending_command = matches!(cmd, Command::Infer { .. }).then(|| cmd.clone());
+        cmd
+    }
 }
 
 impl Block for RhaiBlock {
@@ -180,15 +226,20 @@ impl Block for RhaiBlock {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         self.log.clear();
-        self.run()
+        self.pending_command = None;
+        self.run_and_track_pending()
     }
 
     fn step(&mut self, event: Event) -> Command {
         match event {
             // `infer()` in script sees whatever text the model produced.
             Event::InferDone { text, .. } => {
-                self.log.push(serde_json::Value::String(text));
-                self.run()
+                let command = self.pending_command.take().expect(
+                    "step() received InferDone but no Infer command was pending -- the host \
+                     only sends an Event in response to the Command this block itself issued",
+                );
+                self.log.push((command, serde_json::Value::String(text)));
+                self.run_and_track_pending()
             }
             other => Command::Fail {
                 code: "unexpected_event".into(),
@@ -201,3 +252,63 @@ impl Block for RhaiBlock {
 }
 
 export_block!(RhaiBlock);
+
+/// A `Block` is unit-testable natively, no wasm involved (see the
+/// `cuttlefish-sdk` crate doc) -- these specifically exercise the
+/// `nondeterministic_replay` divergence check, which end-to-end tests in
+/// `crates/cuttlefish-host/tests/rhai_interpreter.rs` can't easily force
+/// (a real script's replay genuinely never diverges there; here `log` is
+/// hand-falsified to simulate a divergence directly).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replay_that_diverges_from_the_recorded_command_fails_loudly() {
+        let block = RhaiBlock {
+            script: "infer(\"real prompt\", 16)".to_string(),
+            input: serde_json::Value::Null,
+            log: vec![(
+                Command::Infer {
+                    prompt: "a different prompt than the script actually sends".to_string(),
+                    max_tokens: 99,
+                    images: Vec::new(),
+                },
+                serde_json::json!("some prior answer"),
+            )],
+            pending_command: None,
+        };
+
+        match block.run() {
+            Command::Fail { code, message } => {
+                assert_eq!(code, "nondeterministic_replay");
+                assert!(message.contains("diverged"), "{message}");
+            }
+            other => panic!("expected a nondeterministic_replay Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_replay_that_matches_the_recorded_command_succeeds() {
+        let block = RhaiBlock {
+            script: "infer(\"real prompt\", 16)".to_string(),
+            input: serde_json::Value::Null,
+            log: vec![(
+                Command::Infer {
+                    prompt: "real prompt".to_string(),
+                    max_tokens: 16,
+                    images: Vec::new(),
+                },
+                serde_json::json!("the memoized answer"),
+            )],
+            pending_command: None,
+        };
+
+        assert_eq!(
+            block.run(),
+            Command::Done {
+                result: serde_json::json!("the memoized answer")
+            }
+        );
+    }
+}
