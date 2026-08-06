@@ -519,6 +519,7 @@ version = "0.0.6"
 dependencies = [
  "cuttlefish-sdk",
  "getrandom 0.3.4",
+ "regex",
  "rhai",
  "serde_json",
 ]
