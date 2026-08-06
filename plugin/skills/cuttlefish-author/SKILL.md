@@ -118,15 +118,44 @@ what a JSON output type like `{summary: text}` expects back: a map with a
 is `+` (`"summarize: " + input.text`).
 
 **`infer(prompt, max_tokens)`** calls the model and returns its reply as a
-string. This is the *only* host command wired into scripts in this initial
-cut — `open`/`slice`/`page_text`/`page_image` (reading files, rendering
-document pages) aren't available to a Rhai script yet; a block that needs
-those still needs `--lang rust`. Example — a real summarizer:
+string:
 
 ```
 //! signature: {text: text} -> {summary: text}
 #{ summary: infer("Summarize in one sentence: " + input.text, 64) }
 ```
+
+**A script can read files too** — every host command a Rust block gets,
+a script gets: `open(path)`, `slice(handle, offset, len)`,
+`slice_bytes(handle, offset, len)`, `page_text(handle, page)`,
+`page_image(handle, page)`. Capability-checked exactly like a Rust
+block's — a script can only `open` a path the spec's `capabilities`
+granted, checked host-side, not by the interpreter. A real
+file-reading block:
+
+```
+//! signature: {path: text} -> {summary: text}
+let f = open(input.path);
+let s = slice(f.handle, 0, f.len);
+#{ summary: infer("Summarize in one sentence: " + s.text, 64) }
+```
+
+- `open(path)` returns `#{ handle, len, kind }` — `kind` mirrors the
+  `MediaKind` a Rust block sees (`#{ kind: "text" }`, `#{ kind: "image",
+  format: "png" }`, `#{ kind: "document", pages: 3, has_text_layer: true
+  }`, `#{ kind: "binary" }`). Branch on `f.kind.kind` before deciding
+  which of the below to call — `slice` on an image handle fails the same
+  way it would from Rust.
+- `slice(handle, offset, len)` returns `#{ text, next_offset }` — resume
+  a walk from `next_offset`, not `offset + len`; the host cuts back to a
+  UTF-8 character boundary, so those can differ.
+- `slice_bytes(handle, offset, len)` returns `#{ bytes_base64,
+  next_offset }` — for genuinely binary data; prefer `slice` for text.
+- `page_text(handle, page)` returns `#{ text }` — fails if the document
+  has no text layer; check `f.kind.has_text_layer` first.
+- `page_image(handle, page)` returns `#{ handle, len }` — a *new* handle,
+  usable in `infer`'s `images` (not exposed to scripts as a separate
+  parameter yet; this is a real remaining gap, not an oversight).
 
 **`parse_json(text)`** parses a JSON string into a real Rhai value (an
 object map for a JSON object, an array for a JSON array, etc.) — for when
@@ -155,13 +184,15 @@ block's own value.)
 
 The interpreter bridges a synchronous language into cuttlefish's async,
 host-driven protocol via **replay**: the *entire* script re-runs from
-scratch every time `infer()` is called and answered, with already-answered
-calls replayed instantly from a log and the first unanswered call
-suspending execution to ask the host. This only produces correct results if
-re-running the script always retraces the *same sequence* of `infer()`
-calls, in the same order — i.e. the script's control flow before an
-unanswered call must depend only on `input` and the answers already in the
-log.
+scratch every time a host call (`infer`, `open`, `slice`, `slice_bytes`,
+`page_text`, `page_image`) is answered, with already-answered calls
+replayed instantly from a log and the first unanswered one suspending
+execution to ask the host. This only produces correct results if
+re-running the script always retraces the *same sequence* of host calls,
+in the same order — i.e. the script's control flow before an unanswered
+call must depend only on `input` and the answers already in the log.
+Mixing kinds is fine (`open` then `infer` then `slice`, say) — the log is
+one linear sequence across all of them, not one per function.
 
 Two concrete rules follow from this:
 
@@ -169,15 +200,17 @@ Two concrete rules follow from this:
    maintain — rhai's `timestamp()` and real random-number generation are
    structurally unavailable in this interpreter, so there's nothing
    non-replayable to reach for by accident.
-2. **Never wrap `infer(...)` in `try { } catch { }`.** The suspend
-   mechanism works by the native `infer` function raising an error that
-   aborts evaluation; Rhai gives native functions no way to raise an error
-   a script genuinely can't catch, so a `try`/`catch` around the call would
+2. **Never wrap a host call in `try { } catch { }`.** The suspend
+   mechanism works by the native function raising an error that aborts
+   evaluation; Rhai gives native functions no way to raise an error a
+   script genuinely can't catch, so a `try`/`catch` around the call would
    intercept the suspend signal as an ordinary script error instead of
-   letting it propagate — corrupting the replay. If a script's `infer()`
-   call is ever wrapped this way, its behavior is undefined; don't do it.
+   letting it propagate — corrupting the replay. If any of `infer`,
+   `open`, `slice`, `slice_bytes`, `page_text`, or `page_image` is ever
+   wrapped this way, behavior is undefined; don't do it. (`parse_json` is
+   not a host call — it's fine to wrap.)
 
-If replay-vs-original ever produces a genuinely different `infer()` call
+If replay-vs-original ever produces a genuinely different host-call
 sequence (almost always because a script read something other than `input`
 and the log to make a decision — e.g. relying on iteration order of a
 freshly-constructed map with no stable ordering), the job fails with a

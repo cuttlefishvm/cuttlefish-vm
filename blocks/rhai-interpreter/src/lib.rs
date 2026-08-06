@@ -39,22 +39,28 @@
 //! `../../.cargo/config.toml`) specifically so nothing non-replayable can
 //! sneak into a script's control flow through rhai's own stdlib.
 //!
-//! **Known unsoundness, not fixed here**: a script that wraps the `infer()`
-//! call in `try { ... } catch { ... }` would intercept our "suspend" error
-//! as an ordinary script-level error instead of letting it propagate out of
-//! `eval()`. Rhai gives native functions no way to raise an error a script
-//! genuinely cannot catch. A real implementation would need either to ban
-//! `try`/`catch` around host calls (Rhai has no scope for that short of a
-//! custom AST walk before running the script) or accept that a
-//! catch-wrapped host call breaks the model. Flagging this rather than
-//! solving it -- it's a real gap, documented in the `cuttlefish-author`
-//! skill so an agent authoring a script knows not to do this.
+//! **Known unsoundness, not fixed here**: a script that wraps any host
+//! round-trip call (`infer`, `open`, `slice`, `slice_bytes`, `page_text`,
+//! `page_image`) in `try { ... } catch { ... }` would intercept our
+//! "suspend" error as an ordinary script-level error instead of letting it
+//! propagate out of `eval()`. Rhai gives native functions no way to raise
+//! an error a script genuinely cannot catch. A real implementation would
+//! need either to ban `try`/`catch` around host calls (Rhai has no scope
+//! for that short of a custom AST walk before running the script) or
+//! accept that a catch-wrapped host call breaks the model. Flagging this
+//! rather than solving it -- it's a real gap, documented in the
+//! `cuttlefish-author` skill so an agent authoring a script knows not to
+//! do this. (`parse_json` is the one exception: it's an ordinary
+//! synchronous function, not a host round-trip, so it's genuinely safe to
+//! wrap in `try`/`catch`.)
 //!
-//! **Only `infer` is wired in this initial cut.** `open`/`slice`/
-//! `page_text`/`page_image` are architecturally identical to add (the same
-//! log-and-suspend mechanism), but wiring each one is left as a documented
-//! follow-up rather than shipped speculatively here — see the
-//! `cuttlefish-author` skill for what a script can and can't do today.
+//! **Every `Command` a Rust block can issue, a script can too**: `infer`,
+//! `open`, `slice`, `slice_bytes`, `page_text`, `page_image` are all
+//! registered here, sharing one suspend-or-replay decision
+//! (`issue_or_replay`) parameterized only by which `Command` each call
+//! builds -- capability enforcement (what a script may `open`) happens
+//! host-side in the same generic `Command` dispatch loop a Rust block's
+//! commands go through, so it applies here unchanged.
 
 use cuttlefish_sdk::{export_block, Block, Command, Event};
 use std::cell::RefCell;
@@ -86,6 +92,48 @@ fn fail(message: String) -> Command {
         code: "schema_validation_failed".into(),
         message,
     }
+}
+
+/// The shared suspend-or-replay decision every host-round-trip function
+/// (`infer`, `open`, `slice`, `slice_bytes`, `page_text`, `page_image`)
+/// makes, factored out so each one only has to build its own `Command` --
+/// see the module doc's "Bridging a synchronous scripting language..."
+/// section for why this needs to exist at all.
+///
+/// Divergence detection is generic across every call KIND, not just
+/// `infer`: a script that opened a file on one run and called `infer`
+/// instead at the same call index on a replay is exactly as
+/// nondeterministic as a script that changed its prompt.
+fn issue_or_replay(
+    command: Command,
+    call_index: &Rc<RefCell<usize>>,
+    pending: &Rc<RefCell<Option<Command>>>,
+    log: &[(Command, serde_json::Value)],
+) -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+    let idx = *call_index.borrow();
+
+    if let Some((recorded_command, answer)) = log.get(idx) {
+        if recorded_command != &command {
+            *pending.borrow_mut() = Some(Command::Fail {
+                code: "nondeterministic_replay".into(),
+                message: format!(
+                    "replay diverged at host call {idx}: originally {recorded_command:?}, now \
+                     {command:?} -- a script's control flow before a host call must depend only \
+                     on `input` and previously-answered host calls"
+                ),
+            });
+            return Err("__cf_suspend_for_host_command".into());
+        }
+        *call_index.borrow_mut() += 1;
+        return rhai::serde::to_dynamic(answer)
+            .map_err(|e| format!("replaying a host call's answer: {e}").into());
+    }
+
+    *pending.borrow_mut() = Some(command);
+    // Aborts Engine::eval() right here. See the module doc's caveat: a
+    // script-level try/catch around this call would intercept it instead
+    // of letting it propagate.
+    Err("__cf_suspend_for_host_command".into())
 }
 
 #[derive(Default)]
@@ -147,54 +195,125 @@ impl RhaiBlock {
 
         let call_index = Rc::new(RefCell::new(0usize));
         let pending: Rc<RefCell<Option<Command>>> = Rc::new(RefCell::new(None));
-        let log = self.log.clone();
+        let log = Rc::new(self.log.clone());
 
+        // Every host-round-trip function below (as opposed to a pure one
+        // like parse_json) shares this shape: build the Command the call
+        // represents, then hand it to issue_or_replay, which either
+        // returns the memoized answer from a prior run or suspends. Each
+        // closure needs its own clone of call_index/pending/log (all cheap
+        // -- an Rc bump or a couple of words), since rhai::Engine::register_fn
+        // takes ownership of what it's given and each arity is a distinct
+        // closure type.
         {
-            let call_index = call_index.clone();
-            let pending = pending.clone();
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
             engine.register_fn(
                 "infer",
                 move |prompt: &str,
                       max_tokens: i64|
                       -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
-                    let idx = *call_index.borrow();
-                    let requested = Command::Infer {
-                        prompt: prompt.to_string(),
-                        max_tokens: max_tokens.max(0) as u32,
-                        images: Vec::new(),
-                    };
-
-                    if let Some((recorded_command, answer)) = log.get(idx) {
-                        // Replay only produces a correct result if the
-                        // sequence of infer() calls is identical to the
-                        // original run -- same prompt, same max_tokens, at
-                        // the same call index. If it isn't, the script's
-                        // control flow depended on something other than
-                        // `input` and the prior answers (see the module
-                        // doc), and continuing would silently return a
-                        // wrong result rather than failing loudly.
-                        if recorded_command != &requested {
-                            *pending.borrow_mut() = Some(Command::Fail {
-                                code: "nondeterministic_replay".into(),
-                                message: format!(
-                                    "replay diverged at infer() call {idx}: originally \
-                                     {recorded_command:?}, now {requested:?} -- a script's \
-                                     control flow before an infer() call must depend only on \
-                                     `input` and previously-answered infer() calls"
-                                ),
-                            });
-                            return Err("__cf_suspend_for_host_command".into());
-                        }
-                        *call_index.borrow_mut() += 1;
-                        return rhai::serde::to_dynamic(answer)
-                            .map_err(|e| format!("replaying infer() answer: {e}").into());
-                    }
-
-                    *pending.borrow_mut() = Some(requested);
-                    // Aborts Engine::eval() right here. See the module doc's
-                    // caveat: a script-level try/catch around this call
-                    // would intercept it instead of letting it propagate.
-                    Err("__cf_suspend_for_host_command".into())
+                    issue_or_replay(
+                        Command::Infer {
+                            prompt: prompt.to_string(),
+                            max_tokens: max_tokens.max(0) as u32,
+                            images: Vec::new(),
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
+                "open",
+                move |path: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::Open {
+                            path: path.to_string(),
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
+                "slice",
+                move |handle: i64,
+                      offset: i64,
+                      len: i64|
+                      -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::Slice {
+                            handle: handle.max(0) as u32,
+                            offset: offset.max(0) as u64,
+                            len: len.max(0) as u64,
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
+                "slice_bytes",
+                move |handle: i64,
+                      offset: i64,
+                      len: i64|
+                      -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::SliceBytes {
+                            handle: handle.max(0) as u32,
+                            offset: offset.max(0) as u64,
+                            len: len.max(0) as u64,
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
+                "page_text",
+                move |handle: i64, page: i64| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::PageText {
+                            handle: handle.max(0) as u32,
+                            page: page.max(0) as u32,
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
+                "page_image",
+                move |handle: i64, page: i64| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::PageImage {
+                            handle: handle.max(0) as u32,
+                            page: page.max(0) as u32,
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
                 },
             );
         }
@@ -236,14 +355,23 @@ impl RhaiBlock {
         }
     }
 
-    /// Run the script and, if it suspended on a new `Infer` command (not a
-    /// `nondeterministic_replay` `Fail`, which also flows through `run`'s
+    /// Run the script and, if it suspended on a new host-call command (not
+    /// a `nondeterministic_replay` `Fail`, which also flows through `run`'s
     /// `pending` mechanism but must never be stashed as if it were a real
     /// in-flight command), remember it so the next `step()` can pair the
     /// answering `Event` with it in `log`.
     fn run_and_track_pending(&mut self) -> Command {
         let cmd = self.run();
-        self.pending_command = matches!(cmd, Command::Infer { .. }).then(|| cmd.clone());
+        let is_host_call = matches!(
+            cmd,
+            Command::Infer { .. }
+                | Command::Open { .. }
+                | Command::Slice { .. }
+                | Command::SliceBytes { .. }
+                | Command::PageText { .. }
+                | Command::PageImage { .. }
+        );
+        self.pending_command = is_host_call.then(|| cmd.clone());
         cmd
     }
 }
@@ -271,23 +399,50 @@ impl Block for RhaiBlock {
     }
 
     fn step(&mut self, event: Event) -> Command {
-        match event {
-            // `infer()` in script sees whatever text the model produced.
-            Event::InferDone { text, .. } => {
-                let command = self.pending_command.take().expect(
-                    "step() received InferDone but no Infer command was pending -- the host \
-                     only sends an Event in response to the Command this block itself issued",
-                );
-                self.log.push((command, serde_json::Value::String(text)));
-                self.run_and_track_pending()
-            }
-            other => Command::Fail {
-                code: "unexpected_event".into(),
-                message: format!(
-                    "this interpreter only wires up Infer round-trips in this initial cut: {other:?}"
-                ),
+        // Every arm below does the same thing: take the one command this
+        // block itself issued (there is always exactly one in flight --
+        // the host only ever answers what was asked), turn the event's
+        // payload into the JSON value the script sees, log the pair, and
+        // resume. `pending_command` came from `run_and_track_pending`,
+        // which stashes it for exactly this purpose.
+        let command = self.pending_command.take().unwrap_or_else(|| {
+            panic!(
+                "step() received {event:?} but no command was pending -- the host only sends an \
+                 event in response to the command this block itself issued"
+            )
+        });
+
+        let answer = match event {
+            Event::InferDone { text, .. } => serde_json::Value::String(text),
+            Event::Opened { handle, len, kind } => match serde_json::to_value(kind) {
+                Ok(kind) => serde_json::json!({ "handle": handle, "len": len, "kind": kind }),
+                Err(e) => return fail(format!("converting an Opened event: {e}")),
             },
-        }
+            Event::Sliced { text, next_offset } => {
+                serde_json::json!({ "text": text, "next_offset": next_offset })
+            }
+            Event::SlicedBytes {
+                bytes_base64,
+                next_offset,
+            } => {
+                serde_json::json!({ "bytes_base64": bytes_base64, "next_offset": next_offset })
+            }
+            Event::PageTexted { text } => serde_json::json!({ "text": text }),
+            Event::PageImaged { handle, len } => {
+                serde_json::json!({ "handle": handle, "len": len })
+            }
+            other => {
+                return Command::Fail {
+                    code: "unexpected_event".into(),
+                    message: format!(
+                        "this interpreter has no script-facing call that produces {other:?}"
+                    ),
+                }
+            }
+        };
+
+        self.log.push((command, answer));
+        self.run_and_track_pending()
     }
 }
 
