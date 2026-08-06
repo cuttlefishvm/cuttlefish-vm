@@ -32,3 +32,16 @@ rhai = { version = "1", features = ["serde", "no_time"] }
 # Only needed to supply the "custom" backend rhai's transitive `getrandom`
 # dependency requires on wasm32-unknown-unknown; see ../../.cargo/config.toml.
 getrandom = "0.3"
+# For regex_test/regex_find/regex_replace_all -- unlike jsonschema (kept out
+# of the wasm guest deliberately, see crates/cuttlefish/Cargo.toml), this is
+# genuinely lightweight: 3 crates total (regex, regex-automata,
+# regex-syntax), none of them the ~15-crate ICU stack jsonschema pulls in --
+# regex's own Unicode support (needed for \d/\s/(?i) to work) is small,
+# inline tables in regex-syntax, not a separate dependency chain. Confirmed
+# compiling clean to wasm32-unknown-unknown. Gives a script real
+# text-extraction capability (e.g. a whitespace/punctuation-tolerant
+# heading match) without needing a Rust toolchain -- this interpreter ships
+# prebuilt in the cuttlefish/cuttlefishd binaries, so nothing here costs an
+# end user anything a Rust proc-block doing the same extraction would (a
+# wasm32 target, which isn't reliably present -- confirmed live, twice).
+regex = "1"

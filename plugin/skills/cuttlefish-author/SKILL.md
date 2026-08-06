@@ -157,6 +157,29 @@ let s = slice(f.handle, 0, f.len);
   usable in `infer`'s `images` (not exposed to scripts as a separate
   parameter yet; this is a real remaining gap, not an oversight).
 
+**Finding/pulling a section out of what you read** — `regex_test(text,
+pattern)` returns whether `pattern` matches anywhere in `text`;
+`regex_find(text, pattern)` returns `#{ found, start, end, text }` for the
+*first* match (`found: false` — never an error — when there isn't one);
+`regex_replace_all(text, pattern, replacement)` replaces every match
+(`$1`-style backreferences work in `replacement`). All three are ordinary
+functions, not host round-trips — safe to wrap in `try`/`catch`, and an
+invalid pattern is a normal script error. A section heading that varies in
+whitespace/punctuation across documents (a real case: SEC filing HTML
+sometimes renders `Item 1A. Risk Factors` as `Item 1A. RI SK FACTORS`,
+letters spaced out) is exactly what these are for:
+
+```
+//! signature: {path: text} -> {section: text}
+let f = open(input.path);
+let s = slice(f.handle, 0, f.len);
+let m = regex_find(s.text, "(?i)item\\s*1a\\.?\\s*risk\\s*factors");
+if !m.found {
+  throw "no Item 1A heading found in " + input.path;
+}
+#{ section: s.text.sub_string(m.start) }
+```
+
 **`parse_json(text)`** parses a JSON string into a real Rhai value (an
 object map for a JSON object, an array for a JSON array, etc.) — for when
 a prompt asks the model for structured output and the script needs actual
