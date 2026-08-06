@@ -117,7 +117,13 @@ jobs:
       - name: Clippy
         run: cargo clippy -p cuttlefish-host --features llamacpp --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test -p cuttlefish-host --features llamacpp --locked
+        # Scoped to --lib plus the one integration binary that actually
+        # touches this feature. The other 13 integration binaries under
+        # tests/ are already covered by the baseline Compile and Test jobs
+        # without the feature on -- running them again here too just pays
+        # for the same from-scratch fixture-crate compiles (bundle_a,
+        # det_a, res_a, ...) a second time for zero additional coverage.
+        run: cargo test -p cuttlefish-host --features llamacpp --locked --lib --test llamacpp
 
   # `pdf-render` is off by default, so nothing above compiles it. It shipped
   # with three type errors for exactly that reason — a feature-gated path that
@@ -144,7 +150,12 @@ jobs:
       - name: Clippy
         run: cargo clippy -p cuttlefish-host --features pdf-render --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test -p cuttlefish-host --features pdf-render --locked
+        # Same reasoning as the llamacpp job's Test step: scoped to --lib
+        # plus tests/media.rs, the one integration binary with real
+        # #[cfg(feature = "pdf-render")] tests. loud_failures.rs's
+        # pdf-render-related assertion is for the feature being *off*, so
+        # it's already exercised by the baseline jobs, not this one.
+        run: cargo test -p cuttlefish-host --features pdf-render --locked --lib --test media
 
   msrv:
     name: Minimum Supported Rust Version
