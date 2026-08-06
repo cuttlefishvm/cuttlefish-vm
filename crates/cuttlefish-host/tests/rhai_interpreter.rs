@@ -133,6 +133,42 @@ async fn a_rhai_script_can_round_trip_an_infer_call_through_the_real_host() {
     assert_eq!(result["summary"], "a stub summary");
 }
 
+#[tokio::test]
+async fn a_rhai_script_can_parse_json_out_of_a_real_infer_reply() {
+    let script = r#"#{ verdict: parse_json(infer("judge this", 16)).verdict }"#;
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::Value::Null,
+        caps: Capabilities::new(Vec::new()),
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        // The stub's reply is word-truncated to max_tokens (16 above), so
+        // this stays comfortably under that to prove a genuine round trip,
+        // not an accidentally-truncated one.
+        Arc::new(cuttlefish_host::infer::StubBackend {
+            reply: r#"{"verdict": "pass"}"#.to_string(),
+        }),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["verdict"], "pass");
+}
+
 /// The full real path: catalog a `.rhai` file, resolve it via
 /// `resolve_and_load`, check it into a `CheckedNode` via `check_graph`, run
 /// a real job against it via `run_job` — asserting the result matches what

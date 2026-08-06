@@ -128,6 +128,29 @@ those still needs `--lang rust`. Example — a real summarizer:
 #{ summary: infer("Summarize in one sentence: " + input.text, 64) }
 ```
 
+**`parse_json(text)`** parses a JSON string into a real Rhai value (an
+object map for a JSON object, an array for a JSON array, etc.) — for when
+a prompt asks the model for structured output and the script needs actual
+fields back, not just a string. Ordinary function, not a host round-trip:
+safe to wrap in `try`/`catch` (unlike `infer`), and on unparseable text it
+raises a normal script error, which fails the job — the same "throw, don't
+default" outcome the "Things worth knowing" section below asks you to
+build by hand for a raw `infer()` reply, already built in here:
+
+```
+//! signature: {question: text} -> {verdict: text}
+let judged = parse_json(infer(
+  "Answer with JSON only: {\"verdict\": \"pass\"|\"fail\"}. " + input.question,
+  32
+));
+#{ verdict: judged.verdict }
+```
+
+(`try`/`catch` is a statement in Rhai, not an expression — if you want to
+handle a parse failure instead of letting it fail the job, assign into a
+variable declared beforehand rather than trying to use the `try`/`catch`
+block's own value.)
+
 ### Determinism rules — read before writing anything non-trivial
 
 The interpreter bridges a synchronous language into cuttlefish's async,
