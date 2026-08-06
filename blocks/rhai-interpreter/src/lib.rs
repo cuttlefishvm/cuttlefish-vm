@@ -127,6 +127,24 @@ impl RhaiBlock {
         };
         scope.push("input", dynamic_input);
 
+        // Ordinary synchronous function, not a host round-trip -- doesn't
+        // touch call_index/log, so it has no replay implications and is
+        // safe for a script to wrap in try/catch (unlike infer()). Exists
+        // so a script asking the model for structured output has some way
+        // to turn the reply into a real record instead of only raw string
+        // ops; a script that calls this on an unparseable reply gets a
+        // normal Rhai runtime error and the job fails, matching the
+        // "throw on an unreadable answer, never default" rule.
+        engine.register_fn(
+            "parse_json",
+            |text: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                let value: serde_json::Value = serde_json::from_str(text)
+                    .map_err(|e| format!("parse_json: {e}"))?;
+                rhai::serde::to_dynamic(&value)
+                    .map_err(|e| format!("parse_json: converting to a script value: {e}").into())
+            },
+        );
+
         let call_index = Rc::new(RefCell::new(0usize));
         let pending: Rc<RefCell<Option<Command>>> = Rc::new(RefCell::new(None));
         let log = self.log.clone();
@@ -364,5 +382,65 @@ mod tests {
             }
             other => panic!("expected a nondeterministic_replay Fail, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_json_turns_a_json_string_into_a_real_record() {
+        let block = RhaiBlock {
+            script: r#"let v = parse_json("{\"score\": 7, \"verdict\": \"pass\"}"); #{ verdict: v.verdict, doubled: v.score * 2 }"#.to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        assert_eq!(
+            block.run(),
+            Command::Done {
+                result: serde_json::json!({"verdict": "pass", "doubled": 14})
+            }
+        );
+    }
+
+    #[test]
+    fn parse_json_on_unparseable_text_fails_the_job_not_a_silent_default() {
+        let block = RhaiBlock {
+            script: r#"parse_json("not json")"#.to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        match block.run() {
+            Command::Fail { message, .. } => {
+                assert!(message.contains("parse_json"), "{message}");
+            }
+            other => panic!("expected a Fail naming parse_json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_json_is_safe_to_wrap_in_try_catch_unlike_infer() {
+        // Unlike infer(), parse_json isn't a suspend point -- a script may
+        // catch its error without corrupting the replay mechanism. (try/
+        // catch is a statement in Rhai, not an expression, hence the `let`
+        // + trailing-expression form rather than using its value directly.)
+        let block = RhaiBlock {
+            script: r#"
+                let v = #{};
+                try { v = parse_json("not json"); } catch { v = #{ fallback: true }; }
+                v
+            "#
+            .to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        assert_eq!(
+            block.run(),
+            Command::Done {
+                result: serde_json::json!({"fallback": true})
+            }
+        );
     }
 }
