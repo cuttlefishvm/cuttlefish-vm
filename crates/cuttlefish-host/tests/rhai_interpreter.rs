@@ -169,6 +169,87 @@ async fn a_rhai_script_can_parse_json_out_of_a_real_infer_reply() {
     assert_eq!(result["verdict"], "pass");
 }
 
+/// `open`/`slice` through a real capability grant -- proves a Rhai script
+/// can read a file at all, the gap that motivated adding these (a script
+/// previously had only `input` and `infer()`; any real document work had
+/// to happen entirely outside cuttlefish).
+#[tokio::test]
+async fn a_rhai_script_can_open_and_slice_a_real_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("doc.txt");
+    std::fs::write(&doc, "hello from a real file").unwrap();
+
+    let script = r#"
+        let f = open(input.path);
+        let s = slice(f.handle, 0, f.len);
+        #{ text: s.text, len: f.len }
+    "#;
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": doc.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+    };
+
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["text"], "hello from a real file");
+    assert_eq!(result["len"], "hello from a real file".len());
+}
+
+/// The same capability enforcement a Rust block gets, proven for a Rhai
+/// script too -- `open` is capability-checked by the host regardless of
+/// which language issued it, since enforcement lives in the generic
+/// Command dispatch loop, not per-guest-language code.
+#[tokio::test]
+async fn a_rhai_script_s_open_is_denied_outside_its_granted_capabilities() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let doc = outside.path().join("secret.txt");
+    std::fs::write(&doc, "should not be readable").unwrap();
+
+    let script = r#"open(input.path); #{ ok: true }"#;
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": doc.to_str().unwrap() }),
+        // Granted a real, but unrelated, root -- not `outside`.
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+    };
+
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+}
+
 /// The full real path: catalog a `.rhai` file, resolve it via
 /// `resolve_and_load`, check it into a `CheckedNode` via `check_graph`, run
 /// a real job against it via `run_job` — asserting the result matches what
