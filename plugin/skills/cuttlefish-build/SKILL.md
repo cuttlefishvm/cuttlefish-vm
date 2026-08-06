@@ -16,6 +16,50 @@ filesystem operations — no daemon, no network.
 **REQUIRED SUB-SKILL:** Use cuttlefish-cli to get the `cuttlefish` binary
 before proceeding.
 
+## Spec file syntax
+
+A `.cuttlefish` file is `spec NAME = { field = value; ... }`. Unknown fields
+are a hard error (deny-by-default), so this is the whole field list — don't
+grep `crates/cuttlefish-core/src/spec.rs` for it:
+
+```
+spec summarize_docs = {
+  description = "Use when the agent needs a summary of a local file and
+                  the content must not leave the machine.";
+  model = Ollama "llama3.2:1b";
+  data_policy = Local_only;
+  capabilities = [ Read "./docs" ];
+  block = "../blocks/echo-summarize";
+}
+```
+
+- `description` — trigger conditions for a *calling agent*, not an
+  explanation of internals.
+- `model = Provider "target"` — provider is a bare, case-insensitive ident
+  (`Ollama`, `LlamaCpp`, `Stub`); target's meaning is provider-specific (a
+  model tag for Ollama, a `.gguf` path for LlamaCpp, the canned reply for
+  Stub). Naming a provider this build wasn't compiled with is a resolution
+  error listing what's actually available — see the README's "Inference
+  providers" table for the full list and feature-flag requirements.
+- `data_policy` — `Local_only` or `Any`. Discovery metadata for the calling
+  agent (pass paths vs. contents); not itself an enforcement mechanism.
+- `capabilities = [ Read "path", ... ]` — the only supported capability kind
+  is `Read`; every path becomes a root a block may read beneath. This is the
+  actual enforcement boundary, checked at build time and again at runtime.
+- `block = "..."` — sugar for a one-node graph. A path relative to the
+  spec's own directory (or one ending `.wasm`/`.cfbundle`) reads straight
+  from disk; anything else is a catalog `name@version` lookup (see
+  `cuttlefish-catalog`).
+- `nodes = { name = { block = "..."; in = { field = other_node.out; }; };
+  ... };` — the real multi-block graph `block = "..."` desugars to. Each
+  node's `in` maps its input record's fields to `other_node.out`
+  expressions; omit `in` for a node with no inbound edge. Typechecked the
+  same way as any other seam (see "Command" below) before anything runs.
+- `branches = { node = { "route_label" -> target_node; ... }; ... };` —
+  conditional dispatch for a branching node's labeled routes. Uncommon
+  enough that if you need it, read `crates/cuttlefish-core/src/graph.rs`
+  rather than trust a summary here.
+
 ## Command
 
 ```

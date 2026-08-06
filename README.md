@@ -67,9 +67,11 @@ $ cuttlefish run --spec summarize_docs --input '{"path": "examples/docs/a.txt"}'
 }
 ```
 
-That is a real local model, not a stub. Still to come: more inference
-providers, the typed DSL with block signatures, multi-block pipelines, the
-model pool, the block registry, and the agent harness.
+That is a real local model, not a stub. Multi-block pipelines exist too — a
+spec's `block = "...";` is sugar for a one-node graph; `nodes = { name = {
+block = "..."; in = { field = other_node.out; }; }; ... };` wires up a real
+DAG with typed fan-in, checked at build time. Still to come: more inference
+providers, the model pool, the block registry, and the agent harness.
 
 ### Beyond text
 
