@@ -20,10 +20,13 @@
 //! the daemon (`run`, `submit`, `jobs`, `resume`, `cancel`, `shutdown`,
 //! `specs`). The split is by dependency, and it is no longer a platform
 //! boundary: both halves compile everywhere now that the transport has a
-//! named-pipe implementation on Windows.
+//! named-pipe implementation on Windows. `models` is a third kind: it talks
+//! to Ollama directly, neither the filesystem nor `cuttlefishd`.
 //!
 //! Argument parsing is deliberately not split: one `clap` derive covers every
 //! subcommand on every platform.
+
+mod models;
 
 mod cli {
     use anyhow::{bail, Context};
@@ -176,6 +179,27 @@ mod cli {
             #[arg(long)]
             input: Option<String>,
         },
+        /// What's known about local models. No running daemon required —
+        /// talks to Ollama directly.
+        Models {
+            #[command(subcommand)]
+            action: ModelsCmd,
+        },
+    }
+
+    /// `cuttlefish models` subcommands.
+    #[derive(Subcommand)]
+    enum ModelsCmd {
+        /// List every model Ollama has pulled locally, each annotated with
+        /// what's known about it (e.g. whether it defaults to emitting
+        /// `<think>`-style reasoning tokens) — so a spec's `model = Ollama
+        /// "..."` can be chosen without hand-probing models one at a time.
+        List {
+            /// Ollama's base URL. Defaults to `$OLLAMA_HOST`, or
+            /// Ollama's own default if that isn't set either.
+            #[arg(long)]
+            host: Option<String>,
+        },
     }
 
     /// `cuttlefish block` subcommands.
@@ -260,7 +284,19 @@ mod cli {
                     },
             } => block_new_cmd(&name, &input, &output, description.as_deref(), &lang),
             Cmd::ValidateJson { schema, input } => validate_json_cmd(&schema, input.as_deref()),
+            Cmd::Models {
+                action: ModelsCmd::List { host },
+            } => models_list_cmd(host).await,
         }
+    }
+
+    /// List Ollama's locally pulled models with their best-effort
+    /// classification, as JSON.
+    async fn models_list_cmd(host: Option<String>) -> anyhow::Result<()> {
+        let host = host.unwrap_or_else(cuttlefish_host::ollama::OllamaBackend::host_from_env);
+        let models = crate::models::list_ollama_models(&host).await?;
+        println!("{}", serde_json::to_string_pretty(&models)?);
+        Ok(())
     }
 
     /// Validate a JSON value (inline `--input`, or stdin if omitted)

@@ -41,6 +41,12 @@ spec summarize_docs = {
   Stub). Naming a provider this build wasn't compiled with is a resolution
   error listing what's actually available — see the README's "Inference
   providers" table for the full list and feature-flag requirements.
+  Before picking an Ollama tag, run `cuttlefish models list` — it lists
+  every locally pulled model with a best-effort `reasoning` flag
+  (`true`/`false`/unknown), so a job using `infer()` with a modest
+  `max_tokens` doesn't accidentally land on a reasoning model that burns
+  its whole budget on `<think>` output and returns an empty reply. Don't
+  hand-probe models one at a time to rediscover this.
 - `data_policy` — `Local_only` or `Any`. Discovery metadata for the calling
   agent (pass paths vs. contents); not itself an enforcement mechanism.
 - `capabilities = [ Read "path", ... ]` — the only supported capability kind
