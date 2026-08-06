@@ -165,10 +165,14 @@ the right thing to do, not as the default way to kick off work.
 ## Running as a dispatched agent
 
 For an actual job run — not a quick one-off check like `cuttlefish jobs`
-— prefer dispatching a subagent (a plain `general-purpose` one; no custom
-subagent type is needed for this) via the `Agent` tool whose entire task
-is: follow this skill's ensure-daemon/submit/poll/auto-resume procedure
-for one spec + input, and report back the final job result. Two reasons:
+— prefer dispatching the `cuttlefish-runner` agent (via the `Agent` tool)
+rather than following this skill's ensure-daemon/submit/poll/auto-resume
+procedure inline. It's the same procedure, already baked into that
+agent's own system prompt — dispatching it skips loading this skill at
+all. Give it the project root, the resolved `BIN_DIR` (dispatch
+`cuttlefish-binary-resolver` first if binaries aren't already known to be
+on `PATH`), the spec name/path, and the input JSON; it reports back the
+job's final result. Two reasons to prefer this over driving it inline:
 
 - **Transcript identity.** Driving the full lifecycle inline renders as
   an anonymous run of collapsed "Ran N shell commands" entries,

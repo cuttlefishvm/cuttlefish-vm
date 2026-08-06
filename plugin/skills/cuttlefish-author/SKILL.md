@@ -26,6 +26,13 @@ comfortably in a script.
 **REQUIRED SUB-SKILL:** Use cuttlefish-cli to get the `cuttlefish` binary
 before proceeding.
 
+Writing an actual block's logic doesn't have to happen inline — dispatch
+the `cuttlefish-block-author` agent instead, with the name, signature,
+description, language, and (concretely, not just the shape) what the
+block should do. It follows the same scaffold/write/catalog steps this
+skill documents, and reports back a receipt rather than leaving the
+authoring noise in the calling session's transcript.
+
 Only `cuttlefish` itself is needed to run `block new`. Building a
 *scaffolded Rust block* additionally needs a real Rust toolchain — that's
 the one place this skill's Rhai-by-default framing doesn't apply; the Rhai
