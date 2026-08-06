@@ -138,8 +138,8 @@ impl RhaiBlock {
         engine.register_fn(
             "parse_json",
             |text: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
-                let value: serde_json::Value = serde_json::from_str(text)
-                    .map_err(|e| format!("parse_json: {e}"))?;
+                let value: serde_json::Value =
+                    serde_json::from_str(text).map_err(|e| format!("parse_json: {e}"))?;
                 rhai::serde::to_dynamic(&value)
                     .map_err(|e| format!("parse_json: converting to a script value: {e}").into())
             },
