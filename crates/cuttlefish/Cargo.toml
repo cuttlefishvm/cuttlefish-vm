@@ -35,6 +35,13 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 wasmtime = { workspace = true }
+# Only this crate needs it -- `validate-json` is host-only, native. Keeping
+# it out of cuttlefish-abi/cuttlefish-sdk matters: those compile to
+# wasm32-unknown-unknown as part of every guest proc-block, and this crate
+# pulls in ~100 transitive dependencies (full ICU Unicode tables,
+# fancy-regex, num-bigint) that would bloat every block's build for a
+# capability guest scripts don't even call.
+jsonschema = { version = "0.49", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

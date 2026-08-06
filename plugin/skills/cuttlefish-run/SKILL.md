@@ -162,6 +162,15 @@ cuttlefish cancel --endpoint <endpoint> <job_id>
 job finishes — use it only when actually waiting for a single result is
 the right thing to do, not as the default way to kick off work.
 
+**Checking a result against more than its declared `Ty` signature:**
+`cuttlefish validate-json <schema.json> --input '<json>'` (or pipe the
+value in over stdin) validates against a real JSON Schema — purely
+local, no daemon involved. Useful for a driver script collecting many
+jobs' results (e.g. into a dataset) that wants a stronger guarantee than
+"this is valid JSON shaped like the signature" before accepting one:
+exits 0 silently if it conforms, exits 1 with every violation (not just
+the first) on stderr otherwise.
+
 ## Running as a dispatched agent
 
 For an actual job run — not a quick one-off check like `cuttlefish jobs`
