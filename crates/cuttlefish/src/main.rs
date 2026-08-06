@@ -160,6 +160,22 @@ mod cli {
             #[command(subcommand)]
             action: BlockCmd,
         },
+        /// Validate a JSON value against a JSON Schema. Purely local — no
+        /// running daemon required. Exit 0 and silent on success; exit 1
+        /// and every violation on stderr on failure. Meant for a driver
+        /// script to check a job's result (or a Rhai script's parsed
+        /// infer() reply, passed back up as that job's own output) against
+        /// a schema stronger than the block's declared `Ty` signature can
+        /// express.
+        ValidateJson {
+            /// Path to the JSON Schema file.
+            schema: PathBuf,
+            /// The JSON value to validate, as a literal string. Reads from
+            /// stdin instead if omitted, so a job's result can be piped
+            /// straight in.
+            #[arg(long)]
+            input: Option<String>,
+        },
     }
 
     /// `cuttlefish block` subcommands.
@@ -243,6 +259,51 @@ mod cli {
                         lang,
                     },
             } => block_new_cmd(&name, &input, &output, description.as_deref(), &lang),
+            Cmd::ValidateJson { schema, input } => validate_json_cmd(&schema, input.as_deref()),
+        }
+    }
+
+    /// Validate a JSON value (inline `--input`, or stdin if omitted)
+    /// against a JSON Schema file. All violations, not just the first —
+    /// a script author fixing their prompt/schema wants the whole list,
+    /// not one round trip per mistake.
+    fn validate_json_cmd(schema_path: &Path, input: Option<&str>) -> anyhow::Result<()> {
+        let schema_text = std::fs::read_to_string(schema_path)
+            .with_context(|| format!("reading {}", schema_path.display()))?;
+        let schema: serde_json::Value = serde_json::from_str(&schema_text)
+            .with_context(|| format!("{} is not valid JSON", schema_path.display()))?;
+
+        let input_text = match input {
+            Some(s) => s.to_string(),
+            None => {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .context("reading JSON value from stdin")?;
+                buf
+            }
+        };
+        let instance: serde_json::Value =
+            serde_json::from_str(&input_text).context("the value to validate is not valid JSON")?;
+
+        let validator = jsonschema::validator_for(&schema).map_err(|e| {
+            anyhow::anyhow!("{} is not a valid JSON Schema: {e}", schema_path.display())
+        })?;
+
+        let errors: Vec<String> = validator
+            .iter_errors(&instance)
+            .map(|e| format!("{}: {e}", e.instance_path()))
+            .collect();
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "value does not conform to {}:\n{}",
+                schema_path.display(),
+                errors.join("\n")
+            );
         }
     }
 
