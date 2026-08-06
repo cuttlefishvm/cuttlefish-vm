@@ -7,6 +7,14 @@ description: Use when any other cuttlefish-* skill needs the cuttlefish or cuttl
 
 ## Overview
 
+If you're dispatching other cuttlefish work as an agent anyway (see
+`cuttlefish-runner`/`cuttlefish-block-author`), dispatch `cuttlefish-
+binary-resolver` first instead of following the procedure below inline —
+it's the same steps, already baked into that agent's system prompt, and
+keeps the resolution noise out of the calling session's transcript. This
+skill is the procedure itself, for when you're driving things inline
+(or when writing/maintaining that agent).
+
 One shared procedure every other `cuttlefish-*` skill points at for "how do
 I get a `cuttlefish`/`cuttlefishd` binary," instead of each saying it
 independently. Prefers a checksum-verified GitHub Release download over
