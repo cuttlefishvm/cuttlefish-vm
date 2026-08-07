@@ -73,7 +73,7 @@ uuid = { version = "1", features = ["v4"] }
 # Array<u8, N> with no LowerHex/Display impl at all, so `format!("{:x}", ...)`
 # does not compile against it. 0.10's GenericArray<u8, N> does implement
 # LowerHex — confirmed by compiling both against this exact usage.
-sha2 = "0.10"
+sha2 = "0.11"
 # RFC 3339 timestamps for the catalog's index.json `created_at` field. Only the
 # `formatting` feature — `created_at` is written once and compared as a plain
 # string for ordering, never parsed back, so `parsing` isn't needed.
