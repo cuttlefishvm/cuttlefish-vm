@@ -250,6 +250,58 @@ async fn a_rhai_script_s_open_is_denied_outside_its_granted_capabilities() {
     assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
 }
 
+/// The real motivating scenario end to end: a script opens a real file and
+/// uses regex to find a section heading that a plain substring search
+/// would miss (letters spaced out, as SEC filing HTML sometimes renders
+/// them), then slices from there. Previously this whole thing had to
+/// happen outside cuttlefish, in a driver script -- with open/slice/regex
+/// all wired in, it doesn't.
+#[tokio::test]
+async fn a_rhai_script_extracts_a_section_by_regex_from_a_real_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("filing.txt");
+    std::fs::write(
+        &doc,
+        "Item 1. Business\nWe make things.\n\
+         Item 1A. RI SK FACTORS\nOur business faces risks including X, Y, Z.\n\
+         Item 1B. Unresolved Staff Comments\nNone.",
+    )
+    .unwrap();
+
+    let script = r#"
+        let f = open(input.path);
+        let s = slice(f.handle, 0, f.len);
+        let m = regex_find(s.text, "(?i)item\\s*1a\\.?\\s*ri\\s*sk\\s*factors");
+        #{ found: m.found, heading: m.text }
+    "#;
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": doc.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+    };
+
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["found"], true);
+    assert_eq!(result["heading"], "Item 1A. RI SK FACTORS");
+}
+
 /// The full real path: catalog a `.rhai` file, resolve it via
 /// `resolve_and_load`, check it into a `CheckedNode` via `check_graph`, run
 /// a real job against it via `run_job` — asserting the result matches what

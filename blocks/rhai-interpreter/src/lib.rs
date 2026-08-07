@@ -50,9 +50,9 @@
 //! accept that a catch-wrapped host call breaks the model. Flagging this
 //! rather than solving it -- it's a real gap, documented in the
 //! `cuttlefish-author` skill so an agent authoring a script knows not to
-//! do this. (`parse_json` is the one exception: it's an ordinary
-//! synchronous function, not a host round-trip, so it's genuinely safe to
-//! wrap in `try`/`catch`.)
+//! do this. (`parse_json`/`regex_test`/`regex_find`/`regex_replace_all` are
+//! the exceptions: ordinary synchronous functions, not host round-trips,
+//! so they're genuinely safe to wrap in `try`/`catch`.)
 //!
 //! **Every `Command` a Rust block can issue, a script can too**: `infer`,
 //! `open`, `slice`, `slice_bytes`, `page_text`, `page_image` are all
@@ -60,7 +60,13 @@
 //! (`issue_or_replay`) parameterized only by which `Command` each call
 //! builds -- capability enforcement (what a script may `open`) happens
 //! host-side in the same generic `Command` dispatch loop a Rust block's
-//! commands go through, so it applies here unchanged.
+//! commands go through, so it applies here unchanged. `regex_test`/
+//! `regex_find`/`regex_replace_all` round out real text extraction on top
+//! of that: a script can `open`/`slice` a file and then find/pull a
+//! section out of it (a heading that varies in whitespace or punctuation
+//! across documents, say) without a Rust toolchain -- this interpreter
+//! ships prebuilt, so nothing here costs an end user what a Rust
+//! proc-block doing the same extraction would (a wasm32 target).
 
 use cuttlefish_sdk::{export_block, Block, Command, Event};
 use std::cell::RefCell;
@@ -85,6 +91,12 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
         *b = (i as u8).wrapping_mul(31).wrapping_add(7);
     }
     Ok(())
+}
+
+/// Shared by `regex_test`/`regex_find`/`regex_replace_all` -- a bad pattern
+/// is a script-level error each of them reports the same way.
+fn compile_regex(pattern: &str) -> Result<regex::Regex, Box<rhai::EvalAltResult>> {
+    regex::Regex::new(pattern).map_err(|e| format!("invalid regex `{pattern}`: {e}").into())
 }
 
 fn fail(message: String) -> Command {
@@ -190,6 +202,54 @@ impl RhaiBlock {
                     serde_json::from_str(text).map_err(|e| format!("parse_json: {e}"))?;
                 rhai::serde::to_dynamic(&value)
                     .map_err(|e| format!("parse_json: converting to a script value: {e}").into())
+            },
+        );
+
+        // Also ordinary synchronous functions -- exist so a script that
+        // read a real file via open()/slice() has some way to find/extract
+        // structure in it (a section heading that varies in whitespace or
+        // punctuation across documents, say) beyond plain substring
+        // search. An invalid pattern is a normal script error (unlike a
+        // real "no match" outcome, which regex_find reports via its
+        // `found` field, not an error -- not matching is an expected,
+        // common result, not a failure).
+        engine.register_fn(
+            "regex_test",
+            |text: &str, pattern: &str| -> Result<bool, Box<rhai::EvalAltResult>> {
+                let re = compile_regex(pattern)?;
+                Ok(re.is_match(text))
+            },
+        );
+        engine.register_fn(
+            "regex_find",
+            |text: &str, pattern: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                let re = compile_regex(pattern)?;
+                let found = match re.find(text) {
+                    Some(m) => serde_json::json!({
+                        "found": true,
+                        "start": m.start(),
+                        "end": m.end(),
+                        "text": m.as_str(),
+                    }),
+                    None => serde_json::json!({
+                        "found": false,
+                        "start": -1,
+                        "end": -1,
+                        "text": "",
+                    }),
+                };
+                rhai::serde::to_dynamic(&found)
+                    .map_err(|e| format!("regex_find: converting to a script value: {e}").into())
+            },
+        );
+        engine.register_fn(
+            "regex_replace_all",
+            |text: &str,
+             pattern: &str,
+             replacement: &str|
+             -> Result<String, Box<rhai::EvalAltResult>> {
+                let re = compile_regex(pattern)?;
+                Ok(re.replace_all(text, replacement).into_owned())
             },
         );
 
@@ -595,6 +655,123 @@ mod tests {
             block.run(),
             Command::Done {
                 result: serde_json::json!({"fallback": true})
+            }
+        );
+    }
+
+    #[test]
+    fn regex_test_matches_and_does_not_match() {
+        let block = RhaiBlock {
+            script:
+                r#"#{ a: regex_test("hello world", "wor.d"), b: regex_test("hello world", "xyz") }"#
+                    .to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        assert_eq!(
+            block.run(),
+            Command::Done {
+                result: serde_json::json!({"a": true, "b": false})
+            }
+        );
+    }
+
+    #[test]
+    fn regex_find_reports_position_and_text_of_the_first_match() {
+        let block = RhaiBlock {
+            script: r#"regex_find("see item 42 and item 7", "item \\d+")"#.to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        assert_eq!(
+            block.run(),
+            Command::Done {
+                result: serde_json::json!({
+                    "found": true,
+                    "start": 4,
+                    "end": 11,
+                    "text": "item 42",
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn regex_find_reports_not_found_rather_than_erroring() {
+        let block = RhaiBlock {
+            script: r#"regex_find("no numbers here", "\\d+").found"#.to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        assert_eq!(
+            block.run(),
+            Command::Done {
+                result: serde_json::json!(false)
+            }
+        );
+    }
+
+    #[test]
+    fn regex_replace_all_replaces_every_match() {
+        let block = RhaiBlock {
+            script: r#"regex_replace_all("a1 b2 c3", "[a-z](\\d)", "n$1")"#.to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        assert_eq!(
+            block.run(),
+            Command::Done {
+                result: serde_json::json!("n1 n2 n3")
+            }
+        );
+    }
+
+    #[test]
+    fn an_invalid_pattern_fails_the_job_not_a_silent_default() {
+        let block = RhaiBlock {
+            script: r#"regex_test("x", "(unclosed")"#.to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        match block.run() {
+            Command::Fail { message, .. } => {
+                assert!(message.contains("invalid regex"), "{message}");
+            }
+            other => panic!("expected a Fail naming the invalid regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_whitespace_tolerant_heading_match_works_like_the_real_10k_extraction_case() {
+        // The exact pattern that motivated this: SEC filing HTML sometimes
+        // renders a heading with its letters spaced out ("RI SK FACTORS")
+        // -- a plain substring search misses it, but a regex with `\s*`
+        // between letters catches it.
+        let block = RhaiBlock {
+            script: r#"
+                let doc = "Item 1A. RI SK FACTORS\nOur business faces risks.";
+                regex_find(doc, "(?i)item\\s*1a\\.?\\s*ri\\s*sk\\s*factors").found
+            "#
+            .to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        assert_eq!(
+            block.run(),
+            Command::Done {
+                result: serde_json::json!(true)
             }
         );
     }
