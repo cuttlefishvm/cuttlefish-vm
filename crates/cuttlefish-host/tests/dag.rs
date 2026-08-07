@@ -223,6 +223,63 @@ fn fan_in_via_record_fails_on_a_missing_field() {
     assert!(matches!(err, DagError::SeamMismatch { .. }), "{err:?}");
 }
 
+/// The exact mistake a real session made: `analyst` produces
+/// `{segment, finding, risk}`, `stress` declares that same shape as its
+/// input, and the fix is the bare pass-through `in = analyst.out;` -- but
+/// it's natural to instead wrap it field by field, `{ segment =
+/// analyst.out; finding = analyst.out; risk = analyst.out; }`, which nests
+/// analyst's whole output under every field instead of using its fields
+/// directly. That's still rejected (this isn't a correctness bug — the
+/// resulting nested type genuinely doesn't match `stress`'s declared
+/// input), but the message should name the fix rather than just dump the
+/// mismatched types.
+#[test]
+fn wrapping_one_node_s_output_across_every_field_names_the_bare_passthrough_fix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut resolved = HashMap::new();
+    resolved.insert(
+        "analyst".to_string(),
+        resolved_for(
+            dir.path(),
+            "analyst",
+            "{facts: text}",
+            "{segment: text, finding: text, risk: text}",
+        ),
+    );
+    resolved.insert(
+        "stress".to_string(),
+        resolved_for(
+            dir.path(),
+            "stress",
+            "{segment: text, finding: text, risk: text}",
+            "{failure_mode: text}",
+        ),
+    );
+
+    let graph = NodeGraph {
+        nodes: vec![
+            ("analyst".to_string(), node(None)),
+            (
+                "stress".to_string(),
+                node(Some(record(&[
+                    ("segment", from("analyst")),
+                    ("finding", from("analyst")),
+                    ("risk", from("analyst")),
+                ]))),
+            ),
+        ],
+    };
+
+    let err = check_graph(&Engine::default(), &graph, &Branches::default(), &resolved)
+        .err()
+        .expect("wrapping one node's output field by field must still be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains("in = analyst.out;"),
+        "expected the bare-passthrough hint in: {message}"
+    );
+}
+
 #[test]
 fn an_undeclared_cycle_is_rejected() {
     let dir = tempfile::tempdir().unwrap();

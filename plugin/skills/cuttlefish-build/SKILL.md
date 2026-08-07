@@ -56,11 +56,44 @@ spec summarize_docs = {
   spec's own directory (or one ending `.wasm`/`.cfbundle`) reads straight
   from disk; anything else is a catalog `name@version` lookup (see
   `cuttlefish-catalog`).
-- `nodes = { name = { block = "..."; in = { field = other_node.out; }; };
-  ... };` — the real multi-block graph `block = "..."` desugars to. Each
-  node's `in` maps its input record's fields to `other_node.out`
-  expressions; omit `in` for a node with no inbound edge. Typechecked the
-  same way as any other seam (see "Command" below) before anything runs.
+- `nodes = { name = { block = "..."; in = <expr>; }; ... };` — the real
+  multi-block graph `block = "..."` desugars to. Omit `in` for a node with
+  no inbound edge (it gets the job's raw input); otherwise `in` is one of:
+
+  - **`other_node.out`** — that node's *whole* output, unchanged. This is
+    what you want whenever a node's declared input already matches an
+    upstream node's declared output shape, which is the common case for a
+    plain A→B→C chain:
+
+    ```
+    nodes = {
+      analyst = { block = "analyst@1"; };
+      # analyst outputs {segment, finding, risk}; stress declares that
+      # same shape as its input -- pass it through as-is, no braces:
+      stress = { block = "stress@1"; in = analyst.out; };
+    };
+    ```
+
+    **Don't** wrap a single upstream node field by field —
+    `in = { segment = analyst.out; finding = analyst.out; risk =
+    analyst.out; }` nests analyst's *entire* output under every one of
+    those three fields instead of using its fields directly, and gets
+    rejected as a seam mismatch (correctly — the resulting type really is
+    wrong, not a typechecker bug). If you hit this, the error names the
+    fix. There's no syntax to pull out just *one* field of an upstream
+    node's output (`analyst.segment` is not valid) — either the whole
+    shape matches (use the bare form above) or it doesn't, in which case
+    change one of the two blocks' signatures so it does.
+  - **`{ field = <expr>; ... }`** — build a record by combining *multiple
+    different* nodes (real fan-in), each field an independent expression:
+
+    ```
+    in = { docs = extract.out; images = render.out; };
+    ```
+  - **`[ <expr>, ... ]`** — build a list the same way, order significant.
+
+  Typechecked the same way as any other seam (see "Command" below) before
+  anything runs.
 - `branches = { node = { "route_label" -> target_node; ... }; ... };` —
   conditional dispatch for a branching node's labeled routes. Uncommon
   enough that if you need it, read `crates/cuttlefish-core/src/graph.rs`

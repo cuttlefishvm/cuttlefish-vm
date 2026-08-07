@@ -371,8 +371,42 @@ fn describe_expr(
                 .map(|s| s.output.to_string())
                 .unwrap_or_default(),
         ),
+        InputExpr::Record(fields) => (
+            "<composite>".to_string(),
+            match same_node_repeated_across_every_field(fields) {
+                // The single most common way to reach for `Record` wrong:
+                // wanting one upstream node's whole output passed through
+                // to a downstream node whose input shape happens to match
+                // it, but writing `{ a = x.out; b = x.out; c = x.out; }`
+                // instead of the bare `in = x.out;` a straight pass-through
+                // actually needs. The wrapped form nests x's whole output
+                // under *each* field instead of using its fields directly,
+                // producing the double-nested type this message would
+                // otherwise show with no explanation. Caught here rather
+                // than left to be found by trial and error against a
+                // confusing type dump -- see the cuttlefish-build skill.
+                Some(node) => format!(
+                    "{expr:?} -- every field here maps to `{node}.out`; if you meant to pass \
+                     `{node}`'s whole output through unchanged, write `in = {node}.out;` with no \
+                     braces instead of wrapping it field by field"
+                ),
+                None => format!("{expr:?}"),
+            },
+        ),
         other => ("<composite>".to_string(), format!("{other:?}")),
     }
+}
+
+/// If every field of a `Record` maps to the same single node's whole
+/// output (`FromNode`), returns that node's name — see the call site in
+/// [`describe_expr`] for why this is worth detecting.
+fn same_node_repeated_across_every_field(fields: &BTreeMap<String, InputExpr>) -> Option<&str> {
+    let mut names = fields.values().map(|v| match v {
+        InputExpr::FromNode(n) => Some(n.as_str()),
+        _ => None,
+    });
+    let first = names.next()??;
+    names.all(|n| n == Some(first)).then_some(first)
 }
 
 /// Implements the spec's "Conditional dispatch and skipped nodes" rule
