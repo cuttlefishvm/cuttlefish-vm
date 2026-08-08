@@ -411,7 +411,18 @@ impl RhaiBlock {
                 Ok(json) => Command::Done { result: json },
                 Err(e) => fail(format!("converting rhai result to json: {e}")),
             },
-            Err(e) => fail(format!("script error: {e}")),
+            // A failure here is the script's own logic going wrong at run
+            // time (a Rhai `EvalAltResult` -- missing function, index out of
+            // bounds, an explicit `throw`, and so on). `catalog add` already
+            // rejects a script that fails to *parse* (see
+            // `catalog::read_script_signature`), so anything reaching this
+            // arm is a run-time failure, not a shape mismatch -- it must not
+            // reuse `schema_validation_failed`, which callers rely on
+            // meaning "input/output didn't match the declared signature".
+            Err(e) => Command::Fail {
+                code: "script_error".into(),
+                message: format!("script error: {e}"),
+            },
         }
     }
 
@@ -565,6 +576,28 @@ mod tests {
                 result: serde_json::json!("the memoized answer")
             }
         );
+    }
+
+    #[test]
+    fn a_script_runtime_error_fails_with_script_error_not_schema_validation_failed() {
+        // `x()` parses fine (catalog add's compile check would let it
+        // through) but there is no such function -- a genuine runtime
+        // failure inside the script, distinct from the input/output shape
+        // mismatches `schema_validation_failed` means elsewhere.
+        let block = RhaiBlock {
+            script: "x()".to_string(),
+            input: serde_json::Value::Null,
+            log: Vec::new(),
+            pending_command: None,
+        };
+
+        match block.run() {
+            Command::Fail { code, message } => {
+                assert_eq!(code, "script_error");
+                assert!(message.contains("script error"), "{message}");
+            }
+            other => panic!("expected a script_error Fail, got {other:?}"),
+        }
     }
 
     #[test]

@@ -322,11 +322,21 @@ pub fn resolve_and_load(
                 source,
             })?;
             let kind = crate::catalog::sniff_artifact_kind(&bytes).ok_or_else(|| {
+                // A `.rhai` file has no magic bytes of its own to sniff — it
+                // is only ever recognized as a Script through the catalog
+                // (see the `Resolved::Cataloged` arm below), never by a
+                // direct filesystem path. Naming that explicitly here saves
+                // whoever hits this from having to already know it.
+                let message = if path.extension().is_some_and(|e| e == "rhai") {
+                    "not a recognized artifact: a .rhai script must be `cuttlefish catalog \
+                     add`ed before use — a pipeline can't reference one directly by path"
+                        .to_string()
+                } else {
+                    "not a recognized artifact (neither wasm nor .cfbundle magic bytes)".into()
+                };
                 PipelineError::Uninspectable {
                     name: path.display().to_string(),
-                    message: "not a recognized artifact (neither wasm nor .cfbundle magic \
-                              bytes)"
-                        .into(),
+                    message,
                 }
             })?;
             Ok(ResolvedInput {

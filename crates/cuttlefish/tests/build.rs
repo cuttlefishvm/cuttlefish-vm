@@ -146,3 +146,59 @@ spec script_node_spec = {
     );
     assert!(!spec_path.with_extension("cfbundle").exists());
 }
+
+#[test]
+fn build_s_script_refusal_names_the_node_key_not_the_block_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("echo.rhai");
+    std::fs::write(&script_path, SCRIPT_TEXT).unwrap();
+
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let add = Command::new(CUTTLEFISH)
+        .args(["catalog", "add", "echo@1"])
+        .arg(&script_path)
+        .env("CUTTLEFISH_HOME", &home)
+        .output()
+        .expect("the cuttlefish binary under test must be spawnable");
+    assert!(
+        add.status.success(),
+        "cataloging the fixture script failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    // The node key ("sum") deliberately differs from the block it points at
+    // ("echo@1") — the refusal must name the former, since that's what the
+    // spec's own author wrote and would look for.
+    let spec_path = dir.path().join("renamed_node.cuttlefish");
+    std::fs::write(
+        &spec_path,
+        r#"
+spec renamed_node_spec = {
+  description = "A Script node whose key differs from its block name.";
+  model = Path "./models/stub.gguf";
+  data_policy = Any;
+  capabilities = [ ];
+  nodes = {
+    sum = { block = "echo@1" };
+  };
+}
+"#,
+    )
+    .unwrap();
+
+    let out = Command::new(CUTTLEFISH)
+        .args(["build"])
+        .arg(&spec_path)
+        .env("CUTTLEFISH_HOME", &home)
+        .output()
+        .expect("the cuttlefish binary under test must be spawnable");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success(), "build must refuse a Script node");
+    assert!(
+        stderr.contains("`sum`"),
+        "the refusal must name the node key `sum`, not the block name `echo`: {stderr}"
+    );
+}

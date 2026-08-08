@@ -1181,3 +1181,59 @@ export_block!(MustNotRun);
         "the branch actually taken (per the cached route) must run: {result}"
     );
 }
+
+#[tokio::test]
+async fn a_node_whose_output_violates_its_declared_signature_fails_loudly() {
+    // Declares `{summary: text}` but always returns `{a: "from-a"}` — the
+    // exact shape of mistake `cuttlefish block new`'s identity-stub template
+    // makes trivially easy to write and never notice: nothing downstream
+    // failed before this check existed, it just silently got `null` for
+    // `summary`.
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+    let wrong_shape = std::fs::read(support::block_with_source(
+        dir.path(),
+        "wrong_shape",
+        &const_block_source("WrongShape", r#"{ "a": "from-a" }"#),
+    ))
+    .unwrap();
+
+    let mut mismatched = node("mismatched", wrong_shape);
+    mismatched.signature = cuttlefish_abi::Signature {
+        input: cuttlefish_abi::Ty::Json,
+        output: cuttlefish_abi::Ty::Record(
+            [("summary".to_string(), cuttlefish_abi::Ty::Text)]
+                .into_iter()
+                .collect(),
+        ),
+    };
+
+    let job = JobSpec {
+        nodes: vec![mismatched],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps,
+    };
+
+    let (tx, _rx) = mpsc::channel(64);
+    let (_ledger_dir, ledger) = test_ledger();
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &cuttlefish_host::module_cache::ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+    let error = envelope.error.expect("a failed job carries an error");
+    assert_eq!(error.code, error_codes::SCHEMA_VALIDATION_FAILED);
+    assert!(
+        error.message.contains("mismatched") && error.message.contains("summary"),
+        "expected the mismatch to name the node and the missing field: {}",
+        error.message
+    );
+}

@@ -1003,6 +1003,7 @@ dependencies = [
  "pdf-extract",
  "pdfium-render",
  "reqwest",
+ "rhai",
  "rusqlite",
  "serde",
  "serde_json",

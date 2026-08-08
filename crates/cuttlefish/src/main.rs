@@ -584,6 +584,14 @@ export_block!({struct_name});
         // order for a chain (each node's sole predecessor is the previous one);
         // `spec.nodes.nodes` is already in that order (NodeGraph preserves
         // insertion order — see graph.rs).
+        // `checked.stages()` reports `Stage::name` — the block's own catalog
+        // name, not the spec's node key — but the error below should name
+        // whichever the author actually wrote in `nodes = {...}`, since
+        // those two can diverge (`nodes = { sum: summarize@2 }`). Captured
+        // here, in the same declaration order as `resolved`/`checked.stages()`
+        // (guaranteed by the `is_simple_chain` check above), so it can be
+        // zipped back in below.
+        let node_keys: Vec<String> = spec.nodes.nodes.iter().map(|(k, _)| k.clone()).collect();
         let resolved: Vec<_> = spec
             .nodes
             .nodes
@@ -609,15 +617,15 @@ export_block!({struct_name});
         // Reject explicitly, before any bundle output is written, the same
         // "fail loudly on what's not supported yet" precedent cuttlefishd's
         // startup check already applies to Bundle-kind nodes.
-        if let Some(stage) = checked
-            .stages()
+        if let Some((node_key, _stage)) = node_keys
             .iter()
-            .find(|s| s.kind == cuttlefish_host::catalog::ArtifactKind::Script)
+            .zip(checked.stages().iter())
+            .find(|(_, s)| s.kind == cuttlefish_host::catalog::ArtifactKind::Script)
         {
             bail!(
                 "node `{}` is a Rhai script. `cuttlefish build` doesn't support packaging a \
                  Script node into a bundle yet — run it via cuttlefishd instead.",
-                stage.name
+                node_key
             );
         }
 

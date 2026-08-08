@@ -141,3 +141,23 @@ fn a_rhai_file_with_two_signature_headers_is_rejected() {
         "expected an error about multiple signature headers, got: {err}"
     );
 }
+
+#[test]
+fn a_rhai_file_with_a_valid_header_but_a_syntax_error_in_its_body_is_rejected_at_add_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = cuttlefish_host::catalog::Catalog::open(tmp.path().join("catalog"));
+    let engine = wasmtime::Engine::default();
+    let script_path = write_script(
+        tmp.path(),
+        "broken.rhai",
+        "//! signature: {n: json} -> {n: json}\nlet x = ;;;\n",
+    );
+
+    let err = catalog
+        .add("broken@1", &script_path, &engine)
+        .expect_err("a script whose body doesn't parse must be rejected at catalog add, not deferred to run time");
+    assert!(
+        err.to_string().to_lowercase().contains("does not parse"),
+        "expected a parse-error message, got: {err}"
+    );
+}
