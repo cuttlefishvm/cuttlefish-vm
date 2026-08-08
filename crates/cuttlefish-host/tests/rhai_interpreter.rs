@@ -347,6 +347,8 @@ async fn a_script_node_resolved_from_the_catalog_and_run_through_run_job_gets_it
                 repeat_until: None,
                 max_iterations: None,
                 over: None,
+                accept: Vec::new(),
+                on_fail: Vec::new(),
             },
         )],
     };

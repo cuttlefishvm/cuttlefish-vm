@@ -320,11 +320,12 @@ impl<'a> Parser<'a> {
         let read_roots = read_roots.ok_or(SpecError::MissingField("capabilities"))?;
         let nodes = nodes.ok_or(SpecError::MissingField("block"))?;
 
-        // A fan-out manifest is read by the *host*, which is not sandboxed —
-        // so nothing would stop it reading a path the spec never granted.
-        // Requiring it to sit inside a declared `Read` root keeps the
-        // capability list a truthful description of everything the job
-        // touches, which is the property the whole capability model rests on.
+        // Fan-out manifests and acceptance schemas are both read by the
+        // *host*, which is not sandboxed — so nothing would stop either
+        // reading a path the spec never granted. Requiring them inside a
+        // declared `Read` root keeps the capability list a truthful
+        // description of everything the job touches, which is the property
+        // the whole capability model rests on.
         for (name, node) in &nodes.nodes {
             if let Some(manifest) = &node.over {
                 if !read_roots.iter().any(|root| path_covers(root, manifest)) {
@@ -333,6 +334,17 @@ impl<'a> Parser<'a> {
                          `capabilities` — add a `Read` for it",
                         manifest.display()
                     )));
+                }
+            }
+            for check in &node.accept {
+                if let crate::graph::AcceptCheck::Schema(schema) = check {
+                    if !read_roots.iter().any(|root| path_covers(root, schema)) {
+                        return Err(SpecError::Malformed(format!(
+                            "node `{name}`'s accept schema {} is outside every path granted by \
+                             `capabilities` — add a `Read` for it",
+                            schema.display()
+                        )));
+                    }
                 }
             }
         }
