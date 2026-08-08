@@ -64,6 +64,7 @@ fn script_node(script_field_value: &str) -> CheckedNode {
         repeat_until: None,
         max_iterations: None,
         script: Some(script_field_value.to_string()),
+        over: None,
     }
 }
 

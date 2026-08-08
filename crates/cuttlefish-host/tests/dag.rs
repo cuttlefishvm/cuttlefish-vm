@@ -693,6 +693,7 @@ fn checked_node(name: &str, signature: cuttlefish_abi::Signature) -> CheckedNode
         repeat_until: None,
         max_iterations: None,
         script: None,
+        over: None,
     }
 }
 
@@ -854,4 +855,103 @@ fn hash_length_prefixed_is_injective_across_a_boundary_shift() {
         hash_pair(b"a", b"b\0c"),
         "an embedded NUL inside a segment must not be interpretable as a segment boundary"
     );
+}
+
+// --- Fan-out nodes ------------------------------------------------------
+
+/// A node that fans out over a manifest and one that doesn't are different
+/// nodes for resume purposes even with identical signatures — otherwise
+/// repointing `over` would resume against checkpoints computed from
+/// entirely different inputs.
+#[test]
+fn changing_the_manifest_path_changes_the_graph_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut resolved = HashMap::new();
+    resolved.insert(
+        "map".to_string(),
+        resolved_for(dir.path(), "fpmap", "json", "json"),
+    );
+
+    let fingerprint_for = |manifest: Option<&str>| {
+        let mut n = node(None);
+        n.over = manifest.map(PathBuf::from);
+        let graph = NodeGraph {
+            nodes: vec![("map".to_string(), n)],
+        };
+        let checked = check_graph(&Engine::default(), &graph, &Branches::default(), &resolved)
+            .expect("a single fan-out node must typecheck");
+        graph_fingerprint(&checked.nodes)
+    };
+
+    assert_ne!(
+        fingerprint_for(Some("a.jsonl")),
+        fingerprint_for(Some("b.jsonl"))
+    );
+    assert_ne!(fingerprint_for(None), fingerprint_for(Some("a.jsonl")));
+}
+
+/// Downstream consumers see the *collection*, not one item's result.
+#[test]
+fn a_fan_out_node_presents_the_collection_record_downstream() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut resolved = HashMap::new();
+    let mut map_node = node(None);
+    map_node.over = Some(PathBuf::from("m.jsonl"));
+    resolved.insert(
+        "map".to_string(),
+        resolved_for(dir.path(), "colmap", "{chunk: text}", "{finding: text}"),
+    );
+    resolved.insert(
+        "reduce".to_string(),
+        resolved_for(
+            dir.path(),
+            "colreduce",
+            "{results_path: text, failures_path: text, succeeded: json, failed: json}",
+            "{summary: text}",
+        ),
+    );
+
+    let graph = NodeGraph {
+        nodes: vec![
+            ("map".to_string(), map_node),
+            ("reduce".to_string(), node(Some(from("map")))),
+        ],
+    };
+    check_graph(&Engine::default(), &graph, &Branches::default(), &resolved)
+        .expect("a reduce node consuming the collection record must typecheck");
+}
+
+/// Declaring the *per-item* shape is the natural mistake, so it must not
+/// typecheck — otherwise the block's own output would silently leak
+/// downstream and the reduce would receive something else entirely.
+#[test]
+fn a_reduce_node_expecting_the_blocks_own_output_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut resolved = HashMap::new();
+    let mut map_node = node(None);
+    map_node.over = Some(PathBuf::from("m.jsonl"));
+    resolved.insert(
+        "map".to_string(),
+        resolved_for(dir.path(), "leakmap", "{chunk: text}", "{finding: text}"),
+    );
+    resolved.insert(
+        "reduce".to_string(),
+        resolved_for(
+            dir.path(),
+            "leakreduce",
+            "{finding: text}",
+            "{summary: text}",
+        ),
+    );
+
+    let graph = NodeGraph {
+        nodes: vec![
+            ("map".to_string(), map_node),
+            ("reduce".to_string(), node(Some(from("map")))),
+        ],
+    };
+    let err = check_graph(&Engine::default(), &graph, &Branches::default(), &resolved)
+        .err()
+        .expect("consuming a fan-out node's per-item output must be rejected");
+    assert!(matches!(err, DagError::SeamMismatch { .. }), "{err:?}");
 }

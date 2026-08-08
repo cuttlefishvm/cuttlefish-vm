@@ -103,6 +103,7 @@ fn node(name: &str, module_bytes: Vec<u8>) -> CheckedNode {
         repeat_until: None,
         max_iterations: None,
         script: None,
+        over: None,
     }
 }
 
