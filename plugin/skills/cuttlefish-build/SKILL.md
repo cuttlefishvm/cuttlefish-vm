@@ -127,6 +127,46 @@ spec summarize_docs = {
     only mean something relative to one manifest.
   - `over` and `repeat_until` cannot be combined; they describe different
     kinds of iteration.
+
+  A node may also declare **`accept`** — what "done" means beyond its type —
+  and **`on_fail`** — what to do when a run isn't accepted:
+
+  ```
+  nodes = {
+    extract = {
+      block  = "extractor@1";
+      over   = "./corpus/manifest.jsonl";
+      accept = [
+        Schema "./schemas/finding.json",
+        Judge { model = Ollama "qwen3:8b"; prompt = "Does this cite numbers from the input?"; }
+      ];
+      on_fail = [ retry 2, reroute Ollama "qwen3:14b", escalate ];
+    };
+  };
+  ```
+
+  - **`accept = [ ... ]`** runs in order and stops at the first failure.
+    Put `Schema` before `Judge`: a schema is free and a judge costs a whole
+    inference, so structurally broken output should never pay for one.
+    - `Schema "path.json"` — JSON Schema. The path must sit inside a
+      `capabilities` read root, same as a manifest.
+    - `Judge "prompt"` uses the spec's own model; `Judge { model = P "t";
+      prompt = "..."; }` names another. The judge sees the node's **input
+      and output**, and must answer `{"accept": bool, "reason": "..."}`.
+      A reply that isn't a usable verdict is *not* a rejection — it is a
+      broken grader, retried and reported as such.
+  - **`on_fail = [ ... ]`** is an ordered ladder, climbed one rung per
+    rejection: `retry N` (N further attempts on the same model),
+    `reroute P "model"` (switch models for every attempt after this),
+    `escalate` (stop, and record it for `cuttlefish escalations`).
+    `escalate` must be last, and `retry 0` is refused.
+  - **A node with no `on_fail` runs once and fails**, exactly as before.
+  - **Nothing is checkpointed while the ladder is climbing.** Only a
+    concluded outcome gets a ledger row, so a resumed job never comes back
+    with a value that was on its way to being retried.
+  - An escalated fan-out item still counts as a failure and still lands in
+    `failures.jsonl`. The escalation is *additional* — it is what makes that
+    one findable later without re-reading every job.
 - `branches = { node = { "route_label" -> target_node; ... }; ... };` —
   conditional dispatch for a branching node's labeled routes. Uncommon
   enough that if you need it, read `crates/cuttlefish-core/src/graph.rs`

@@ -131,6 +131,17 @@ mod cli {
             #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
             endpoint: PathBuf,
         },
+        /// List everything every job gave up on after its `on_fail` ladder
+        /// was exhausted — the queue a planner drains later.
+        Escalations {
+            /// Where the daemon listens: a unix socket path, or a named
+            /// pipe on Windows. Defaults per platform.
+            ///
+            /// `--socket` is kept as an alias so existing scripts and docs
+            /// keep working; the name is simply wrong on Windows.
+            #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
+            endpoint: PathBuf,
+        },
         /// List what the daemon can run.
         Specs {
             /// Where the daemon listens: a unix socket path, or a named
@@ -268,6 +279,7 @@ mod cli {
                 input,
             } => crate::daemon::submit(&endpoint, &spec, &input).await,
             Cmd::Jobs { endpoint } => crate::daemon::jobs(&endpoint).await,
+            Cmd::Escalations { endpoint } => crate::daemon::escalations(&endpoint).await,
             Cmd::Resume { endpoint, job_id } => crate::daemon::resume(&endpoint, &job_id).await,
             Cmd::Cancel { endpoint, job_id } => crate::daemon::cancel(&endpoint, &job_id).await,
             Cmd::Shutdown { endpoint } => crate::daemon::shutdown(&endpoint).await,
@@ -756,6 +768,43 @@ mod daemon {
             .await?;
 
         println!("{}", serde_json::to_string_pretty(&body)?);
+        Ok(())
+    }
+
+    /// Everything every job on this machine gave up on.
+    ///
+    /// Printed as a table rather than the raw JSON `jobs` prints, because
+    /// this is read by a person deciding what to do next, and the one field
+    /// that decides that — the reason — is the one a JSON dump buries.
+    pub async fn escalations(socket: &Path) -> anyhow::Result<()> {
+        let body: serde_json::Value = client(socket)?
+            .get("http://localhost/escalations")
+            .send()
+            .await
+            .with_context(|| format!("connecting to daemon at {}", socket.display()))?
+            .json()
+            .await?;
+
+        let rows = body.as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if rows.is_empty() {
+            println!("no escalations");
+            return Ok(());
+        }
+
+        for row in rows {
+            let get = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("?");
+            // An item index is absent for a whole-node escalation, and
+            // printing `item ?` there would invent a distinction that isn't
+            // there.
+            let where_ = match row.get("item").and_then(|v| v.as_u64()) {
+                Some(i) => format!("{}[{i}]", get("node")),
+                None => get("node").to_string(),
+            };
+            println!("{}  {}  {}", get("job"), where_, get("at"));
+            for line in get("reason").lines() {
+                println!("    {line}");
+            }
+        }
         Ok(())
     }
 

@@ -695,6 +695,51 @@ async fn get_jobs_surfaces_an_interrupted_job() {
 }
 
 #[tokio::test]
+async fn get_escalations_reports_across_jobs_this_process_never_ran() {
+    // The point of the endpoint: the session that asked for the work is
+    // gone, so an escalation must be findable from a job id nobody
+    // remembers, recorded by a process that is no longer running. This
+    // builds such a job directly on disk — this daemon never submitted it.
+    let h = start().await;
+    let id = unique_job_id("escalated");
+    {
+        let ledger = cuttlefish_host::ledger::Ledger::open(
+            &h.jobs_root.join(&id).join("ledger.sqlite"),
+            &h.fingerprint,
+        )
+        .unwrap();
+        ledger
+            .write_escalated("extract", Some(7), "judge: cites no numbers from the input")
+            .unwrap();
+    }
+
+    let body: serde_json::Value = h
+        .client
+        .get("http://localhost/escalations")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let rows = body
+        .as_array()
+        .expect("GET /escalations must return an array");
+    let found = rows
+        .iter()
+        .find(|e| e["job"] == id)
+        .unwrap_or_else(|| panic!("the escalated job must appear; got {body}"));
+    assert_eq!(found["node"], "extract");
+    assert_eq!(found["item"], 7);
+    assert_eq!(
+        found["reason"], "judge: cites no numbers from the input",
+        "the reason must survive intact — it is the only thing that tells \
+         whoever reads this what to do next"
+    );
+}
+
+#[tokio::test]
 async fn resuming_a_non_interrupted_job_is_rejected() {
     let h = start().await;
     let id = h
