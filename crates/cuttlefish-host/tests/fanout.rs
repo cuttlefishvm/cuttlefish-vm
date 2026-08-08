@@ -62,6 +62,7 @@ fn map_node(script: &str, manifest: &Path) -> CheckedNode {
         max_iterations: None,
         script: Some(script.to_string()),
         over: Some(manifest.to_path_buf()),
+        item_output: None,
     }
 }
 
@@ -95,6 +96,7 @@ fn reduce_node() -> CheckedNode {
         max_iterations: None,
         script: Some(COUNT_LINES.to_string()),
         over: None,
+        item_output: None,
     }
 }
 
@@ -299,4 +301,101 @@ async fn resuming_against_an_edited_manifest_is_refused() {
     let msg = envelope.error.unwrap().message;
     assert!(msg.contains("map"), "must name the node: {msg}");
     assert!(msg.contains("manifest"), "{msg}");
+}
+
+/// Built through the *real* `check_graph`, not hand-assembled `CheckedNode`s.
+///
+/// This exists because a bug slipped past every other test in this file: the
+/// typechecker replaces a fan-out node's `signature.output` with the
+/// collection record for downstream typing, which meant per-item validation
+/// was checking each item against the collection type and rejecting all of
+/// them. Tests that construct `CheckedNode` directly bypass that
+/// substitution entirely and so cannot see it. Only the full path can.
+#[tokio::test]
+async fn per_item_validation_uses_the_blocks_own_output_not_the_collection_type() {
+    use cuttlefish_core::graph::{Branches, Node, NodeGraph};
+    use cuttlefish_host::catalog::{Catalog, ResolutionContext};
+    use cuttlefish_host::dag::check_graph;
+    use cuttlefish_host::pipeline::resolve_and_load;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::default();
+    let catalog = Catalog::open(dir.path().join("catalog"));
+    let manifest = write_manifest(dir.path(), "{\"n\": 1}\n{\"n\": 2}\n");
+
+    // The map block declares a *specific* per-item output, so if validation
+    // used the collection record instead, every item would be rejected.
+    let map_src = dir.path().join("double.rhai");
+    std::fs::write(
+        &map_src,
+        "//! signature: json -> {doubled: json}\n#{ doubled: input.n * 2 }\n",
+    )
+    .unwrap();
+    catalog.add("double@1", &map_src, &engine).unwrap();
+
+    let reduce_src = dir.path().join("tally.rhai");
+    std::fs::write(
+        &reduce_src,
+        "//! signature: {results_path: text, failures_path: text, succeeded: json, failed: json} -> json\n\
+         let f = open(input.results_path);\n\
+         let s = slice(f.handle, 0, f.len);\n\
+         let n = 0;\n\
+         for line in s.text.split(\"\\n\") { if line != \"\" { n += 1; } }\n\
+         #{ counted: n }\n",
+    )
+    .unwrap();
+    catalog.add("tally@1", &reduce_src, &engine).unwrap();
+
+    let mut resolved = HashMap::new();
+    for (node, name_version) in [("analyze", "double@1"), ("tally", "tally@1")] {
+        resolved.insert(
+            node.to_string(),
+            resolve_and_load(
+                &catalog,
+                dir.path(),
+                name_version,
+                ResolutionContext::Interactive,
+            )
+            .unwrap(),
+        );
+    }
+
+    let mut analyze = Node {
+        block: std::path::PathBuf::new(),
+        input: None,
+        repeat_until: None,
+        max_iterations: None,
+        over: Some(manifest.clone()),
+    };
+    analyze.over = Some(manifest);
+    let graph = NodeGraph {
+        nodes: vec![
+            ("analyze".to_string(), analyze),
+            (
+                "tally".to_string(),
+                Node {
+                    block: std::path::PathBuf::new(),
+                    input: Some(cuttlefish_core::graph::InputExpr::FromNode(
+                        "analyze".into(),
+                    )),
+                    repeat_until: None,
+                    max_iterations: None,
+                    over: None,
+                },
+            ),
+        ],
+    };
+
+    let checked = check_graph(&engine, &graph, &Branches::default(), &resolved)
+        .expect("a fan-out node feeding a reduce must typecheck");
+
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+    let envelope = run_on(checked.nodes, dir.path(), &ledger).await;
+
+    assert_eq!(
+        envelope.status,
+        JobStatus::Completed,
+        "items must validate against the block's own declared output: {envelope:?}"
+    );
+    assert_eq!(envelope.result.unwrap()["counted"], 2);
 }

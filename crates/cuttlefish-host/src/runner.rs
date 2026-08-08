@@ -761,6 +761,14 @@ async fn run_fanout_node(
         .as_ref()
         .expect("run_fanout_node is only called for a node with `over`");
     let node_name = node.name.as_str();
+    // NOT `node.signature.output` — that has already been replaced with the
+    // collection record for downstream typing, so validating an item against
+    // it would reject every single item.
+    let item_output = node
+        .item_output
+        .as_ref()
+        .unwrap_or(&node.signature.output)
+        .clone();
 
     let bail = |message: String, usage: &mut Usage| -> Envelope {
         usage.duration_ms = started.elapsed().as_millis() as u64;
@@ -946,7 +954,7 @@ async fn run_fanout_node(
         .await;
 
         match outcome {
-            Ok(value) if node.signature.output.matches_value(&value) => {
+            Ok(value) if item_output.matches_value(&value) => {
                 succeeded += 1;
                 if let Err(e) = ledger.write_item_completed(node_name, item_index, &value) {
                     return Err(bail(
@@ -959,8 +967,7 @@ async fn run_fanout_node(
                 failed += 1;
                 let message = format!(
                     "item {item_index} produced {value}, which doesn't match the block's \
-                     declared output `{}`",
-                    node.signature.output
+                     declared output `{item_output}`"
                 );
                 if let Err(e) = ledger.write_item_failed(node_name, item_index, &message) {
                     return Err(bail(
@@ -991,10 +998,18 @@ async fn run_fanout_node(
     }
 
     if succeeded == 0 {
+        // Quote the first item's actual error. "All 500 items failed" with no
+        // cause is a dead end, and when every item fails the same way — which
+        // is the common case — the first one is the whole story.
+        let first_error = ledger
+            .concluded_items(node_name)
+            .ok()
+            .and_then(|items| items.into_iter().find_map(|(_, _, err)| err))
+            .unwrap_or_else(|| "no error recorded".to_string());
         return Err(bail(
             format!(
                 "node `{node_name}`: all {failed} fan-out item(s) failed — there is nothing for \
-                 a downstream node to reduce over",
+                 a downstream node to reduce over. First failure: {first_error}"
             ),
             usage,
         ));

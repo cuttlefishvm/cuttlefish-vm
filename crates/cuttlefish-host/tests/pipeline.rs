@@ -317,6 +317,7 @@ fn checked_node(
         max_iterations: None,
         script: None,
         over: None,
+        item_output: None,
     }
 }
 

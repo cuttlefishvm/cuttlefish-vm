@@ -46,6 +46,17 @@ pub struct CheckedNode {
     /// [`fanout_collection_ty`] downstream rather than its block's own
     /// declared output.
     pub over: Option<std::path::PathBuf>,
+    /// For a fan-out node only: what its block declared as the output of
+    /// *one item*, before [`fanout_collection_ty`] replaced `signature.output`
+    /// for downstream typing.
+    ///
+    /// Both are needed and they are not the same type. Downstream nodes
+    /// consume the collection, so `signature.output` must describe that; but
+    /// each individual item's result still has to be validated against what
+    /// the block actually promised to produce, which is this. Collapsing them
+    /// into one field means every item gets checked against the collection
+    /// record and fails.
+    pub item_output: Option<cuttlefish_abi::Ty>,
 }
 
 /// What a fan-out node presents to the nodes downstream of it.
@@ -165,10 +176,15 @@ pub fn check_graph(
     //    referenced node's *output* type, and a node can be referenced
     //    before it's "current" in visit order.
     let mut signatures = HashMap::new();
+    let mut item_outputs: HashMap<String, cuttlefish_abi::Ty> = HashMap::new();
     for (name, node) in &graph.nodes {
         let input = resolved.get(name).expect("caller resolved every node");
         let mut signature = read_stage_signature(engine, input)?;
         if node.over.is_some() {
+            // Keep what the block promised for one item — the substitution
+            // below is about downstream typing only, and each item's result
+            // still has to be checked against this at runtime.
+            item_outputs.insert(name.clone(), signature.output.clone());
             // A fan-out node's block declares the shape of *one item's*
             // result, but downstream nodes consume the collection of all of
             // them. Substituting here — where per-node signatures are first
@@ -229,6 +245,7 @@ pub fn check_graph(
             max_iterations: node.max_iterations,
             script: input_resolved.script.clone(),
             over: node.over.clone(),
+            item_output: item_outputs.get(name).cloned(),
         });
     }
 

@@ -694,6 +694,7 @@ fn checked_node(name: &str, signature: cuttlefish_abi::Signature) -> CheckedNode
         max_iterations: None,
         script: None,
         over: None,
+        item_output: None,
     }
 }
 
