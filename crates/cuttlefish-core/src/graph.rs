@@ -108,6 +108,16 @@ pub fn is_simple_chain(graph: &NodeGraph, branches: &Branches) -> bool {
         if node.repeat_until.is_some() {
             return false;
         }
+        // The bundle manifest carries a node's name, kind, resolution and
+        // signature — nothing about *how* it executes. `over` would
+        // therefore be dropped at bundle time and silently absent at run
+        // time, so a bundled fan-out node runs once against the job input
+        // instead of once per manifest line, and returns something that
+        // looks entirely reasonable. Refusing to bundle is the only honest
+        // option until the format carries this.
+        if node.over.is_some() {
+            return false;
+        }
         match (i, &node.input) {
             (0, None) => {}
             (0, Some(_)) => return false, // the entry node must have no input
@@ -434,6 +444,25 @@ mod is_simple_chain_tests {
         looped.max_iterations = Some(5);
         let graph = NodeGraph {
             nodes: vec![("a".into(), node("blocks/a", None)), ("b".into(), looped)],
+        };
+        assert!(!is_simple_chain(&graph, &Branches::default()));
+    }
+
+    /// A `.cfbundle` manifest records each node's name, kind, resolution and
+    /// signature — nothing about *how* it executes. A fan-out node bundled
+    /// anyway would lose `over` on the way in and be silently ignored on the
+    /// way out, running once against the job input instead of N times over
+    /// the manifest, and producing a plausible-looking result. Refusing to
+    /// bundle is the only honest option until the format carries it.
+    #[test]
+    fn a_fan_out_node_is_not_simple_because_a_bundle_cannot_carry_over() {
+        let mut fanned = node("blocks/a", None);
+        fanned.over = Some(PathBuf::from("corpus/manifest.jsonl"));
+        let graph = NodeGraph {
+            nodes: vec![
+                ("a".into(), fanned),
+                ("b".into(), node("blocks/b", Some(from_node("a")))),
+            ],
         };
         assert!(!is_simple_chain(&graph, &Branches::default()));
     }
