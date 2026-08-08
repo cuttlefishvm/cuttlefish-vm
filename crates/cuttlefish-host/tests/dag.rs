@@ -41,6 +41,7 @@ fn node(input: Option<InputExpr>) -> Node {
         input,
         repeat_until: None,
         max_iterations: None,
+        over: None,
     }
 }
 
@@ -353,6 +354,7 @@ fn a_repeat_until_self_reference_is_accepted() {
                 input: Some(from("refine")),
                 repeat_until: Some("done".to_string()),
                 max_iterations: Some(5),
+                over: None,
             },
         )],
     };

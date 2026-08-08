@@ -49,6 +49,34 @@ impl LedgerJobStatus {
 /// concurrent access.
 pub struct Ledger {
     conn: Mutex<Connection>,
+    job_dir: std::path::PathBuf,
+}
+
+/// Names the job this ledger belongs to without trying to render the SQLite
+/// connection, which is not `Debug`. Exists so callers can use
+/// `Result`-combinators like `expect_err` on [`Ledger::open`].
+impl std::fmt::Debug for Ledger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ledger")
+            .field("job_dir", &self.job_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a ledger could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum LedgerError {
+    /// The underlying SQLite call failed.
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    /// The file predates per-item checkpoints, so its `checkpoints` table has
+    /// no `item_index` column and its rows cannot be interpreted against the
+    /// current schema.
+    #[error(
+        "this job's ledger predates per-item fan-out checkpoints and cannot be resumed \
+         — re-submit the job to start a fresh one"
+    )]
+    StaleSchema,
 }
 
 impl Ledger {
@@ -59,7 +87,7 @@ impl Ledger {
     /// yet (a fresh job) — reopening an existing ledger leaves the
     /// originally-recorded fingerprint untouched, since comparing old vs.
     /// new fingerprint is a resume endpoint's job, not `open`'s.
-    pub fn open(path: &Path, graph_fingerprint: &str) -> rusqlite::Result<Self> {
+    pub fn open(path: &Path, graph_fingerprint: &str) -> Result<Self, LedgerError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -70,14 +98,39 @@ impl Ledger {
         // busy_timeout of 0 means that second connection gets an immediate
         // SQLITE_BUSY instead of waiting briefly for the lock to clear.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
+        // A table that already exists keeps its original shape under CREATE
+        // TABLE IF NOT EXISTS, so a ledger written before per-item
+        // checkpoints would survive to here and then fail at the first
+        // INSERT with "no such column: item_index" — an error that says
+        // nothing about what actually happened or what to do. Detect it here
+        // instead. An empty result means the table doesn't exist yet, which
+        // is just a fresh ledger.
+        let existing_columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(checkpoints)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if !existing_columns.is_empty() && !existing_columns.iter().any(|c| c == "item_index") {
+            return Err(LedgerError::StaleSchema);
+        }
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS checkpoints (
-                node_name    TEXT PRIMARY KEY,
+                node_name    TEXT NOT NULL,
+                item_index   INTEGER NOT NULL DEFAULT -1,
                 status       TEXT NOT NULL,
                 output_json  TEXT,
-                completed_at TEXT NOT NULL
+                error_text   TEXT,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (node_name, item_index)
              );
-             CREATE TABLE IF NOT EXISTS job_status (status TEXT NOT NULL, graph_fingerprint TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS job_status (status TEXT NOT NULL, graph_fingerprint TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS fanout_manifests (
+                node_name  TEXT PRIMARY KEY,
+                digest     TEXT NOT NULL,
+                item_count INTEGER NOT NULL
+             );",
         )?;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM job_status", [], |r| r.get(0))?;
         if count == 0 {
@@ -88,7 +141,21 @@ impl Ledger {
         }
         Ok(Self {
             conn: Mutex::new(conn),
+            // Fan-out results are materialized beside the ledger. Deriving
+            // the directory from the path we were already given avoids
+            // threading a second, independently-computed notion of "this
+            // job's directory" through `run_job`, which could drift.
+            job_dir: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
         })
+    }
+
+    /// The directory this job's state lives in — the ledger file's own
+    /// parent. Fan-out results are materialized under here.
+    pub fn job_dir(&self) -> &Path {
+        &self.job_dir
     }
 
     /// The fingerprint recorded when this job was first submitted — compare
@@ -102,7 +169,7 @@ impl Ledger {
     /// `None` for a node that never ran, is still pending, or was skipped.
     pub fn get_completed(&self, node_name: &str) -> rusqlite::Result<Option<serde_json::Value>> {
         let result: Option<(String, Option<String>)> = match self.lock().query_row(
-            "SELECT status, output_json FROM checkpoints WHERE node_name = ?1",
+            "SELECT status, output_json FROM checkpoints WHERE node_name = ?1 AND item_index = -1",
             [node_name],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ) {
@@ -122,7 +189,7 @@ impl Ledger {
     /// branch decision).
     pub fn is_skipped(&self, node_name: &str) -> rusqlite::Result<bool> {
         let status: Option<String> = match self.lock().query_row(
-            "SELECT status FROM checkpoints WHERE node_name = ?1",
+            "SELECT status FROM checkpoints WHERE node_name = ?1 AND item_index = -1",
             [node_name],
             |r| r.get(0),
         ) {
@@ -141,8 +208,9 @@ impl Ledger {
         output: &serde_json::Value,
     ) -> rusqlite::Result<()> {
         self.lock().execute(
-            "INSERT OR REPLACE INTO checkpoints (node_name, status, output_json, completed_at)
-             VALUES (?1, 'completed', ?2, ?3)",
+            "INSERT OR REPLACE INTO checkpoints
+               (node_name, item_index, status, output_json, error_text, completed_at)
+             VALUES (?1, -1, 'completed', ?2, NULL, ?3)",
             rusqlite::params![node_name, output.to_string(), now_marker()],
         )?;
         Ok(())
@@ -152,11 +220,162 @@ impl Ledger {
     /// that node.
     pub fn write_skipped(&self, node_name: &str) -> rusqlite::Result<()> {
         self.lock().execute(
-            "INSERT OR REPLACE INTO checkpoints (node_name, status, output_json, completed_at)
-             VALUES (?1, 'skipped', NULL, ?2)",
+            "INSERT OR REPLACE INTO checkpoints
+               (node_name, item_index, status, output_json, error_text, completed_at)
+             VALUES (?1, -1, 'skipped', NULL, NULL, ?2)",
             rusqlite::params![node_name, now_marker()],
         )?;
         Ok(())
+    }
+
+    /// Record one fan-out item as completed with `output`.
+    pub fn write_item_completed(
+        &self,
+        node_name: &str,
+        item_index: usize,
+        output: &serde_json::Value,
+    ) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO checkpoints
+               (node_name, item_index, status, output_json, error_text, completed_at)
+             VALUES (?1, ?2, 'completed', ?3, NULL, ?4)",
+            rusqlite::params![
+                node_name,
+                item_index as i64,
+                output.to_string(),
+                now_marker()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record one fan-out item as having *concluded* in failure.
+    ///
+    /// Concluded is the operative word. An item still in flight when the
+    /// process died must leave no row at all, so that resume re-runs it —
+    /// whereas an item whose block genuinely returned `Fail` is recorded
+    /// here and never retried. That distinction is the entire basis of
+    /// fan-out resume semantics: it separates "this chunk is bad" from "we
+    /// were interrupted", without needing to ask which happened.
+    pub fn write_item_failed(
+        &self,
+        node_name: &str,
+        item_index: usize,
+        error: &str,
+    ) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO checkpoints
+               (node_name, item_index, status, output_json, error_text, completed_at)
+             VALUES (?1, ?2, 'failed', NULL, ?3, ?4)",
+            rusqlite::params![node_name, item_index as i64, error, now_marker()],
+        )?;
+        Ok(())
+    }
+
+    /// One item's recorded output, if it completed successfully.
+    pub fn get_item_completed(
+        &self,
+        node_name: &str,
+        item_index: usize,
+    ) -> rusqlite::Result<Option<serde_json::Value>> {
+        let row: Option<(String, Option<String>)> = match self.lock().query_row(
+            "SELECT status, output_json FROM checkpoints
+             WHERE node_name = ?1 AND item_index = ?2",
+            rusqlite::params![node_name, item_index as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
+        Ok(match row {
+            Some((status, Some(json))) if status == "completed" => {
+                Some(serde_json::from_str(&json).expect("ledger never stores invalid JSON"))
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether this item already concluded, either way — the resume check.
+    /// A concluded item is skipped; anything else is (re-)run.
+    pub fn item_concluded(&self, node_name: &str, item_index: usize) -> rusqlite::Result<bool> {
+        let count: i64 = self.lock().query_row(
+            "SELECT COUNT(*) FROM checkpoints WHERE node_name = ?1 AND item_index = ?2",
+            rusqlite::params![node_name, item_index as i64],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Every concluded item for `node_name`, in index order, as
+    /// `(index, output, error)` — exactly one of `output`/`error` is `Some`.
+    #[allow(clippy::type_complexity)]
+    pub fn concluded_items(
+        &self,
+        node_name: &str,
+    ) -> rusqlite::Result<Vec<(usize, Option<serde_json::Value>, Option<String>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT item_index, status, output_json, error_text FROM checkpoints
+             WHERE node_name = ?1 AND item_index >= 0 ORDER BY item_index",
+        )?;
+        let rows = stmt.query_map([node_name], |r| {
+            let index: i64 = r.get(0)?;
+            let status: String = r.get(1)?;
+            let output: Option<String> = r.get(2)?;
+            let error: Option<String> = r.get(3)?;
+            Ok((
+                index as usize,
+                if status == "completed" {
+                    output.map(|j| {
+                        serde_json::from_str(&j).expect("ledger never stores invalid JSON")
+                    })
+                } else {
+                    None
+                },
+                if status == "failed" { error } else { None },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Record what `node_name` fanned out over, or verify it is unchanged.
+    ///
+    /// `Ok(Err(previous_digest))` means this node previously ran against a
+    /// *different* manifest. Item indices are only meaningful relative to one
+    /// specific manifest, so resuming would quietly pair recorded results
+    /// with entirely different inputs — no graph-level fingerprint can catch
+    /// an edit to the manifest file itself, which is why this exists.
+    ///
+    /// The outer `Result` is storage failure; the inner one is the verdict.
+    pub fn check_or_record_manifest(
+        &self,
+        node_name: &str,
+        digest: &str,
+        item_count: usize,
+    ) -> rusqlite::Result<Result<(), String>> {
+        let conn = self.lock();
+        let existing: Option<String> = match conn.query_row(
+            "SELECT digest FROM fanout_manifests WHERE node_name = ?1",
+            [node_name],
+            |r| r.get(0),
+        ) {
+            Ok(d) => Some(d),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e),
+        };
+        match existing {
+            Some(previous) if previous != digest => Ok(Err(previous)),
+            Some(_) => Ok(Ok(())),
+            None => {
+                conn.execute(
+                    "INSERT INTO fanout_manifests (node_name, digest, item_count)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![node_name, digest, item_count as i64],
+                )?;
+                Ok(Ok(()))
+            }
+        }
     }
 
     /// The job's own terminal status. `Running` until [`Ledger::finish`] is
