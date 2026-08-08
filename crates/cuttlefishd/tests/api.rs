@@ -272,6 +272,8 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
             script: None,
             over: None,
             item_output: None,
+            accept: Vec::new(),
+            on_fail: Vec::new(),
         })
         .collect();
     let fingerprint = cuttlefish_host::dag::graph_fingerprint(&checked_nodes);
@@ -887,6 +889,8 @@ async fn shutdown_causes_serve_to_return() {
         script: None,
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }];
 
     // A real `Notify`, distinct from the `std::future::pending()` every other

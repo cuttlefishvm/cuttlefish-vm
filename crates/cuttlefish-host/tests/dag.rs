@@ -699,6 +699,8 @@ fn checked_node(name: &str, signature: cuttlefish_abi::Signature) -> CheckedNode
         script: None,
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 

@@ -998,6 +998,7 @@ dependencies = [
  "encoding_rs",
  "futures-util",
  "image",
+ "jsonschema",
  "llama-cpp-2",
  "lopdf 0.44.0",
  "pdf-extract",

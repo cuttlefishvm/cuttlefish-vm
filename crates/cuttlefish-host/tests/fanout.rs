@@ -63,6 +63,8 @@ fn map_node(script: &str, manifest: &Path) -> CheckedNode {
         script: Some(script.to_string()),
         over: Some(manifest.to_path_buf()),
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 
@@ -97,6 +99,8 @@ fn reduce_node() -> CheckedNode {
         script: Some(COUNT_LINES.to_string()),
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 

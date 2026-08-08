@@ -66,6 +66,8 @@ fn script_node(script_field_value: &str) -> CheckedNode {
         script: Some(script_field_value.to_string()),
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 

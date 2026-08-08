@@ -105,6 +105,8 @@ fn node(name: &str, module_bytes: Vec<u8>) -> CheckedNode {
         script: None,
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 

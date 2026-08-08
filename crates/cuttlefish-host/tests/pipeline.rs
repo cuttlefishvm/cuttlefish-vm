@@ -318,6 +318,8 @@ fn checked_node(
         script: None,
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 
