@@ -709,13 +709,26 @@ async fn get_escalations_reports_across_jobs_this_process_never_ran() {
         )
         .unwrap();
         ledger
-            .write_escalated("extract", Some(7), "judge: cites no numbers from the input")
+            .write_escalated(
+                "extract",
+                Some(7),
+                "judge: cites no numbers from the input",
+                Some(&serde_json::json!({"chunk": "revenue rose"})),
+            )
             .unwrap();
     }
 
+    // `?all=true` rather than the default listing, and not incidentally:
+    // every test in this file shares one jobs root, and the drain endpoint
+    // is global by design — it drains every outstanding escalation on the
+    // machine, including this one. Asserting against the outstanding queue
+    // would make this test pass or fail on whether the drain test happened
+    // to run first. What this test is actually about is that the endpoint
+    // reports across jobs this process never ran, which `?all=true` shows
+    // just as well. Outstanding-vs-drained is covered by the drain test.
     let body: serde_json::Value = h
         .client
-        .get("http://localhost/escalations")
+        .get("http://localhost/escalations?all=true")
         .send()
         .await
         .unwrap()
@@ -1455,4 +1468,107 @@ async fn an_endpoint_value_is_never_mistaken_for_a_wasm_flag_value() {
     assert_eq!(body[0]["name"], "summarize_docs");
 
     let _ = child.kill();
+}
+
+#[tokio::test]
+async fn draining_returns_inputs_marks_rows_and_reports_what_it_could_not_recover() {
+    // The three things a drain has to get right at once: hand back the
+    // inputs, stop the rows coming back on the next drain, and be honest
+    // about the ones it can't help with.
+    let h = start().await;
+    let id = unique_job_id("drainable");
+    let recoverable = serde_json::json!({"n": 2, "doc": "q3.pdf"});
+    {
+        let ledger = cuttlefish_host::ledger::Ledger::open(
+            &h.jobs_root.join(&id).join("ledger.sqlite"),
+            &h.fingerprint,
+        )
+        .unwrap();
+        ledger
+            .write_escalated("grade", Some(0), "too small", Some(&recoverable))
+            .unwrap();
+        // An escalation from before inputs were recorded. It must be
+        // reported, not silently dropped -- a drain that writes one line
+        // for two listed escalations without comment is untrustworthy.
+        ledger
+            .write_escalated("grade", Some(1), "ancient failure", None)
+            .unwrap();
+    }
+
+    let body: serde_json::Value = h
+        .client
+        .post("http://localhost/escalations/drain")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let mine: Vec<_> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["job"] == id)
+        .collect();
+    assert_eq!(mine.len(), 1, "only the recoverable row is drainable");
+    assert_eq!(
+        mine[0]["input"], recoverable,
+        "the input must come back verbatim -- it becomes a manifest line"
+    );
+
+    let stranded: Vec<_> = body["unrecoverable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["job"] == id)
+        .collect();
+    assert_eq!(stranded.len(), 1, "the input-less row must be reported");
+    assert_eq!(stranded[0]["item"], 1);
+
+    // Drained rows leave the queue...
+    let after: serde_json::Value = h
+        .client
+        .get("http://localhost/escalations")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let outstanding: Vec<_> = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["job"] == id)
+        .collect();
+    assert_eq!(
+        outstanding.len(),
+        1,
+        "the drained row is gone; the unrecoverable one stays outstanding"
+    );
+    assert_eq!(outstanding[0]["item"], 1);
+
+    // ...but the history survives.
+    let history: serde_json::Value = h
+        .client
+        .get("http://localhost/escalations?all=true")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let all_mine: Vec<_> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["job"] == id)
+        .collect();
+    assert_eq!(all_mine.len(), 2, "draining must not destroy the record");
+    let drained = all_mine.iter().find(|e| e["item"] == 0).unwrap();
+    assert!(
+        drained["drained_at"].is_string(),
+        "the exported row must be stamped: {drained}"
+    );
 }

@@ -176,6 +176,12 @@ cuttlefish cancel --endpoint <endpoint> <job_id>
 ```bash
 cuttlefish escalations --endpoint <endpoint>
 # everything every job gave up on, with the reason it gave up
+
+cuttlefish escalations --endpoint <endpoint> --all
+# including ones already drained — the history
+
+cuttlefish escalations --endpoint <endpoint> --manifest /tmp/retry.jsonl
+# export the escalated items' inputs and mark them drained
 ```
 
 **Draining escalations is the point of them.** A node whose spec declares
@@ -191,6 +197,36 @@ escalation is a planning decision, which is yours.
 A job with escalations still finished. Escalated fan-out items are
 counted as failures and appear in that node's `failures.jsonl` like any
 other — the escalation is an index into them, not a separate outcome.
+
+**Draining is not retrying.** An escalation means the ladder was already
+exhausted — every retry spent, every reroute taken. Re-running the same
+work under the same policy fails identically. So `--manifest` hands the
+work *back*, and you decide what to change:
+
+```bash
+cuttlefish escalations --endpoint <endpoint> --manifest /tmp/retry.jsonl
+# wrote 12 item(s) to /tmp/retry.jsonl
+#   line 1: 79eee874  extract[7]
+#   ...
+```
+
+The file holds only the raw inputs, one JSON value per line — exactly
+what `over` consumes. Point a new spec at it with something actually
+different (a stronger model, a looser schema, a fixed block):
+
+```
+redo = { block = "extract@1"; over = "/tmp/retry.jsonl"; };
+```
+
+Provenance is not in the file — a `__source` field would change each
+value's shape and break the consuming block's declared input type. It
+goes to stdout instead, in the same order.
+
+Draining marks rows rather than deleting them, so a second drain finds
+nothing and the same work is never handed out twice. `--all` still shows
+what happened. If an escalation predates input recording it cannot be
+drained; the command says so on stderr and does not count it, so the
+line count is never quietly short.
 
 `cuttlefish run` (unchanged, pre-existing) still blocks until one specific
 job finishes — use it only when actually waiting for a single result is
