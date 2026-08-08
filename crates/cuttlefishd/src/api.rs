@@ -65,6 +65,21 @@ pub struct SubmitJob {
     pub input: serde_json::Value,
 }
 
+/// The read roots a job actually runs with: everything its spec declared,
+/// plus its own fan-out results directory.
+///
+/// The daemon writes fan-out results itself, as host code, so nothing grants
+/// *it* access. But a reduce block reading those results is sandboxed like
+/// any other block, and the results path isn't knowable when the spec is
+/// written — it depends on the job id. Granting it here, scoped to the one
+/// directory this job's own results live in, is what lets a reduce node
+/// `open` them without the spec author having to predict the path.
+fn fanout_aware_roots(st: &AppState, job_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut roots = st.spec.read_roots.clone();
+    roots.push(job_dir.join("results"));
+    roots
+}
+
 /// Build the router.
 pub fn router(state: AppState) -> Router {
     // Path parameters use axum 0.8 syntax — `{id}`, not the `:id` of 0.7.
@@ -162,7 +177,7 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         nodes: (*st.checked_nodes).clone(),
         exclusive_to: (*st.exclusive_to).clone(),
         input: req.input,
-        caps: Capabilities::new(st.spec.read_roots.clone()),
+        caps: Capabilities::new(fanout_aware_roots(&st, &job_dir)),
     };
 
     // Every event goes through `publish`, so it lands in the replay log as well
@@ -352,7 +367,7 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
         nodes: (*st.checked_nodes).clone(),
         exclusive_to: (*st.exclusive_to).clone(),
         input,
-        caps: Capabilities::new(st.spec.read_roots.clone()),
+        caps: Capabilities::new(fanout_aware_roots(&st, &job_dir)),
     };
 
     // Atomic guard against a concurrent second /resume call racing to this

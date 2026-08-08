@@ -462,6 +462,47 @@ pub async fn run_job(
                 Some(expr) => evaluate_input(expr, &outputs),
             };
 
+            // Fan-out: this node runs once per manifest line rather than
+            // once, with each item checkpointed independently. Handled by
+            // its own helper because it is a genuinely different execution
+            // shape, not a variation on the repeat_until loop below (which
+            // it is parse-time forbidden to combine with).
+            if node.over.is_some() {
+                let collected = match run_fanout_node(
+                    &engine,
+                    cache,
+                    &backend,
+                    node,
+                    &job.caps,
+                    &mut handles,
+                    &events,
+                    &cancel,
+                    &mut usage,
+                    started,
+                    index,
+                    total,
+                    ledger,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(envelope) => break 'run envelope,
+                };
+                if let Err(e) = ledger.write_completed(&node.name, &collected) {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    break 'run fail(
+                        error_codes::SCHEMA_VALIDATION_FAILED,
+                        format!(
+                            "recording checkpoint for node `{}` in ledger: {e}",
+                            node.name
+                        ),
+                        usage,
+                    );
+                }
+                outputs.insert(node.name.clone(), collected);
+                continue;
+            }
+
             // Bounded loop: repeat_until re-invokes this node on its own
             // prior output, up to max_iterations. A node without
             // repeat_until runs exactly once (the loop's `None` arm breaks
@@ -680,6 +721,344 @@ pub async fn run_job(
 /// `Err` carries a finished [`Envelope`]: a stage that fails ends the whole job,
 /// because a later stage's input is the earlier one's output and there is
 /// nothing sensible to feed it.
+/// Run one fan-out node: its block once per manifest line, each item
+/// checkpointed independently, then the results materialized for whatever
+/// consumes them downstream.
+///
+/// Returns the collection record described by
+/// [`crate::dag::fanout_collection_ty`] — deliberately not any one item's
+/// result, since downstream consumes all of them.
+///
+/// # Why the ledger is authoritative and the files are a projection
+///
+/// Items are recorded in SQLite as they conclude, and `results.jsonl` /
+/// `failures.jsonl` are written once at the end by reading those rows back.
+/// Appending to the text files as items finished would be simpler, but a
+/// crash mid-append leaves a torn final line that resume then has to
+/// reconcile against the ledger. Projecting at the end makes that class of
+/// bug unrepresentable: SQLite is already transactional, so let it be the
+/// thing that's true.
+#[allow(clippy::too_many_arguments)]
+async fn run_fanout_node(
+    engine: &Engine,
+    cache: &crate::module_cache::ModuleCache,
+    backend: &Arc<dyn InferBackend>,
+    node: &crate::dag::CheckedNode,
+    caps: &Capabilities,
+    handles: &mut Handles,
+    events: &mpsc::Sender<JobEvent>,
+    cancel: &CancellationToken,
+    usage: &mut Usage,
+    started: Instant,
+    index: usize,
+    total: usize,
+    ledger: &crate::ledger::Ledger,
+) -> Result<serde_json::Value, Envelope> {
+    use sha2::{Digest, Sha256};
+
+    let manifest_path = node
+        .over
+        .as_ref()
+        .expect("run_fanout_node is only called for a node with `over`");
+    let node_name = node.name.as_str();
+
+    let bail = |message: String, usage: &mut Usage| -> Envelope {
+        usage.duration_ms = started.elapsed().as_millis() as u64;
+        fail(
+            error_codes::SCHEMA_VALIDATION_FAILED,
+            message,
+            usage.clone(),
+        )
+    };
+
+    // --- Read and validate the manifest up front -------------------------
+    //
+    // A malformed manifest is an authoring error, so it fails the whole job
+    // before any item runs, rather than surfacing as N mysterious item
+    // failures partway through.
+    let bytes = std::fs::read(manifest_path).map_err(|e| {
+        bail(
+            format!(
+                "node `{node_name}`: reading fan-out manifest {}: {e}",
+                manifest_path.display()
+            ),
+            usage,
+        )
+    })?;
+
+    let text = String::from_utf8(bytes.clone()).map_err(|e| {
+        bail(
+            format!(
+                "node `{node_name}`: fan-out manifest {} is not valid UTF-8: {e}",
+                manifest_path.display()
+            ),
+            usage,
+        )
+    })?;
+
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(v) => items.push(v),
+            Err(e) => {
+                return Err(bail(
+                    format!(
+                        "node `{node_name}`: fan-out manifest {} line {} is not valid JSON: {e}",
+                        manifest_path.display(),
+                        i + 1
+                    ),
+                    usage,
+                ))
+            }
+        }
+    }
+
+    if items.is_empty() {
+        return Err(bail(
+            format!(
+                "node `{node_name}`: fan-out manifest {} is empty — zero items almost always \
+                 means the step that produced it failed, and reducing over nothing would \
+                 silently look like success",
+                manifest_path.display()
+            ),
+            usage,
+        ));
+    }
+
+    // --- Pin this node to the manifest it ran against --------------------
+    //
+    // An item_index is only meaningful relative to one manifest, and no
+    // graph fingerprint can see an edit to the manifest *file*.
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    match ledger.check_or_record_manifest(node_name, &digest, items.len()) {
+        Ok(Ok(())) => {}
+        Ok(Err(previous)) => {
+            return Err(bail(
+                format!(
+                    "node `{node_name}`: fan-out manifest {} has changed since this job first \
+                     ran (was {previous}, now {digest}) — recorded item indices no longer refer \
+                     to the same inputs, so resuming would pair results with the wrong items; \
+                     re-submit the job instead",
+                    manifest_path.display()
+                ),
+                usage,
+            ))
+        }
+        Err(e) => {
+            return Err(bail(
+                format!("node `{node_name}`: recording fan-out manifest digest: {e}"),
+                usage,
+            ))
+        }
+    }
+
+    // --- Run each item ---------------------------------------------------
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+
+    for (item_index, item_input) in items.iter().enumerate() {
+        // Cancellation is checked here, not only inside run_stage: without
+        // it a cancelled 500-item campaign would keep starting new items,
+        // finishing only once the manifest ran out.
+        if cancel.is_cancelled() {
+            usage.duration_ms = started.elapsed().as_millis() as u64;
+            return Err(Envelope {
+                status: JobStatus::Cancelled,
+                result: None,
+                error: None,
+                usage: usage.clone(),
+            });
+        }
+
+        // Resume: an item that already concluded — either way — is not run
+        // again. An item that was merely in flight when a previous run died
+        // left no row, so it lands here and runs now.
+        match ledger.item_concluded(node_name, item_index) {
+            Ok(true) => {
+                if ledger
+                    .get_item_completed(node_name, item_index)
+                    .unwrap_or(None)
+                    .is_some()
+                {
+                    succeeded += 1;
+                } else {
+                    failed += 1;
+                }
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                return Err(bail(
+                    format!("node `{node_name}`: reading item {item_index} from ledger: {e}"),
+                    usage,
+                ))
+            }
+        }
+
+        let _ = events
+            .send(JobEvent::Progress(serde_json::json!({
+                "stage": index + 1,
+                "of": total,
+                "node": node_name,
+                "item": item_index,
+                "items": items.len(),
+                "succeeded": succeeded,
+                "failed": failed,
+            })))
+            .await;
+
+        // Each item's input must satisfy what the block declared. A single
+        // mismatched line is a data-quality problem, not an authoring one,
+        // so it fails that item and the run continues.
+        if !node.signature.input.matches_value(item_input) {
+            failed += 1;
+            let message = format!(
+                "item {item_index} does not match the block's declared input `{}`",
+                node.signature.input
+            );
+            if let Err(e) = ledger.write_item_failed(node_name, item_index, &message) {
+                return Err(bail(
+                    format!("node `{node_name}`: recording item {item_index} failure: {e}"),
+                    usage,
+                ));
+            }
+            continue;
+        }
+
+        let outcome = run_stage(
+            engine,
+            cache,
+            backend,
+            &node.module_bytes,
+            item_input.clone(),
+            node.script.as_deref(),
+            caps,
+            handles,
+            events,
+            cancel,
+            usage,
+            started,
+            index,
+        )
+        .await;
+
+        match outcome {
+            Ok(value) if node.signature.output.matches_value(&value) => {
+                succeeded += 1;
+                if let Err(e) = ledger.write_item_completed(node_name, item_index, &value) {
+                    return Err(bail(
+                        format!("node `{node_name}`: recording item {item_index} result: {e}"),
+                        usage,
+                    ));
+                }
+            }
+            Ok(value) => {
+                failed += 1;
+                let message = format!(
+                    "item {item_index} produced {value}, which doesn't match the block's \
+                     declared output `{}`",
+                    node.signature.output
+                );
+                if let Err(e) = ledger.write_item_failed(node_name, item_index, &message) {
+                    return Err(bail(
+                        format!("node `{node_name}`: recording item {item_index} failure: {e}"),
+                        usage,
+                    ));
+                }
+            }
+            // A cancelled job must not be recorded as a per-item failure —
+            // nothing about the item was wrong, and doing so would make the
+            // cancellation permanent across a later resume.
+            Err(envelope) if envelope.status == JobStatus::Cancelled => return Err(envelope),
+            Err(envelope) => {
+                failed += 1;
+                let message = envelope
+                    .error
+                    .as_ref()
+                    .map(|e| format!("{}: {}", e.code, e.message))
+                    .unwrap_or_else(|| "item failed with no error detail".to_string());
+                if let Err(e) = ledger.write_item_failed(node_name, item_index, &message) {
+                    return Err(bail(
+                        format!("node `{node_name}`: recording item {item_index} failure: {e}"),
+                        usage,
+                    ));
+                }
+            }
+        }
+    }
+
+    if succeeded == 0 {
+        return Err(bail(
+            format!(
+                "node `{node_name}`: all {failed} fan-out item(s) failed — there is nothing for \
+                 a downstream node to reduce over",
+            ),
+            usage,
+        ));
+    }
+
+    // --- Materialize the results from the ledger -------------------------
+    //
+    // Named per node: a graph may legally contain more than one fan-out
+    // node, and flat results.jsonl / failures.jsonl would clobber.
+    let results_dir = ledger.job_dir().join("results");
+    std::fs::create_dir_all(&results_dir).map_err(|e| {
+        bail(
+            format!(
+                "node `{node_name}`: creating {}: {e}",
+                results_dir.display()
+            ),
+            usage,
+        )
+    })?;
+    let results_path = results_dir.join(format!("{node_name}.results.jsonl"));
+    let failures_path = results_dir.join(format!("{node_name}.failures.jsonl"));
+
+    let concluded = ledger.concluded_items(node_name).map_err(|e| {
+        bail(
+            format!("node `{node_name}`: reading concluded items from ledger: {e}"),
+            usage,
+        )
+    })?;
+
+    let (mut results_out, mut failures_out) = (String::new(), String::new());
+    for (item_index, output, error) in concluded {
+        match (output, error) {
+            (Some(value), _) => results_out.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"item": item_index, "result": value})
+            )),
+            (None, Some(message)) => failures_out.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"item": item_index, "error": message})
+            )),
+            (None, None) => {}
+        }
+    }
+
+    for (path, contents) in [
+        (&results_path, &results_out),
+        (&failures_path, &failures_out),
+    ] {
+        std::fs::write(path, contents).map_err(|e| {
+            bail(
+                format!("node `{node_name}`: writing {}: {e}", path.display()),
+                usage,
+            )
+        })?;
+    }
+
+    Ok(serde_json::json!({
+        "results_path": results_path.to_string_lossy(),
+        "failures_path": failures_path.to_string_lossy(),
+        "succeeded": succeeded,
+        "failed": failed,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_stage(
     engine: &Engine,
