@@ -1,0 +1,66 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The cuttlefish daemon: accepts delegated jobs, runs them, streams results."><title>cuttlefishd - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="cuttlefishd" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate cuttlefishd</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../cuttlefishd/index.html">cuttlefishd</a><span class="version">0.0.6</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#transport-http-over-a-unix-domain-socket" title="Transport: HTTP over a unix domain socket">Transport: HTTP over a unix domain socket</a><ul><li><a href="#the-alternative-and-the-one-argument-that-genuinely-favours-it" title="The alternative, and the one argument that genuinely favours it">The alternative, and the one argument that genuinely favours it</a></li></ul></li></ul><h3><a href="#modules">Crate Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>cuttlefishd</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/cuttlefishd/lib.rs.html#1-137">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The cuttlefish daemon: accepts delegated jobs, runs them, streams results.</p>
+<p>The transport decision is recorded here, because it is the choice most
+likely to be revisited by someone who was not present for it.</p>
+<h2 id="transport-http-over-a-unix-domain-socket"><a class="doc-anchor" href="#transport-http-over-a-unix-domain-socket">§</a>Transport: HTTP over a unix domain socket</h2>
+<p>Clients talk to the daemon over HTTP on a unix domain socket, with
+server-sent events for live job output.</p>
+<p>It is worth being precise about what that does and does not mean, because
+“why HTTP instead of IPC?” is the obvious question and it contains a false
+dichotomy. A unix domain socket <em>is</em> inter-process communication. The socket
+was never in question; HTTP is only the framing carried over it. The real
+choice is which protocol rides the socket.</p>
+<p>HTTP was chosen for reasons that all reduce to <em>nobody has to write protocol
+code</em>:</p>
+<ul>
+<li>Every language has a mature client, so consuming cuttlefish costs no
+bespoke implementation. The CLI in this workspace is a thin wrapper around
+an off-the-shelf HTTP client.</li>
+<li>It is debuggable by hand. <code>curl --unix-socket</code> reproduces any client
+interaction, which matters enormously while the reactor loop and the
+capability model are still being proven.</li>
+<li>Server-sent events supply streaming <em>and</em> <code>Last-Event-ID</code> replay. The
+replay half is not incidental: a client that submits a job and then
+connects to the event stream would otherwise miss everything a fast job
+emitted in between.</li>
+<li>Exposing the daemon over TCP for a remote caller becomes a config change
+rather than a second protocol.</li>
+</ul>
+<h3 id="the-alternative-and-the-one-argument-that-genuinely-favours-it"><a class="doc-anchor" href="#the-alternative-and-the-one-argument-that-genuinely-favours-it">§</a>The alternative, and the one argument that genuinely favours it</h3>
+<p>A leaner framing — length-prefixed JSON, JSON-RPC, gRPC — would cost less per
+message and would be bidirectional, letting cancellation travel in-band
+instead of as a separate <code>DELETE</code>. Neither matters much here: this transport
+carries jobs, not packets, and cancellation is rare.</p>
+<p>JSON-RPC deserves a specific mention as the strongest of those: it is what
+MCP and LSP speak, so it is the framing that agent tooling already
+understands, and adopting it would leave cuttlefish a short step from being
+usable directly as an MCP server.</p>
+<p>The genuinely compelling argument for a raw socket protocol, though, is one
+HTTP cannot answer at all: <strong>file descriptor passing</strong>. A unix socket can
+transfer an open file descriptor via <code>SCM_RIGHTS</code>. For this project that is
+not a micro-optimisation, it changes the security model:</p>
+<ul>
+<li>Today a caller passes a <em>path</em>, the daemon checks it against the job’s
+granted capabilities, and then opens it. Check and open are separate
+syscalls, so there is a window in which the path can be swapped —
+precisely the race that symlink attacks exploit.</li>
+<li>If the caller passed an already-open descriptor instead, there would be no
+window, because the descriptor <em>is</em> the capability. The daemon would need
+no filesystem access to the path at all, which is a materially stronger
+version of the privacy guarantee this project exists to provide.</li>
+</ul>
+<p>A related, smaller benefit: <code>SO_PEERCRED</code> lets the daemon establish the uid
+and pid of its peer, which matters on a shared machine.</p>
+<p>Neither of these is a reason to replace the control plane. Descriptor
+passing cannot ride HTTP no matter what else is decided, so it needs a side
+channel in <em>every</em> design — which makes it additive later rather than a
+constraint now. The path-based capability check keeps its own defence in the
+meantime: it canonicalises both sides before comparing, which closes the
+traversal and symlink cases it can close without descriptor passing.</p>
+<p>Revisit this decision if descriptor passing becomes required, or if
+cuttlefish should speak MCP natively. Do not revisit it for performance
+without a measurement showing the transport is the bottleneck; at job
+granularity it will not be.</p>
+</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="api/index.html" title="mod cuttlefishd::api">api</a></dt><dd>The HTTP surface: submit a job, watch it, fetch its result, cancel it.</dd><dt><a class="mod" href="serve/index.html" title="mod cuttlefishd::serve">serve</a></dt><dd>Serving the API over a machine-local, OS-permission-gated transport: a
+unix domain socket on unix, a named pipe on Windows.</dd><dt><a class="mod" href="state/index.html" title="mod cuttlefishd::state">state</a></dt><dd>Job bookkeeping: status, results, and the event log.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.scan_for_interrupted_jobs.html" title="fn cuttlefishd::scan_for_interrupted_jobs">scan_<wbr>for_<wbr>interrupted_<wbr>jobs</a></dt><dd>Scan every job directory under <code>jobs_root</code> for a ledger whose
+<code>job_status</code> is still <code>Running</code> — i.e. a job that was mid-flight when the
+daemon last stopped — and record it in <code>jobs</code> as <a href="../cuttlefish_abi/enum.JobStatus.html#variant.Interrupted" title="variant cuttlefish_abi::JobStatus::Interrupted"><code>cuttlefish_abi::JobStatus::Interrupted</code></a>.</dd></dl></section></div></main></body></html>

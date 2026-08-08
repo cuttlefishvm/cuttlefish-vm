@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["InputExpr"],"fn":["is_simple_chain"],"struct":["Branches","GraphParser","Node","NodeGraph"]};

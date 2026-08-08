@@ -1,0 +1,57 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Native tooling for AI agents: a local runtime for jobs an agent hands off."><title>cuttlefish - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="cuttlefish" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate cuttlefish</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><a class="logo-container" href="../cuttlefish/index.html"><img src="https://cuttlefishvm.github.io/assets/images/logo.png" alt="logo"></a><h2><a href="../cuttlefish/index.html">cuttlefish</a><span class="version">0.0.6</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#how-a-job-runs" title="How a job runs">How a job runs</a></li><li><a href="#this-crate" title="This crate">This crate</a></li><li><a href="#project-conventions" title="Project conventions">Project conventions</a></li></ul><h3><a href="#reexports">Crate Items</a></h3><ul class="block"><li><a href="#reexports" title="Re-exports">Re-exports</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>cuttlefish</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/cuttlefish/lib.rs.html#1-82">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Native tooling for AI agents: a local runtime for jobs an agent hands off.</p>
+<p>A coding agent delegates a job — summarize this, classify that, extract
+these fields — and Cuttlefish runs it on this machine against a local
+model, returning a structured result. Two things make that worth doing:</p>
+<ul>
+<li><strong>Data stays local.</strong> For jobs marked local-only, the calling agent
+passes <em>paths</em>, not contents. Cuttlefish opens the files itself, so
+proprietary source and personal data never enter a frontier model’s
+context at all. The guarantee is not “we also ran something locally” — it
+is that the remote model never received the bytes.</li>
+<li><strong>Frontier prices stop applying to grunt work.</strong> Bulk, repetitive, and
+mechanical subtasks do not need a trillion-parameter model, and offloading
+them keeps tokens and context for the work that does.</li>
+</ul>
+<p>The limitation is worth stating plainly rather than discovering later: you
+cannot run a frontier-class model on a laptop. Cuttlefish targets the large
+subset of agent work that does not need frontier reasoning. It is not a
+replacement for one.</p>
+<h2 id="how-a-job-runs"><a class="doc-anchor" href="#how-a-job-runs">§</a>How a job runs</h2>
+<p>A job is described by a <code>.cuttlefish</code> spec — which model, what the job may
+touch, and which processing block implements it. The block is compiled to
+WebAssembly and runs sandboxed inside the daemon, which serves inference
+from a local model and streams results back to the caller.</p>
+<p>Three decisions shape the rest of the system, and each exists to avoid a
+specific failure rather than to express a preference:</p>
+<p><strong>The host drives the guest.</strong> A block is a state machine: it returns
+<em>commands</em> (<code>Infer</code>, <code>Open</code>, <code>Slice</code>, <code>Done</code>) and the host executes them,
+then steps the block again. The obvious alternative — let the guest call
+into the host and block until it answers — cannot work, because a
+single-threaded wasm guest offers no execution context for the host to call
+back into, and inference must run on a different thread from the (<code>!Sync</code>)
+wasm store. Inverting control also makes cancellation trivial: the host
+simply stops stepping, so no guest cooperation is required.</p>
+<p><strong>Bulk data never enters guest memory.</strong> A block receives a handle and a
+length, then pulls bounded windows. Guest memory tracks the window size, not
+the input size, so a block written against a README behaves identically
+against a corpus — and the 4 GiB ceiling of 32-bit wasm binds on nothing we
+actually do.</p>
+<p><strong>Capabilities are deny-by-default and checked twice.</strong> A block reaches
+nothing unless its spec grants it. The grant is verified when the spec is
+compiled and again by the sandbox at runtime. The compile-time check is a
+convenience that produces good error messages; the runtime check is the
+security boundary.</p>
+<h2 id="this-crate"><a class="doc-anchor" href="#this-crate">§</a>This crate</h2>
+<p>This is the facade. It ships the <code>cuttlefish</code> command-line client and
+re-exports the workspace’s pieces, so that one page documents the whole
+system. The implementation lives in sibling crates:</p>
+<ul>
+<li><a href="../cuttlefish_abi/index.html" title="mod cuttlefish_abi"><code>abi</code></a> — the contract between host and guest.</li>
+<li><a href="../cuttlefish_core/index.html" title="mod cuttlefish_core"><code>core</code></a> — parsing <code>Cuttlefish.spec</code> files.</li>
+</ul>
+<h2 id="project-conventions"><a class="doc-anchor" href="#project-conventions">§</a>Project conventions</h2>
+<p>Documentation lives in the code rather than in a separate design document,
+so that explanations sit beside what they explain and go stale loudly
+instead of quietly. Comments state <em>why</em> code looks the way it does, never
+what it does. See <code>AGENTS.md</code> in the repository for the full contract.</p>
+</div></details><h2 id="reexports" class="section-header">Re-exports<a href="#reexports" class="anchor">§</a></h2><dl class="item-table reexports"><dt id="reexport.abi"><code>pub use <a class="mod" href="../cuttlefish_abi/index.html" title="mod cuttlefish_abi">cuttlefish_abi</a> as abi;</code></dt><dt id="reexport.core"><code>pub use <a class="mod" href="../cuttlefish_core/index.html" title="mod cuttlefish_core">cuttlefish_core</a> as core;</code></dt></dl></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Command","Event","MediaKind","TokenAction","Ty"],"macro":[["export_block",1]],"struct":["Desc","Signature"],"trait":["Block"],"type":["Handle"]};
