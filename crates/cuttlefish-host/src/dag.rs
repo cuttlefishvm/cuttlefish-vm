@@ -40,6 +40,37 @@ pub struct CheckedNode {
     /// Threaded straight from `ResolvedInput::script`/`Stage::script` — see
     /// `pipeline.rs`. `Some` only for a `Script`-kind node.
     pub script: Option<String>,
+    /// The fan-out manifest this node runs over, if any — see
+    /// [`cuttlefish_core::graph::Node::over`]. When set, this node runs its
+    /// block once per manifest line and presents
+    /// [`fanout_collection_ty`] downstream rather than its block's own
+    /// declared output.
+    pub over: Option<std::path::PathBuf>,
+    /// For a fan-out node only: what its block declared as the output of
+    /// *one item*, before [`fanout_collection_ty`] replaced `signature.output`
+    /// for downstream typing.
+    ///
+    /// Both are needed and they are not the same type. Downstream nodes
+    /// consume the collection, so `signature.output` must describe that; but
+    /// each individual item's result still has to be validated against what
+    /// the block actually promised to produce, which is this. Collapsing them
+    /// into one field means every item gets checked against the collection
+    /// record and fails.
+    pub item_output: Option<cuttlefish_abi::Ty>,
+}
+
+/// What a fan-out node presents to the nodes downstream of it.
+///
+/// Deliberately *not* the block's own declared output: downstream consumes
+/// the collection of every item's result, not any one item's. The counts are
+/// [`Ty::Json`] because [`Ty`] has no number variant.
+pub fn fanout_collection_ty() -> Ty {
+    Ty::Record(BTreeMap::from([
+        ("results_path".to_string(), Ty::Text),
+        ("failures_path".to_string(), Ty::Text),
+        ("succeeded".to_string(), Ty::Json),
+        ("failed".to_string(), Ty::Json),
+    ]))
 }
 
 /// A whole graph, typechecked and topologically ordered.
@@ -145,9 +176,26 @@ pub fn check_graph(
     //    referenced node's *output* type, and a node can be referenced
     //    before it's "current" in visit order.
     let mut signatures = HashMap::new();
-    for (name, _) in &graph.nodes {
+    let mut item_outputs: HashMap<String, cuttlefish_abi::Ty> = HashMap::new();
+    for (name, node) in &graph.nodes {
         let input = resolved.get(name).expect("caller resolved every node");
-        signatures.insert(name.clone(), read_stage_signature(engine, input)?);
+        let mut signature = read_stage_signature(engine, input)?;
+        if node.over.is_some() {
+            // Keep what the block promised for one item — the substitution
+            // below is about downstream typing only, and each item's result
+            // still has to be checked against this at runtime.
+            item_outputs.insert(name.clone(), signature.output.clone());
+            // A fan-out node's block declares the shape of *one item's*
+            // result, but downstream nodes consume the collection of all of
+            // them. Substituting here — where per-node signatures are first
+            // collected — is what makes every seam check downstream correct
+            // with no further changes, since `evaluate_expr_ty` and each
+            // `assignable_to` comparison read from this same map. The
+            // block's own declared output is still used, per item, to
+            // validate what each run produced.
+            signature.output = fanout_collection_ty();
+        }
+        signatures.insert(name.clone(), signature);
     }
 
     // 2. Topological sort with cycle detection. An edge node -> referenced
@@ -196,6 +244,8 @@ pub fn check_graph(
             repeat_until: node.repeat_until.clone(),
             max_iterations: node.max_iterations,
             script: input_resolved.script.clone(),
+            over: node.over.clone(),
+            item_output: item_outputs.get(name).cloned(),
         });
     }
 
@@ -217,6 +267,18 @@ pub fn graph_fingerprint(nodes: &[CheckedNode]) -> String {
     for node in nodes {
         hash_length_prefixed(&mut hasher, node.name.as_bytes());
         hash_length_prefixed(&mut hasher, node.signature.to_string().as_bytes());
+        // A node fanning out over a different manifest is a different node
+        // for resume purposes even with an identical signature: its recorded
+        // item indices refer to inputs from the old manifest. Without this,
+        // repointing `over` would resume against checkpoints computed from
+        // entirely different data.
+        hash_length_prefixed(
+            &mut hasher,
+            node.over
+                .as_ref()
+                .map(|p| p.as_os_str().as_encoded_bytes())
+                .unwrap_or(b""),
+        );
     }
     format!("{:x}", hasher.finalize())
 }

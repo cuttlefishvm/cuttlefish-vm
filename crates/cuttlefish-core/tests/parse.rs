@@ -347,3 +347,78 @@ fn an_unknown_escape_is_rejected_rather_than_silently_kept() {
     );
     assert!(parse_spec(&src).is_err());
 }
+
+// --- Fan-out (`over`) ---------------------------------------------------
+//
+// A fan-out node runs its block once per manifest line instead of once. The
+// manifest is read by the *host*, so the refusals below matter for the same
+// reason every other refusal in this file does: a spec that half-parses runs
+// a job touching paths nobody granted.
+
+#[test]
+fn a_node_can_declare_over_for_fan_out() {
+    let spec = parse_spec(
+        r#"spec s = {
+  description = "d"; model = Stub "x"; data_policy = Any;
+  capabilities = [ Read "./corpus" ];
+  nodes = { a = { block = "a@1"; over = "./corpus/manifest.jsonl"; }; };
+}"#,
+    )
+    .expect("a node with `over` must parse");
+    let node = spec.nodes.get("a").expect("node `a`");
+    assert_eq!(
+        node.over.as_deref(),
+        Some(std::path::Path::new("./corpus/manifest.jsonl"))
+    );
+}
+
+#[test]
+fn over_and_repeat_until_on_one_node_is_rejected() {
+    let err = parse_spec(
+        r#"spec s = {
+  description = "d"; model = Stub "x"; data_policy = Any;
+  capabilities = [ Read "./corpus" ];
+  nodes = { a = { block = "a@1"; over = "./corpus/m.jsonl"; repeat_until = "done"; max_iterations = 3; }; };
+}"#,
+    )
+    .expect_err("over + repeat_until must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("over"), "{msg}");
+    assert!(msg.contains("repeat_until"), "{msg}");
+}
+
+#[test]
+fn a_manifest_outside_every_read_root_is_rejected() {
+    let err = parse_spec(
+        r#"spec s = {
+  description = "d"; model = Stub "x"; data_policy = Any;
+  capabilities = [ Read "./corpus" ];
+  nodes = { a = { block = "a@1"; over = "./elsewhere/manifest.jsonl"; }; };
+}"#,
+    )
+    .expect_err("a manifest outside the read roots must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("elsewhere/manifest.jsonl"), "{msg}");
+    assert!(msg.contains("capabilities"), "{msg}");
+}
+
+/// `./corpus` and `corpus` name the same directory. A naive
+/// `Path::starts_with` says otherwise (a leading `./` is a real
+/// `Component::CurDir`), which would reject perfectly ordinary specs.
+#[test]
+fn a_leading_dot_slash_does_not_change_whether_a_manifest_is_covered() {
+    for (root, manifest) in [
+        ("./corpus", "./corpus/m.jsonl"),
+        ("corpus", "./corpus/m.jsonl"),
+        ("./corpus", "corpus/m.jsonl"),
+    ] {
+        parse_spec(&format!(
+            r#"spec s = {{
+  description = "d"; model = Stub "x"; data_policy = Any;
+  capabilities = [ Read "{root}" ];
+  nodes = {{ a = {{ block = "a@1"; over = "{manifest}"; }}; }};
+}}"#
+        ))
+        .unwrap_or_else(|e| panic!("Read {root:?} must cover {manifest:?}: {e}"));
+    }
+}

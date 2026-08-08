@@ -94,6 +94,39 @@ spec summarize_docs = {
 
   Typechecked the same way as any other seam (see "Command" below) before
   anything runs.
+
+  A node may also declare **`over = "manifest.jsonl"`**, which makes it run
+  its block **once per line** of that manifest instead of once — the whole
+  campaign being one job, so it survives the agent that submitted it:
+
+  ```
+  nodes = {
+    analyze = { block = "analyst@1"; over = "./corpus/manifest.jsonl"; };
+    synth   = { block = "synth@1"; in = analyze.out; };
+  };
+  ```
+
+  - The manifest is **JSONL**: one JSON value per line, each the complete
+    input for one run. Blank lines are skipped. It must sit inside a path
+    granted by `capabilities` (the host reads it, and the host isn't
+    sandboxed, so this keeps the capability list honest).
+  - A fan-out node's `.out` is **not** one item's result — it is the fixed
+    record `{results_path: text, failures_path: text, succeeded: json,
+    failed: json}`. A downstream node must declare *that* as its input;
+    declaring the per-item shape is the natural mistake and won't
+    typecheck. Read the results with `open`/`slice` on `results_path`.
+  - **One bad item doesn't kill the run.** An item whose input doesn't
+    match the declared type, or whose block fails, is recorded in
+    `failures.jsonl` and the rest continue. What *does* fail the whole job:
+    a missing/unparseable/empty manifest (an authoring error, caught before
+    any item runs), or every single item failing.
+  - **Resume doesn't repeat concluded work.** Interrupt a 500-item run and
+    resume it; items that already succeeded or already failed are skipped,
+    items that were merely in flight run again. Editing the manifest
+    between runs is refused rather than silently reindexed — item numbers
+    only mean something relative to one manifest.
+  - `over` and `repeat_until` cannot be combined; they describe different
+    kinds of iteration.
 - `branches = { node = { "route_label" -> target_node; ... }; ... };` —
   conditional dispatch for a branching node's labeled routes. Uncommon
   enough that if you need it, read `crates/cuttlefish-core/src/graph.rs`

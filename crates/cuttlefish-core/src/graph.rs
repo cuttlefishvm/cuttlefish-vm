@@ -38,6 +38,14 @@ pub struct Node {
     /// as a typecheck-time gap, since a missing bound is a spec-authoring
     /// mistake regardless of what the graph shape turns out to be.
     pub max_iterations: Option<u32>,
+    /// Fan-out marker: a JSONL manifest, one JSON value per line, each the
+    /// complete input for one run of this node's block. `None` for an
+    /// ordinary node, which runs exactly once.
+    ///
+    /// Mutually exclusive with [`Node::repeat_until`] — both describe
+    /// iteration, but over different things (manifest items vs. this node's
+    /// own prior output), and there is no coherent combined meaning.
+    pub over: Option<PathBuf>,
 }
 
 /// `nodes = { name = { ... }; ... }`
@@ -60,6 +68,7 @@ impl NodeGraph {
                     input: None,
                     repeat_until: None,
                     max_iterations: None,
+                    over: None,
                 },
             )],
         }
@@ -219,16 +228,18 @@ impl<'a> GraphParser<'a> {
         Ok((NodeGraph { nodes }, self.at))
     }
 
-    /// `{ block = "..."; in = expr; repeat_until = "..."; max_iterations = N; }`
+    /// `{ block = "..."; in = expr; over = "..."; repeat_until = "..."; max_iterations = N; }`
     fn node_body(&mut self) -> Result<Node, SpecError> {
         self.expect(&Tok::OpenBrace)?;
-        let (mut block, mut input, mut repeat_until, mut max_iterations) = (None, None, None, None);
+        let (mut block, mut input, mut repeat_until, mut max_iterations, mut over) =
+            (None, None, None, None, None);
         while self.peek().is_some() && self.peek() != Some(&Tok::CloseBrace) {
             let key = self.ident()?;
             self.expect(&Tok::Equals)?;
             match key.as_str() {
                 "block" => block = Some(PathBuf::from(self.string()?)),
                 "in" => input = Some(self.input_expr()?),
+                "over" => over = Some(PathBuf::from(self.string()?)),
                 "repeat_until" => repeat_until = Some(self.string_or_field()?),
                 "max_iterations" => max_iterations = Some(self.number()?),
                 other => return Err(SpecError::UnknownField(other.to_string())),
@@ -241,11 +252,20 @@ impl<'a> GraphParser<'a> {
                 "repeat_until requires max_iterations".into(),
             ));
         }
+        if over.is_some() && repeat_until.is_some() {
+            return Err(SpecError::Malformed(
+                "a node cannot declare both `over` (run once per manifest item) and \
+                 `repeat_until` (re-run on its own output) — they are two different \
+                 iteration semantics with no combined meaning"
+                    .into(),
+            ));
+        }
         Ok(Node {
             block: block.ok_or(SpecError::MissingField("block"))?,
             input,
             repeat_until,
             max_iterations,
+            over,
         })
     }
 
@@ -351,6 +371,7 @@ mod is_simple_chain_tests {
             input,
             repeat_until: None,
             max_iterations: None,
+            over: None,
         }
     }
 

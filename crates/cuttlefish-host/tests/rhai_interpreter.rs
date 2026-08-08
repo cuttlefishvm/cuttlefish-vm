@@ -64,6 +64,8 @@ fn script_node(script_field_value: &str) -> CheckedNode {
         repeat_until: None,
         max_iterations: None,
         script: Some(script_field_value.to_string()),
+        over: None,
+        item_output: None,
     }
 }
 
@@ -344,6 +346,7 @@ async fn a_script_node_resolved_from_the_catalog_and_run_through_run_job_gets_it
                 input: None,
                 repeat_until: None,
                 max_iterations: None,
+                over: None,
             },
         )],
     };

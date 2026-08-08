@@ -270,6 +270,8 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
             repeat_until: None,
             max_iterations: None,
             script: None,
+            over: None,
+            item_output: None,
         })
         .collect();
     let fingerprint = cuttlefish_host::dag::graph_fingerprint(&checked_nodes);
@@ -882,6 +884,8 @@ async fn shutdown_causes_serve_to_return() {
         repeat_until: None,
         max_iterations: None,
         script: None,
+        over: None,
+        item_output: None,
     }];
 
     // A real `Notify`, distinct from the `std::future::pending()` every other
