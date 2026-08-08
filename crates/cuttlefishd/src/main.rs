@@ -57,6 +57,15 @@ async fn main() -> anyhow::Result<()> {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     spec.read_roots = spec.read_roots.iter().map(|r| spec_dir.join(r)).collect();
+    // Fan-out manifests are spec-relative for exactly the same reason, and
+    // are read by the host rather than a block — so if this resolution were
+    // skipped, a daemon started from another directory would read the wrong
+    // file (or none) rather than failing in any obvious way.
+    for (_, node) in spec.nodes.nodes.iter_mut() {
+        if let Some(manifest) = node.over.take() {
+            node.over = Some(spec_dir.join(manifest));
+        }
+    }
 
     // The spec names a provider; the registry decides what serves it. Adding a
     // backend therefore changes neither this file nor the spec parser.

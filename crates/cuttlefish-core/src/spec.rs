@@ -32,7 +32,7 @@
 //!
 //! Being liberal in what it accepts would be exactly the wrong instinct here.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Where a job's model comes from.
@@ -144,6 +144,28 @@ pub enum SpecError {
 }
 
 use crate::lex::{lex, Tok, Token};
+
+/// Whether `root` contains `candidate`, comparing on meaningful path
+/// components only.
+///
+/// Not `Path::starts_with`: a leading `./` is a real `Component::CurDir`, so
+/// `Path::new("./corpus/m.jsonl").starts_with("corpus")` is `false` — and a
+/// spec author writing `capabilities = [ Read "corpus" ]` beside
+/// `over = "./corpus/m.jsonl"` has no reason to expect one spelling of the
+/// same directory to be rejected.
+fn path_covers(root: &Path, candidate: &Path) -> bool {
+    fn significant(p: &Path) -> Vec<std::ffi::OsString> {
+        p.components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .map(|c| c.as_os_str().to_os_string())
+            .collect()
+    }
+    candidate_starts_with(&significant(candidate), &significant(root))
+}
+
+fn candidate_starts_with(candidate: &[std::ffi::OsString], root: &[std::ffi::OsString]) -> bool {
+    candidate.len() >= root.len() && candidate[..root.len()] == *root
+}
 
 /// Parse a spec.
 ///
@@ -295,13 +317,33 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::CloseBrace)?;
 
+        let read_roots = read_roots.ok_or(SpecError::MissingField("capabilities"))?;
+        let nodes = nodes.ok_or(SpecError::MissingField("block"))?;
+
+        // A fan-out manifest is read by the *host*, which is not sandboxed —
+        // so nothing would stop it reading a path the spec never granted.
+        // Requiring it to sit inside a declared `Read` root keeps the
+        // capability list a truthful description of everything the job
+        // touches, which is the property the whole capability model rests on.
+        for (name, node) in &nodes.nodes {
+            if let Some(manifest) = &node.over {
+                if !read_roots.iter().any(|root| path_covers(root, manifest)) {
+                    return Err(SpecError::Malformed(format!(
+                        "node `{name}`'s manifest {} is outside every path granted by \
+                         `capabilities` — add a `Read` for it",
+                        manifest.display()
+                    )));
+                }
+            }
+        }
+
         Ok(Spec {
             name,
             description: description.ok_or(SpecError::MissingField("description"))?,
             model: model.ok_or(SpecError::MissingField("model"))?,
             data_policy: data_policy.ok_or(SpecError::MissingField("data_policy"))?,
-            read_roots: read_roots.ok_or(SpecError::MissingField("capabilities"))?,
-            nodes: nodes.ok_or(SpecError::MissingField("block"))?,
+            read_roots,
+            nodes,
             branches: branches.unwrap_or_default(),
         })
     }
