@@ -114,6 +114,7 @@ fn spec(f: &Fixture, input: serde_json::Value) -> JobSpec {
         exclusive_to: HashMap::new(),
         input,
         caps: f.caps.clone(),
+        alternates: Default::default(),
     }
 }
 
@@ -282,6 +283,7 @@ async fn a_module_that_is_not_wasm_fails_as_a_trap() {
             exclusive_to: HashMap::new(),
             input: serde_json::json!({ "path": f.doc.to_str().unwrap() }),
             caps: f.caps.clone(),
+            alternates: Default::default(),
         },
         tx,
         CancellationToken::new(),
@@ -521,6 +523,7 @@ async fn a_fan_in_node_receives_both_upstream_outputs() {
         exclusive_to: HashMap::new(),
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -587,6 +590,7 @@ export_block!(NeverDone);
         exclusive_to: HashMap::new(),
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -654,6 +658,7 @@ export_block!(DoneFirst);
         exclusive_to: HashMap::new(),
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -753,6 +758,7 @@ export_block!(MustNotRun);
         exclusive_to,
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -853,6 +859,7 @@ export_block!(MustNotRun);
         exclusive_to,
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -956,6 +963,7 @@ export_block!(MustNotRun);
         exclusive_to,
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -1033,6 +1041,7 @@ export_block!(MustNotRun);
         exclusive_to: HashMap::new(),
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (_ledger_dir, ledger) = test_ledger();
@@ -1151,6 +1160,7 @@ export_block!(MustNotRun);
         exclusive_to,
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (_ledger_dir, ledger) = test_ledger();
@@ -1215,6 +1225,7 @@ async fn a_node_whose_output_violates_its_declared_signature_fails_loudly() {
         exclusive_to: HashMap::new(),
         input: serde_json::json!({}),
         caps,
+        alternates: Default::default(),
     };
 
     let (tx, _rx) = mpsc::channel(64);

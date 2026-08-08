@@ -55,7 +55,7 @@ use thiserror::Error;
 /// model = OpenAi "http://host/v1#gpt-4"; // an OpenAI-compatible endpoint
 /// model = Path "./models/qwen.gguf";     // a local file, for embedded runtimes
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelRef {
     /// Which backend should serve this, lowercased — `ollama`, `path`, `stub`.
     ///

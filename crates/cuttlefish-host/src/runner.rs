@@ -42,6 +42,57 @@ pub enum JobEvent {
     Progress(serde_json::Value),
 }
 
+/// Backends for models *other than* the job's own, keyed by the model that
+/// names them.
+///
+/// Named `alternates` rather than `backends` on purpose: `run_job` already
+/// takes the job's own backend, and a field called `backends` sitting beside
+/// a parameter called `backend` is a trap. Everything here is something the
+/// job reaches only by explicit instruction — an `on_fail = [ reroute ... ]`
+/// rung, or a `Judge` that names its own model.
+///
+/// Resolved once at daemon startup, so a model this build cannot serve fails
+/// as the daemon comes up rather than three hours into a campaign, at the
+/// exact moment something has already gone wrong.
+pub type Alternates =
+    std::collections::HashMap<cuttlefish_core::spec::ModelRef, Arc<dyn InferBackend>>;
+
+/// Every model a spec can reach *besides* its own — the `reroute` targets
+/// and the model-bearing `Judge`s, deduplicated.
+///
+/// Exists so the daemon can resolve them all at startup. Collecting them
+/// here rather than in `cuttlefishd` keeps the knowledge of which node
+/// fields name a model next to the type that consumes them, so adding a
+/// third such field later is one edit rather than two.
+pub fn alternate_models_of(
+    spec: &cuttlefish_core::spec::Spec,
+) -> Vec<cuttlefish_core::spec::ModelRef> {
+    use cuttlefish_core::graph::{AcceptCheck, Rung};
+    let mut seen: Vec<cuttlefish_core::spec::ModelRef> = Vec::new();
+    let mut push = |model: cuttlefish_core::spec::ModelRef| {
+        // The job's own model is not an alternate; it already has a backend.
+        if model != spec.model && !seen.contains(&model) {
+            seen.push(model);
+        }
+    };
+    for (_, node) in &spec.nodes.nodes {
+        for rung in &node.on_fail {
+            if let Rung::Reroute(model) = rung {
+                push(model.clone());
+            }
+        }
+        for check in &node.accept {
+            if let AcceptCheck::Judge {
+                model: Some(model), ..
+            } = check
+            {
+                push(model.clone());
+            }
+        }
+    }
+    seen
+}
+
 /// Everything needed to run one job.
 pub struct JobSpec {
     /// The checked graph, in topological order — safe to execute
@@ -55,6 +106,10 @@ pub struct JobSpec {
     pub input: serde_json::Value,
     /// What this job is permitted to reach.
     pub caps: Capabilities,
+    /// Backends for models beyond the job's own — see [`Alternates`].
+    /// Empty for a spec with no `reroute` rung and no model-bearing `Judge`,
+    /// which is every spec that existed before acceptance contracts.
+    pub alternates: Alternates,
 }
 
 /// Pointer width of a guest module, read from the module rather than assumed.

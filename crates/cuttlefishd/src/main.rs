@@ -69,9 +69,30 @@ async fn main() -> anyhow::Result<()> {
 
     // The spec names a provider; the registry decides what serves it. Adding a
     // backend therefore changes neither this file nor the spec parser.
-    let backend = Registry::with_builtins()
+    let registry = Registry::with_builtins();
+    let backend = registry
         .resolve(&spec.model)
         .with_context(|| format!("resolving model `{}`", spec.model))?;
+
+    // Every *other* model the spec can reach — `on_fail = [ reroute ... ]`
+    // targets and model-bearing `Judge`s. Resolved here, at startup, for the
+    // same reason the spec's own model is: a model this build cannot serve
+    // should stop the daemon coming up, not surface partway through a
+    // campaign at the exact moment something has already gone wrong.
+    let mut alternates = cuttlefish_host::runner::Alternates::new();
+    for model in cuttlefish_host::runner::alternate_models_of(&spec) {
+        let resolved = registry.resolve(&model).with_context(|| {
+            format!("resolving model `{model}` named by a node's recovery or acceptance policy")
+        })?;
+        alternates.insert(model, resolved);
+    }
+    if !alternates.is_empty() {
+        eprintln!(
+            "cuttlefishd resolved {} alternate model(s) for recovery/acceptance",
+            alternates.len()
+        );
+    }
+
     eprintln!("cuttlefishd serving `{}` via {}", spec.name, spec.model);
 
     // Typecheck before serving. A seam mismatch is a property of the spec, not
@@ -151,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         engine,
         module_cache,
         backend,
+        alternates: Arc::new(alternates),
         jobs,
         spec: Arc::new(spec),
         checked_nodes: Arc::new({
