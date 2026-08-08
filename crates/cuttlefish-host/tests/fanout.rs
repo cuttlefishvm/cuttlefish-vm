@@ -258,7 +258,9 @@ async fn resume_does_not_repeat_items_that_already_concluded() {
     ledger
         .write_item_completed("map", 0, &serde_json::json!({"sentinel": true}))
         .unwrap();
-    ledger.write_item_failed("map", 1, "bad chunk").unwrap();
+    ledger
+        .write_item_failed("map", 1, "bad chunk", None)
+        .unwrap();
 
     let envelope = run_on(
         vec![
