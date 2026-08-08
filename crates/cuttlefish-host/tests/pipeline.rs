@@ -318,6 +318,8 @@ fn checked_node(
         script: None,
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 
@@ -355,6 +357,7 @@ async fn a_pipeline_threads_each_result_into_the_next_block() {
             exclusive_to: std::collections::HashMap::new(),
             input: serde_json::json!({}),
             caps: Capabilities::default(),
+            alternates: Default::default(),
         },
         tx,
         tokio_util::sync::CancellationToken::new(),
@@ -409,6 +412,7 @@ async fn a_failing_stage_ends_the_job_and_names_the_stage() {
             exclusive_to: std::collections::HashMap::new(),
             input: serde_json::json!({}),
             caps: Capabilities::default(),
+            alternates: Default::default(),
         },
         tx,
         tokio_util::sync::CancellationToken::new(),

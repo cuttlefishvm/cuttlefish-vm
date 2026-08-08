@@ -61,17 +61,61 @@ async fn main() -> anyhow::Result<()> {
     // are read by the host rather than a block — so if this resolution were
     // skipped, a daemon started from another directory would read the wrong
     // file (or none) rather than failing in any obvious way.
+    //
+    // `accept = [ Schema "..." ]` paths are spec-relative for exactly the
+    // same reason and read by exactly the same host code, so they resolve
+    // here too. Missing this is not a subtle failure — every job fails on
+    // its first acceptance check with "no such file" — but it fails at the
+    // *node*, long after startup, which is the wrong place to learn that a
+    // path was interpreted against the wrong directory.
     for (_, node) in spec.nodes.nodes.iter_mut() {
         if let Some(manifest) = node.over.take() {
             node.over = Some(spec_dir.join(manifest));
+        }
+        for check in node.accept.iter_mut() {
+            if let cuttlefish_core::graph::AcceptCheck::Schema(path) = check {
+                *path = spec_dir.join(&*path);
+            }
         }
     }
 
     // The spec names a provider; the registry decides what serves it. Adding a
     // backend therefore changes neither this file nor the spec parser.
-    let backend = Registry::with_builtins()
+    let registry = Registry::with_builtins();
+    let backend = registry
         .resolve(&spec.model)
         .with_context(|| format!("resolving model `{}`", spec.model))?;
+
+    // Every *other* model the spec can reach — `on_fail = [ reroute ... ]`
+    // targets and model-bearing `Judge`s. Resolved here, at startup, for the
+    // same reason the spec's own model is: a model this build cannot serve
+    // should stop the daemon coming up, not surface partway through a
+    // campaign at the exact moment something has already gone wrong.
+    let mut alternates = cuttlefish_host::runner::Alternates::new();
+    for model in cuttlefish_host::runner::alternate_models_of(&spec) {
+        let resolved = registry.resolve(&model).with_context(|| {
+            format!("resolving model `{model}` named by a node's recovery or acceptance policy")
+        })?;
+        alternates.insert(model, resolved);
+    }
+    // Compile every `accept` schema now, and throw the result away. A
+    // malformed or missing schema is a property of the spec, so it should
+    // stop the daemon coming up rather than surface as a bizarre acceptance
+    // failure once half a campaign has already run. `run_job` compiles them
+    // again for real — this is the early, loud check, not the one that
+    // matters at execution time.
+    for (name, node) in &spec.nodes.nodes {
+        cuttlefish_host::accept::CompiledChecks::compile(&node.accept)
+            .with_context(|| format!("checking the `accept` list of node `{name}`"))?;
+    }
+
+    if !alternates.is_empty() {
+        eprintln!(
+            "cuttlefishd resolved {} alternate model(s) for recovery/acceptance",
+            alternates.len()
+        );
+    }
+
     eprintln!("cuttlefishd serving `{}` via {}", spec.name, spec.model);
 
     // Typecheck before serving. A seam mismatch is a property of the spec, not
@@ -151,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
         engine,
         module_cache,
         backend,
+        alternates: Arc::new(alternates),
         jobs,
         spec: Arc::new(spec),
         checked_nodes: Arc::new({

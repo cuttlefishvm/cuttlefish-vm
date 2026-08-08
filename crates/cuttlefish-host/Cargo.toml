@@ -46,6 +46,11 @@ serde = { workspace = true }
 # sha2: content-hashing for the catalog's blob store, wired in starting in Task 7.
 # time: RFC 3339 timestamps for the catalog's created_at field, wired in starting in Task 9.
 sha2 = { workspace = true }
+# Acceptance checks (`accept = [ Schema ... ]`) validate host-side. Heavy
+# (~100 transitive crates: ICU, fancy-regex, num-bigint) and deliberately
+# confined to the host -- it must never reach a guest block, which compiles to
+# wasm32 and would pay this cost per block.
+jsonschema = { version = "0.49", default-features = false }
 time = { workspace = true }
 dirs = { workspace = true }
 rusqlite = { workspace = true }

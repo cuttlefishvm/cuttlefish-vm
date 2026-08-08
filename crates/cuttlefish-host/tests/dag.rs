@@ -42,6 +42,8 @@ fn node(input: Option<InputExpr>) -> Node {
         repeat_until: None,
         max_iterations: None,
         over: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 
@@ -355,6 +357,8 @@ fn a_repeat_until_self_reference_is_accepted() {
                 repeat_until: Some("done".to_string()),
                 max_iterations: Some(5),
                 over: None,
+                accept: Vec::new(),
+                on_fail: Vec::new(),
             },
         )],
     };
@@ -695,6 +699,8 @@ fn checked_node(name: &str, signature: cuttlefish_abi::Signature) -> CheckedNode
         script: None,
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 

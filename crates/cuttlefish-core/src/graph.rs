@@ -22,6 +22,39 @@ pub enum InputExpr {
     List(Vec<InputExpr>),
 }
 
+/// One check a node's output must pass before it counts as done.
+///
+/// Evaluated in declaration order, short-circuiting on the first failure —
+/// see [`Node::accept`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptCheck {
+    /// Validate against the JSON Schema at this path. Deterministic, and
+    /// costs no inference.
+    Schema(PathBuf),
+    /// Ask a model whether the output is acceptable.
+    Judge {
+        /// Which model grades. `None` means the spec's own `model`.
+        model: Option<crate::spec::ModelRef>,
+        /// The grading prompt. The host appends the node's input and the
+        /// output under judgement, since "does this cite numbers *from the
+        /// input*" is unanswerable without both.
+        prompt: String,
+    },
+}
+
+/// One rung of a node's recovery ladder, climbed in order until a rung
+/// succeeds or the rungs run out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rung {
+    /// Up to N further attempts, unchanged.
+    Retry(u32),
+    /// One attempt against a different model.
+    Reroute(crate::spec::ModelRef),
+    /// Terminal: stop, record why, and surface it to `cuttlefish
+    /// escalations`. Must be the last rung — see `GraphParser::ladder`.
+    Escalate,
+}
+
 /// One node in the graph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
@@ -46,6 +79,17 @@ pub struct Node {
     /// iteration, but over different things (manifest items vs. this node's
     /// own prior output), and there is no coherent combined meaning.
     pub over: Option<PathBuf>,
+    /// Checks this node's output must pass beyond its declared type.
+    ///
+    /// Ordered and short-circuiting. Empty means the declared type is the
+    /// only contract — today's behaviour, unchanged.
+    pub accept: Vec<AcceptCheck>,
+    /// What to try when an attempt fails, in order.
+    ///
+    /// Empty (or omitted) means one attempt and no recovery — again,
+    /// today's behaviour. A ladder that runs out without [`Rung::Escalate`]
+    /// is an ordinary failure.
+    pub on_fail: Vec<Rung>,
 }
 
 /// `nodes = { name = { ... }; ... }`
@@ -69,6 +113,8 @@ impl NodeGraph {
                     repeat_until: None,
                     max_iterations: None,
                     over: None,
+                    accept: Vec::new(),
+                    on_fail: Vec::new(),
                 },
             )],
         }
@@ -243,6 +289,7 @@ impl<'a> GraphParser<'a> {
         self.expect(&Tok::OpenBrace)?;
         let (mut block, mut input, mut repeat_until, mut max_iterations, mut over) =
             (None, None, None, None, None);
+        let (mut accept, mut on_fail) = (Vec::new(), Vec::new());
         while self.peek().is_some() && self.peek() != Some(&Tok::CloseBrace) {
             let key = self.ident()?;
             self.expect(&Tok::Equals)?;
@@ -250,6 +297,8 @@ impl<'a> GraphParser<'a> {
                 "block" => block = Some(PathBuf::from(self.string()?)),
                 "in" => input = Some(self.input_expr()?),
                 "over" => over = Some(PathBuf::from(self.string()?)),
+                "accept" => accept = self.accept_checks()?,
+                "on_fail" => on_fail = self.ladder()?,
                 "repeat_until" => repeat_until = Some(self.string_or_field()?),
                 "max_iterations" => max_iterations = Some(self.number()?),
                 other => return Err(SpecError::UnknownField(other.to_string())),
@@ -276,7 +325,120 @@ impl<'a> GraphParser<'a> {
             repeat_until,
             max_iterations,
             over,
+            accept,
+            on_fail,
         })
+    }
+
+    /// `[ Schema "p.json", Judge "prompt", Judge { model = M "t"; prompt = "..."; } ]`
+    fn accept_checks(&mut self) -> Result<Vec<AcceptCheck>, SpecError> {
+        let mut checks = Vec::new();
+        self.expect(&Tok::OpenBracket)?;
+        while self.peek() != Some(&Tok::CloseBracket) {
+            let kind = self.ident()?;
+            match kind.as_str() {
+                "Schema" => checks.push(AcceptCheck::Schema(PathBuf::from(self.string()?))),
+                "Judge" => checks.push(self.judge()?),
+                other => {
+                    return Err(SpecError::Malformed(format!(
+                        "unknown accept check `{other}` — expected `Schema` or `Judge`"
+                    )))
+                }
+            }
+            if self.peek() == Some(&Tok::Comma) {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        self.expect(&Tok::CloseBracket)?;
+        Ok(checks)
+    }
+
+    /// Either `Judge "prompt"` or `Judge { model = M "t"; prompt = "..."; }`.
+    ///
+    /// Two spellings because the bare one costs nothing to declare and suits
+    /// a cheap sanity check, while naming a model is what lets a strong,
+    /// slow model grade a fast one's bulk output.
+    fn judge(&mut self) -> Result<AcceptCheck, SpecError> {
+        if self.peek() != Some(&Tok::OpenBrace) {
+            return Ok(AcceptCheck::Judge {
+                model: None,
+                prompt: self.string()?,
+            });
+        }
+        self.at += 1;
+        let (mut model, mut prompt) = (None, None);
+        while self.peek().is_some() && self.peek() != Some(&Tok::CloseBrace) {
+            let key = self.ident()?;
+            self.expect(&Tok::Equals)?;
+            match key.as_str() {
+                "model" => {
+                    let provider = self.ident()?;
+                    model = Some(crate::spec::ModelRef::new(provider, self.string()?));
+                }
+                "prompt" => prompt = Some(self.string()?),
+                other => return Err(SpecError::UnknownField(other.to_string())),
+            }
+            self.skip_semi();
+        }
+        self.expect(&Tok::CloseBrace)?;
+        Ok(AcceptCheck::Judge {
+            model,
+            prompt: prompt.ok_or(SpecError::MissingField("prompt"))?,
+        })
+    }
+
+    /// `[ retry 2, reroute Ollama "m", escalate ]`
+    fn ladder(&mut self) -> Result<Vec<Rung>, SpecError> {
+        let mut rungs: Vec<Rung> = Vec::new();
+        self.expect(&Tok::OpenBracket)?;
+        while self.peek() != Some(&Tok::CloseBracket) {
+            // A terminal rung with anything after it means the author
+            // expected the tail to run. It never would — so say so rather
+            // than accepting a ladder whose second half is decorative.
+            if rungs.last() == Some(&Rung::Escalate) {
+                return Err(SpecError::Malformed(
+                    "`escalate` must be the last rung of an on_fail ladder — nothing after it \
+                     can ever run"
+                        .into(),
+                ));
+            }
+            let kind = self.ident()?;
+            match kind.as_str() {
+                "retry" => {
+                    let n = self.number()?;
+                    if n == 0 {
+                        return Err(SpecError::Malformed(
+                            "`retry 0` expresses nothing — write `retry 1`, or omit the rung"
+                                .into(),
+                        ));
+                    }
+                    rungs.push(Rung::Retry(n));
+                }
+                "reroute" => {
+                    let provider = self.ident()?;
+                    rungs.push(Rung::Reroute(crate::spec::ModelRef::new(
+                        provider,
+                        self.string()?,
+                    )));
+                }
+                "escalate" => rungs.push(Rung::Escalate),
+                other => {
+                    return Err(SpecError::Malformed(format!(
+                        "unknown on_fail rung `{other}` — expected `retry`, `reroute`, or \
+                         `escalate`"
+                    )))
+                }
+            }
+            if self.peek() == Some(&Tok::Comma) {
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        self.expect(&Tok::CloseBracket)?;
+        Ok(rungs)
     }
 
     /// `repeat_until = "done"` — a bare field-name string, not a node
@@ -382,6 +544,8 @@ mod is_simple_chain_tests {
             repeat_until: None,
             max_iterations: None,
             over: None,
+            accept: Vec::new(),
+            on_fail: Vec::new(),
         }
     }
 

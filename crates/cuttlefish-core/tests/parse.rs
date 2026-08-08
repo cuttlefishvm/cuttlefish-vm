@@ -2,7 +2,7 @@
 //! what it accepts. Most of these tests are refusals: a spec that half-parses
 //! would run a job under permissions nobody wrote down.
 
-use cuttlefish_core::graph::InputExpr;
+use cuttlefish_core::graph::{AcceptCheck, InputExpr, Rung};
 use cuttlefish_core::spec::{parse_spec, DataPolicy, ModelRef, SpecError};
 use std::path::PathBuf;
 
@@ -421,4 +421,134 @@ fn a_leading_dot_slash_does_not_change_whether_a_manifest_is_covered() {
         ))
         .unwrap_or_else(|e| panic!("Read {root:?} must cover {manifest:?}: {e}"));
     }
+}
+
+// --- Acceptance checks (`accept`) ---------------------------------------
+//
+// What "done" means beyond a node's declared type. Ordered and
+// short-circuiting: Schema is deterministic and free, Judge costs a whole
+// inference, so a schema-first list never pays for a judge on structurally
+// broken output.
+
+#[test]
+fn a_node_can_declare_accept_checks() {
+    let spec = parse_spec(
+        r#"spec s = {
+  description = "d"; model = Stub "x"; data_policy = Any;
+  capabilities = [ Read "./schemas" ];
+  nodes = { a = { block = "a@1";
+                  accept = [ Schema "./schemas/v.json", Judge "is it good?" ]; }; };
+}"#,
+    )
+    .expect("accept must parse");
+    let node = spec.nodes.get("a").unwrap();
+    assert_eq!(node.accept.len(), 2);
+    assert!(matches!(node.accept[0], AcceptCheck::Schema(_)));
+    match &node.accept[1] {
+        AcceptCheck::Judge { model, prompt } => {
+            assert!(model.is_none(), "a bare Judge uses the spec's own model");
+            assert_eq!(prompt, "is it good?");
+        }
+        other => panic!("expected a Judge, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_judge_can_name_its_own_model() {
+    // The form that actually works: a slow, strong model grading a fast
+    // one's bulk output.
+    let spec = parse_spec(
+        r#"spec s = {
+  description = "d"; model = Stub "x"; data_policy = Any; capabilities = [ ];
+  nodes = { a = { block = "a@1";
+                  accept = [ Judge { model = Ollama "llama3.3:70b"; prompt = "grade it"; } ]; }; };
+}"#,
+    )
+    .expect("the record form of Judge must parse");
+    match &spec.nodes.get("a").unwrap().accept[0] {
+        AcceptCheck::Judge { model, prompt } => {
+            assert_eq!(
+                model.as_ref().unwrap(),
+                &ModelRef::new("ollama", "llama3.3:70b")
+            );
+            assert_eq!(prompt, "grade it");
+        }
+        other => panic!("expected a Judge, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_node_without_accept_has_no_checks() {
+    // The default must stay exactly today's behaviour: the declared type is
+    // the only contract.
+    let spec = parse_spec(SAMPLE).unwrap();
+    assert!(spec.nodes.get("block").unwrap().accept.is_empty());
+}
+
+// --- Recovery ladder (`on_fail`) ----------------------------------------
+
+/// Build a one-node spec whose `on_fail` is `ladder`.
+fn ladder_spec(ladder: &str) -> Result<cuttlefish_core::spec::Spec, SpecError> {
+    parse_spec(&format!(
+        r#"spec s = {{
+  description = "d"; model = Stub "x"; data_policy = Any; capabilities = [ ];
+  nodes = {{ a = {{ block = "a@1"; on_fail = {ladder}; }}; }};
+}}"#
+    ))
+}
+
+#[test]
+fn a_node_can_declare_an_on_fail_ladder() {
+    let spec = ladder_spec(r#"[ retry 2, reroute Ollama "llama3.3:70b", escalate ]"#)
+        .expect("an on_fail ladder must parse");
+    let rungs = &spec.nodes.get("a").unwrap().on_fail;
+    assert_eq!(rungs.len(), 3);
+    assert_eq!(rungs[0], Rung::Retry(2));
+    assert_eq!(
+        rungs[1],
+        Rung::Reroute(ModelRef::new("ollama", "llama3.3:70b"))
+    );
+    assert_eq!(rungs[2], Rung::Escalate);
+}
+
+#[test]
+fn escalate_must_be_the_last_rung() {
+    // Anything after a terminal rung is unreachable. Accepting it would mean
+    // a spec whose second half is decorative and whose author doesn't know.
+    let err = ladder_spec("[ escalate, retry 2 ]").expect_err("must be rejected");
+    assert!(err.to_string().contains("escalate"), "{err}");
+}
+
+#[test]
+fn a_ladder_cannot_escalate_twice() {
+    let err = ladder_spec("[ escalate, escalate ]").expect_err("must be rejected");
+    assert!(err.to_string().contains("escalate"), "{err}");
+}
+
+#[test]
+fn retry_zero_is_rejected() {
+    // Expresses nothing: the author meant `retry 1`, or no rung at all.
+    let err = ladder_spec("[ retry 0 ]").expect_err("must be rejected");
+    assert!(err.to_string().contains("retry 0"), "{err}");
+}
+
+#[test]
+fn a_node_without_on_fail_has_no_ladder() {
+    let spec = parse_spec(SAMPLE).unwrap();
+    assert!(spec.nodes.get("block").unwrap().on_fail.is_empty());
+}
+
+#[test]
+fn a_schema_path_outside_every_read_root_is_rejected() {
+    // Same rule and same reason as a fan-out manifest: the host reads it,
+    // and the host is not sandboxed.
+    let err = parse_spec(
+        r#"spec s = {
+  description = "d"; model = Stub "x"; data_policy = Any;
+  capabilities = [ Read "./schemas" ];
+  nodes = { a = { block = "a@1"; accept = [ Schema "./elsewhere/v.json" ]; }; };
+}"#,
+    )
+    .expect_err("a schema outside the read roots must be rejected");
+    assert!(err.to_string().contains("elsewhere/v.json"), "{err}");
 }

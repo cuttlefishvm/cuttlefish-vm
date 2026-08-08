@@ -63,6 +63,23 @@ impl std::fmt::Debug for Ledger {
     }
 }
 
+/// One thing a job gave up on after its recovery ladder was exhausted.
+///
+/// Carries enough for a session that wasn't there when it happened to act:
+/// which node, which item if any, and *why*. A list of job ids would only
+/// be a second hunt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Escalation {
+    /// The node that gave up.
+    pub node: String,
+    /// Which fan-out item, or `None` for a whole node.
+    pub item: Option<usize>,
+    /// The failure that exhausted the ladder.
+    pub reason: String,
+    /// When it was recorded.
+    pub at: String,
+}
+
 /// Why a ledger could not be opened.
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -333,8 +350,59 @@ impl Ledger {
                 } else {
                     None
                 },
-                if status == "failed" { error } else { None },
+                // Anything not `completed` is a failure of some kind, and
+                // carries its error. Matching on `failed` alone would drop
+                // `escalated` items out of `failures.jsonl` entirely — they
+                // would count as concluded, count toward `failed`, and then
+                // silently vanish from the projection.
+                if status == "completed" { None } else { error },
             ))
+        })?;
+        rows.collect()
+    }
+
+    /// Record that recovery was exhausted for `node_name`, giving up.
+    ///
+    /// Stored as an ordinary concluded failure with a distinct status rather
+    /// than in a table of its own — the composite key already carries node
+    /// and item, and an escalation *is* a kind of concluded failure. Pass
+    /// `None` for a whole node, `Some(i)` for one fan-out item.
+    pub fn write_escalated(
+        &self,
+        node_name: &str,
+        item_index: Option<usize>,
+        reason: &str,
+    ) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO checkpoints
+               (node_name, item_index, status, output_json, error_text, completed_at)
+             VALUES (?1, ?2, 'escalated', NULL, ?3, ?4)",
+            rusqlite::params![
+                node_name,
+                item_index.map(|i| i as i64).unwrap_or(-1),
+                reason,
+                now_marker()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Everything this job gave up on, for `cuttlefish escalations`.
+    pub fn escalations(&self) -> rusqlite::Result<Vec<Escalation>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT node_name, item_index, error_text, completed_at FROM checkpoints
+             WHERE status = 'escalated' ORDER BY node_name, item_index",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let index: i64 = r.get(1)?;
+            Ok(Escalation {
+                node: r.get(0)?,
+                // -1 is the whole-node sentinel, not a real item.
+                item: (index >= 0).then_some(index as usize),
+                reason: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                at: r.get(3)?,
+            })
         })?;
         rows.collect()
     }

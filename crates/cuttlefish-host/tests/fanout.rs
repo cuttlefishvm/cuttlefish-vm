@@ -63,6 +63,8 @@ fn map_node(script: &str, manifest: &Path) -> CheckedNode {
         script: Some(script.to_string()),
         over: Some(manifest.to_path_buf()),
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 
@@ -97,6 +99,8 @@ fn reduce_node() -> CheckedNode {
         script: Some(COUNT_LINES.to_string()),
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 
@@ -121,6 +125,7 @@ async fn run_on(nodes: Vec<CheckedNode>, dir: &Path, ledger: &Ledger) -> cuttlef
         exclusive_to: HashMap::new(),
         input: serde_json::Value::Null,
         caps: Capabilities::new(vec![dir.to_path_buf()]),
+        alternates: Default::default(),
     };
     run_job(
         Arc::new(Engine::default()),
@@ -360,14 +365,15 @@ async fn per_item_validation_uses_the_blocks_own_output_not_the_collection_type(
         );
     }
 
-    let mut analyze = Node {
+    let analyze = Node {
         block: std::path::PathBuf::new(),
         input: None,
         repeat_until: None,
         max_iterations: None,
-        over: Some(manifest.clone()),
+        over: Some(manifest),
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     };
-    analyze.over = Some(manifest);
     let graph = NodeGraph {
         nodes: vec![
             ("analyze".to_string(), analyze),
@@ -381,6 +387,8 @@ async fn per_item_validation_uses_the_blocks_own_output_not_the_collection_type(
                     repeat_until: None,
                     max_iterations: None,
                     over: None,
+                    accept: Vec::new(),
+                    on_fail: Vec::new(),
                 },
             ),
         ],

@@ -173,6 +173,25 @@ cuttlefish jobs --endpoint <endpoint>
 cuttlefish cancel --endpoint <endpoint> <job_id>
 ```
 
+```bash
+cuttlefish escalations --endpoint <endpoint>
+# everything every job gave up on, with the reason it gave up
+```
+
+**Draining escalations is the point of them.** A node whose spec declares
+`on_fail = [ ..., escalate ]` stops and records *why* rather than failing
+silently, precisely because the session that submitted the work is
+usually gone by then. So this is the first thing to run when picking up
+someone else's campaign, or your own from yesterday — it reports across
+**every** job on the machine, not just this daemon's, and prints the
+failing check's own text so you can tell "the model can't do this" from
+"the schema is wrong". Nothing retries automatically: what to do with an
+escalation is a planning decision, which is yours.
+
+A job with escalations still finished. Escalated fan-out items are
+counted as failures and appear in that node's `failures.jsonl` like any
+other — the escalation is an index into them, not a separate outcome.
+
 `cuttlefish run` (unchanged, pre-existing) still blocks until one specific
 job finishes — use it only when actually waiting for a single result is
 the right thing to do, not as the default way to kick off work.

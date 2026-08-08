@@ -37,8 +37,12 @@ pub struct AppState {
     /// the invariant this depends on (never share one cache across two
     /// different `Engine`s).
     pub module_cache: Arc<cuttlefish_host::module_cache::ModuleCache>,
-    /// Serves inference.
+    /// Serves inference for the spec's own model.
     pub backend: Arc<dyn InferBackend>,
+    /// Backends for models a node reaches only by explicit instruction — a
+    /// `reroute` rung or a `Judge` naming its own model. Resolved at
+    /// startup; see `cuttlefish_host::runner::Alternates`.
+    pub alternates: Arc<cuttlefish_host::runner::Alternates>,
     /// Job bookkeeping.
     pub jobs: JobStore,
     /// The one spec this daemon serves. A registry of many arrives later.
@@ -89,6 +93,7 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/jobs/{id}/events", get(job_events))
         .route("/jobs/{id}/resume", post(resume_job))
+        .route("/escalations", get(list_escalations))
         .route("/shutdown", post(shutdown))
         .with_state(state)
 }
@@ -107,6 +112,77 @@ async fn list_specs(State(st): State<AppState>) -> impl IntoResponse {
             cuttlefish_core::spec::DataPolicy::Any => "any",
         },
     }]))
+}
+
+/// Everything every job on this machine gave up on.
+///
+/// Across *all* jobs, not just ones this daemon process ran. The whole reason
+/// a node escalates is that the session which asked for the work is gone —
+/// so scoping this to the current process, or to one job id the caller would
+/// have to already know, would answer a question nobody has. The jobs root is
+/// walked the same way `scan_for_interrupted_jobs` walks it at startup.
+///
+/// A single unreadable ledger is skipped with a warning rather than failing
+/// the request: one job corrupted by a hard crash must not hide every other
+/// job's escalations.
+async fn list_escalations() -> impl IntoResponse {
+    let Some(jobs_root) = cuttlefish_host::ledger::jobs_root() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "could not determine home directory; set CUTTLEFISH_HOME"
+            })),
+        )
+            .into_response();
+    };
+
+    let mut all = Vec::new();
+    if jobs_root.exists() {
+        let entries = match std::fs::read_dir(&jobs_root) {
+            Ok(e) => e,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("reading {}: {e}", jobs_root.display())
+                    })),
+                )
+                    .into_response()
+            }
+        };
+        for entry in entries.flatten() {
+            let ledger_path = entry.path().join("ledger.sqlite");
+            if !ledger_path.exists() {
+                continue;
+            }
+            let job_id = entry.file_name().to_string_lossy().into_owned();
+            // The fingerprint is only consulted when creating a ledger, and
+            // every ledger here already exists — its presence is what
+            // selected the directory.
+            let ledger = match cuttlefish_host::ledger::Ledger::open(&ledger_path, "") {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("warning: skipping unreadable ledger for job `{job_id}`: {e}");
+                    continue;
+                }
+            };
+            match ledger.escalations() {
+                Ok(rows) => all.extend(rows.into_iter().map(|e| {
+                    serde_json::json!({
+                        "job": job_id,
+                        "node": e.node,
+                        "item": e.item,
+                        "reason": e.reason,
+                        "at": e.at,
+                    })
+                })),
+                Err(e) => {
+                    eprintln!("warning: reading escalations for job `{job_id}`: {e}");
+                }
+            }
+        }
+    }
+    Json(all).into_response()
 }
 
 async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl IntoResponse {
@@ -178,6 +254,7 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         exclusive_to: (*st.exclusive_to).clone(),
         input: req.input,
         caps: Capabilities::new(fanout_aware_roots(&st, &job_dir)),
+        alternates: (*st.alternates).clone(),
     };
 
     // Every event goes through `publish`, so it lands in the replay log as well
@@ -368,6 +445,7 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
         exclusive_to: (*st.exclusive_to).clone(),
         input,
         caps: Capabilities::new(fanout_aware_roots(&st, &job_dir)),
+        alternates: (*st.alternates).clone(),
     };
 
     // Atomic guard against a concurrent second /resume call racing to this

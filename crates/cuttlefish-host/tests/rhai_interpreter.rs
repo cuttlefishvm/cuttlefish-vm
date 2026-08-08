@@ -66,6 +66,8 @@ fn script_node(script_field_value: &str) -> CheckedNode {
         script: Some(script_field_value.to_string()),
         over: None,
         item_output: None,
+        accept: Vec::new(),
+        on_fail: Vec::new(),
     }
 }
 
@@ -82,6 +84,7 @@ async fn a_rhai_scripted_block_computes_pure_output_through_the_real_host() {
         // whoever submits the job.
         input: serde_json::json!({ "n": 21 }),
         caps: Capabilities::new(Vec::new()),
+        alternates: Default::default(),
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -113,6 +116,7 @@ async fn a_rhai_script_can_round_trip_an_infer_call_through_the_real_host() {
         exclusive_to: HashMap::new(),
         input: serde_json::json!({ "text": "some document text" }),
         caps: Capabilities::new(Vec::new()),
+        alternates: Default::default(),
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -144,6 +148,7 @@ async fn a_rhai_script_can_parse_json_out_of_a_real_infer_reply() {
         exclusive_to: HashMap::new(),
         input: serde_json::Value::Null,
         caps: Capabilities::new(Vec::new()),
+        alternates: Default::default(),
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -192,6 +197,7 @@ async fn a_rhai_script_can_open_and_slice_a_real_file() {
         exclusive_to: HashMap::new(),
         input: serde_json::json!({ "path": doc.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
     };
 
     let ledger =
@@ -233,6 +239,7 @@ async fn a_rhai_script_s_open_is_denied_outside_its_granted_capabilities() {
         input: serde_json::json!({ "path": doc.to_str().unwrap() }),
         // Granted a real, but unrelated, root -- not `outside`.
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
     };
 
     let ledger =
@@ -282,6 +289,7 @@ async fn a_rhai_script_extracts_a_section_by_regex_from_a_real_file() {
         exclusive_to: HashMap::new(),
         input: serde_json::json!({ "path": doc.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
     };
 
     let ledger =
@@ -347,6 +355,8 @@ async fn a_script_node_resolved_from_the_catalog_and_run_through_run_job_gets_it
                 repeat_until: None,
                 max_iterations: None,
                 over: None,
+                accept: Vec::new(),
+                on_fail: Vec::new(),
             },
         )],
     };
@@ -363,6 +373,7 @@ async fn a_script_node_resolved_from_the_catalog_and_run_through_run_job_gets_it
         // script field.
         input: serde_json::json!({ "n": 14 }),
         caps: Capabilities::new(Vec::new()),
+        alternates: Default::default(),
     };
 
     let dir = tempfile::tempdir().unwrap();

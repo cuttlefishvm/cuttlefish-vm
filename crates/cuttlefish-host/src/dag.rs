@@ -57,6 +57,13 @@ pub struct CheckedNode {
     /// into one field means every item gets checked against the collection
     /// record and fails.
     pub item_output: Option<cuttlefish_abi::Ty>,
+    /// What "done" means for this node beyond its type — see
+    /// [`crate::accept`]. Empty means the type signature is the whole
+    /// contract, which is the pre-existing behaviour.
+    pub accept: Vec<cuttlefish_core::graph::AcceptCheck>,
+    /// The recovery ladder climbed when an attempt is not accepted. Empty
+    /// means one attempt and then failure.
+    pub on_fail: Vec<cuttlefish_core::graph::Rung>,
 }
 
 /// What a fan-out node presents to the nodes downstream of it.
@@ -246,6 +253,8 @@ pub fn check_graph(
             script: input_resolved.script.clone(),
             over: node.over.clone(),
             item_output: item_outputs.get(name).cloned(),
+            accept: node.accept.clone(),
+            on_fail: node.on_fail.clone(),
         });
     }
 
@@ -279,8 +288,51 @@ pub fn graph_fingerprint(nodes: &[CheckedNode]) -> String {
                 .map(|p| p.as_os_str().as_encoded_bytes())
                 .unwrap_or(b""),
         );
+        // Acceptance and recovery change what a *completed* checkpoint means.
+        // A node whose `accept` list tightened has already-recorded rows that
+        // were never held to the new contract, and one whose `on_fail` gained
+        // an `escalate` has rows recorded under a policy that would now have
+        // given up instead — so resuming across either edit would mix
+        // conclusions reached under two different rules.
+        hash_length_prefixed(&mut hasher, policy_repr(node).as_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// A node's `accept`/`on_fail` as one stable string, for fingerprinting.
+///
+/// Written out by hand rather than via `Debug`: `Debug` output is explicitly
+/// not a stable format, so a derive tweak in `cuttlefish-core` would silently
+/// invalidate every checkpoint on disk.
+fn policy_repr(node: &CheckedNode) -> String {
+    use cuttlefish_core::graph::{AcceptCheck, Rung};
+    let mut out = String::new();
+    for check in &node.accept {
+        match check {
+            AcceptCheck::Schema(path) => {
+                out.push_str("schema:");
+                out.push_str(&path.to_string_lossy());
+            }
+            AcceptCheck::Judge { model, prompt } => {
+                out.push_str("judge:");
+                if let Some(m) = model {
+                    out.push_str(&m.to_string());
+                }
+                out.push(':');
+                out.push_str(prompt);
+            }
+        }
+        out.push('\n');
+    }
+    for rung in &node.on_fail {
+        match rung {
+            Rung::Retry(n) => out.push_str(&format!("retry:{n}")),
+            Rung::Reroute(m) => out.push_str(&format!("reroute:{m}")),
+            Rung::Escalate => out.push_str("escalate"),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Feed `bytes` into `hasher` prefixed with its own length (as a fixed

@@ -42,6 +42,57 @@ pub enum JobEvent {
     Progress(serde_json::Value),
 }
 
+/// Backends for models *other than* the job's own, keyed by the model that
+/// names them.
+///
+/// Named `alternates` rather than `backends` on purpose: `run_job` already
+/// takes the job's own backend, and a field called `backends` sitting beside
+/// a parameter called `backend` is a trap. Everything here is something the
+/// job reaches only by explicit instruction — an `on_fail = [ reroute ... ]`
+/// rung, or a `Judge` that names its own model.
+///
+/// Resolved once at daemon startup, so a model this build cannot serve fails
+/// as the daemon comes up rather than three hours into a campaign, at the
+/// exact moment something has already gone wrong.
+pub type Alternates =
+    std::collections::HashMap<cuttlefish_core::spec::ModelRef, Arc<dyn InferBackend>>;
+
+/// Every model a spec can reach *besides* its own — the `reroute` targets
+/// and the model-bearing `Judge`s, deduplicated.
+///
+/// Exists so the daemon can resolve them all at startup. Collecting them
+/// here rather than in `cuttlefishd` keeps the knowledge of which node
+/// fields name a model next to the type that consumes them, so adding a
+/// third such field later is one edit rather than two.
+pub fn alternate_models_of(
+    spec: &cuttlefish_core::spec::Spec,
+) -> Vec<cuttlefish_core::spec::ModelRef> {
+    use cuttlefish_core::graph::{AcceptCheck, Rung};
+    let mut seen: Vec<cuttlefish_core::spec::ModelRef> = Vec::new();
+    let mut push = |model: cuttlefish_core::spec::ModelRef| {
+        // The job's own model is not an alternate; it already has a backend.
+        if model != spec.model && !seen.contains(&model) {
+            seen.push(model);
+        }
+    };
+    for (_, node) in &spec.nodes.nodes {
+        for rung in &node.on_fail {
+            if let Rung::Reroute(model) = rung {
+                push(model.clone());
+            }
+        }
+        for check in &node.accept {
+            if let AcceptCheck::Judge {
+                model: Some(model), ..
+            } = check
+            {
+                push(model.clone());
+            }
+        }
+    }
+    seen
+}
+
 /// Everything needed to run one job.
 pub struct JobSpec {
     /// The checked graph, in topological order — safe to execute
@@ -55,6 +106,10 @@ pub struct JobSpec {
     pub input: serde_json::Value,
     /// What this job is permitted to reach.
     pub caps: Capabilities,
+    /// Backends for models beyond the job's own — see [`Alternates`].
+    /// Empty for a spec with no `reroute` rung and no model-bearing `Judge`,
+    /// which is every spec that existed before acceptance contracts.
+    pub alternates: Alternates,
 }
 
 /// Pointer width of a guest module, read from the module rather than assumed.
@@ -348,6 +403,26 @@ pub async fn run_job(
             );
         }
 
+        // Compile every node's `accept` list up front, indexed by node
+        // position. A malformed schema is a property of the spec, so it
+        // should stop the job at the start rather than surface as a bizarre
+        // acceptance failure once half a campaign has already run.
+        let checks: Vec<crate::accept::CompiledChecks> = match job
+            .nodes
+            .iter()
+            .map(|n| {
+                crate::accept::CompiledChecks::compile(&n.accept)
+                    .map_err(|e| format!("node `{}`: {e}", n.name))
+            })
+            .collect()
+        {
+            Ok(c) => c,
+            Err(message) => {
+                usage.duration_ms = started.elapsed().as_millis() as u64;
+                break 'run fail(error_codes::SCHEMA_VALIDATION_FAILED, message, usage);
+            }
+        };
+
         let total = job.nodes.len();
         let mut outputs: std::collections::HashMap<String, serde_json::Value> =
             std::collections::HashMap::new();
@@ -472,6 +547,8 @@ pub async fn run_job(
                     &engine,
                     cache,
                     &backend,
+                    &job.alternates,
+                    &checks[index],
                     node,
                     &job.caps,
                     &mut handles,
@@ -503,60 +580,11 @@ pub async fn run_job(
                 continue;
             }
 
-            // Bounded loop: repeat_until re-invokes this node on its own
-            // prior output, up to max_iterations. A node without
-            // repeat_until runs exactly once (the loop's `None` arm breaks
-            // immediately).
-            let mut current_input = node_input;
-            let mut iterations: u32 = 0;
-            let result = loop {
-                let r = match run_stage(
-                    &engine,
-                    cache,
-                    &backend,
-                    &node.module_bytes,
-                    current_input.clone(),
-                    node.script.as_deref(),
-                    &job.caps,
-                    &mut handles,
-                    &events,
-                    &cancel,
-                    &mut usage,
-                    started,
-                    index,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(envelope) => break 'run envelope,
-                };
-                match &node.repeat_until {
-                    None => break r,
-                    Some(field) => {
-                        iterations += 1;
-                        let done = r.get(field).and_then(|v| v.as_str()) == Some("done");
-                        if done {
-                            break r;
-                        }
-                        let max = node
-                            .max_iterations
-                            .expect("repeat_until requires max_iterations, enforced at parse time");
-                        if iterations >= max {
-                            usage.duration_ms = started.elapsed().as_millis() as u64;
-                            break 'run fail(
-                                error_codes::SCHEMA_VALIDATION_FAILED,
-                                format!(
-                                    "node `{}` did not reach repeat_until=\"done\" within max_iterations={max}",
-                                    node.name
-                                ),
-                                usage,
-                            );
-                        }
-                        current_input = r;
-                    }
-                }
-            };
-
+            // Run the node, holding its output to the declared type and to
+            // every `accept` check, and climbing `on_fail` if it isn't
+            // accepted. The bounded `repeat_until` loop lives inside one
+            // attempt — see `Ladder`.
+            //
             // Nothing checked a block's *actual* output against what it
             // declared until this existed: a Script or Rust block could
             // claim `{summary: text}` and return `{text: "..."}` and the
@@ -566,18 +594,62 @@ pub async fn run_job(
             // its own doc comment) so this only ever catches genuine shape
             // mismatches, not false positives on types this protocol has no
             // fixed JSON encoding for.
-            if !node.signature.output.matches_value(&result) {
-                usage.duration_ms = started.elapsed().as_millis() as u64;
-                break 'run fail(
-                    error_codes::SCHEMA_VALIDATION_FAILED,
-                    format!(
-                        "node `{}` declared its output as `{}` but produced {result}, which \
-                         doesn't match",
-                        node.name, node.signature.output
-                    ),
-                    usage,
-                );
-            }
+            let ladder = Ladder {
+                engine: &engine,
+                cache,
+                default_backend: &backend,
+                alternates: &job.alternates,
+                checks: &checks[index],
+                expected: &node.signature.output,
+                on_fail: &node.on_fail,
+                repeat_until: node.repeat_until.as_deref(),
+                max_iterations: node.max_iterations,
+                caps: &job.caps,
+                events: &events,
+                cancel: &cancel,
+                started,
+                index,
+            };
+            let result = match ladder
+                .run(
+                    &node.module_bytes,
+                    node.script.as_deref(),
+                    node_input,
+                    &mut handles,
+                    &mut usage,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(LadderError::Fatal(envelope)) => break 'run *envelope,
+                Err(LadderError::Exhausted {
+                    reason,
+                    escalated,
+                    envelope,
+                }) => {
+                    // Record the give-up *before* failing the job. An
+                    // escalation that only exists in the returned envelope is
+                    // gone the moment the caller stops looking, which defeats
+                    // the point: the whole reason to escalate is that nobody
+                    // is watching right now.
+                    if escalated {
+                        if let Err(e) = ledger.write_escalated(&node.name, None, &reason) {
+                            eprintln!("recording escalation for node `{}`: {e}", node.name);
+                        }
+                    }
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    // The block's own envelope when it has one, so a
+                    // `wasm_trap` still reads as a `wasm_trap`.
+                    break 'run match envelope {
+                        Some(e) => *e,
+                        None => fail(
+                            error_codes::SCHEMA_VALIDATION_FAILED,
+                            format!("node `{}`: {reason}", node.name),
+                            usage,
+                        ),
+                    };
+                }
+            };
 
             // A branching node: read its `route` field and record the
             // decision for later nodes' branch-skip check (top of this
@@ -743,6 +815,8 @@ async fn run_fanout_node(
     engine: &Engine,
     cache: &crate::module_cache::ModuleCache,
     backend: &Arc<dyn InferBackend>,
+    alternates: &Alternates,
+    checks: &crate::accept::CompiledChecks,
     node: &crate::dag::CheckedNode,
     caps: &Capabilities,
     handles: &mut Handles,
@@ -936,25 +1010,37 @@ async fn run_fanout_node(
             continue;
         }
 
-        let outcome = run_stage(
+        // The same ladder the ordinary-node path uses, per item. `expected`
+        // is the *per-item* output, and `repeat_until` is `None` because
+        // combining it with `over` is forbidden at parse time.
+        let ladder = Ladder {
             engine,
             cache,
-            backend,
-            &node.module_bytes,
-            item_input.clone(),
-            node.script.as_deref(),
+            default_backend: backend,
+            alternates,
+            checks,
+            expected: &item_output,
+            on_fail: &node.on_fail,
+            repeat_until: None,
+            max_iterations: None,
             caps,
-            handles,
             events,
             cancel,
-            usage,
             started,
             index,
-        )
-        .await;
+        };
 
-        match outcome {
-            Ok(value) if item_output.matches_value(&value) => {
+        match ladder
+            .run(
+                &node.module_bytes,
+                node.script.as_deref(),
+                item_input.clone(),
+                handles,
+                usage,
+            )
+            .await
+        {
+            Ok(value) => {
                 succeeded += 1;
                 if let Err(e) = ledger.write_item_completed(node_name, item_index, &value) {
                     return Err(bail(
@@ -963,31 +1049,28 @@ async fn run_fanout_node(
                     ));
                 }
             }
-            Ok(value) => {
-                failed += 1;
-                let message = format!(
-                    "item {item_index} produced {value}, which doesn't match the block's \
-                     declared output `{item_output}`"
-                );
-                if let Err(e) = ledger.write_item_failed(node_name, item_index, &message) {
-                    return Err(bail(
-                        format!("node `{node_name}`: recording item {item_index} failure: {e}"),
-                        usage,
-                    ));
-                }
-            }
             // A cancelled job must not be recorded as a per-item failure —
             // nothing about the item was wrong, and doing so would make the
             // cancellation permanent across a later resume.
-            Err(envelope) if envelope.status == JobStatus::Cancelled => return Err(envelope),
-            Err(envelope) => {
+            Err(LadderError::Fatal(envelope)) => return Err(*envelope),
+            // A fan-out item's envelope is deliberately dropped: an item
+            // failure is recorded as text and the *job* keeps going, so
+            // there is nothing here for an envelope to become.
+            Err(LadderError::Exhausted {
+                reason, escalated, ..
+            }) => {
                 failed += 1;
-                let message = envelope
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{}: {}", e.code, e.message))
-                    .unwrap_or_else(|| "item failed with no error detail".to_string());
-                if let Err(e) = ledger.write_item_failed(node_name, item_index, &message) {
+                let message = format!("item {item_index} {reason}");
+                // An escalated item is still a concluded failure — it counts
+                // toward `failed` and lands in `failures.jsonl` like any
+                // other. The escalation row is *additional*: it is what makes
+                // this one findable later without re-reading every job.
+                let recorded = if escalated {
+                    ledger.write_escalated(node_name, Some(item_index), &message)
+                } else {
+                    ledger.write_item_failed(node_name, item_index, &message)
+                };
+                if let Err(e) = recorded {
                     return Err(bail(
                         format!("node `{node_name}`: recording item {item_index} failure: {e}"),
                         usage,
@@ -1072,6 +1155,284 @@ async fn run_fanout_node(
         "succeeded": succeeded,
         "failed": failed,
     }))
+}
+
+/// Why an attempt ladder ran out of rungs.
+enum LadderError {
+    /// Every rung was climbed and the work still wasn't accepted.
+    Exhausted {
+        /// The last thing that went wrong, verbatim — this becomes the text
+        /// a human reads in `cuttlefish escalations`, so it has to name the
+        /// actual failing check rather than "acceptance failed".
+        reason: String,
+        /// Whether the ladder ended on an explicit `escalate` rung, as
+        /// opposed to simply running out. Only the former gets an escalation
+        /// row: the author asked for someone to be told.
+        escalated: bool,
+        /// The last attempt's own envelope, when the last thing that went
+        /// wrong was the block failing rather than a check rejecting it.
+        ///
+        /// Carried so the error *code* survives the ladder. Without it every
+        /// `wasm_trap` and `capability_denied` would reach the caller
+        /// flattened into `schema_validation_failed`, which is both wrong and
+        /// a silent downgrade for the many nodes that declare no `on_fail` at
+        /// all and should behave exactly as they did before ladders existed.
+        envelope: Option<Box<Envelope>>,
+    },
+    /// The job as a whole must stop — cancellation, or a host-level error
+    /// that has nothing to do with this node's output being wrong. Never
+    /// retried, because retrying a cancellation is how a cancelled job comes
+    /// back to life.
+    Fatal(Box<Envelope>),
+}
+
+/// Everything the ladder needs that doesn't change between attempts.
+///
+/// A struct rather than a dozen more parameters: `run_stage` already carries
+/// thirteen, and the ladder wraps it from two call sites (one node, one
+/// fan-out item) that must behave identically. Bundling the invariant part is
+/// what makes "identically" checkable by eye.
+struct Ladder<'a> {
+    engine: &'a Engine,
+    cache: &'a crate::module_cache::ModuleCache,
+    /// The job's own backend: where the first attempt goes, and — always —
+    /// where judges are asked. A judge run on the rerouted model would be
+    /// grading its own work.
+    default_backend: &'a Arc<dyn InferBackend>,
+    alternates: &'a Alternates,
+    checks: &'a crate::accept::CompiledChecks,
+    /// What this attempt's output must structurally be. For a fan-out item
+    /// this is the block's per-item output, *not* the collection the node
+    /// presents downstream.
+    expected: &'a cuttlefish_abi::Ty,
+    on_fail: &'a [cuttlefish_core::graph::Rung],
+    /// The node's bounded loop, if it has one. Held here, rather than around
+    /// the ladder, because one *attempt* has to mean one whole run of the
+    /// node: retrying a node that reached `max_iterations` without finishing
+    /// means running its loop again from the top, not resuming it.
+    repeat_until: Option<&'a str>,
+    /// Required alongside `repeat_until`, enforced at parse time.
+    max_iterations: Option<u32>,
+    caps: &'a Capabilities,
+    events: &'a mpsc::Sender<JobEvent>,
+    cancel: &'a CancellationToken,
+    started: Instant,
+    index: usize,
+}
+
+impl Ladder<'_> {
+    /// Run the work, climbing `on_fail` until something is accepted or the
+    /// ladder runs out.
+    ///
+    /// Nothing here writes to the ledger. That is the whole point: a value
+    /// that is about to be retried is not a conclusion, and recording it
+    /// would make a transient rejection permanent across a resume.
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        &self,
+        module_bytes: &[u8],
+        script: Option<&str>,
+        input: serde_json::Value,
+        handles: &mut Handles,
+        usage: &mut Usage,
+    ) -> Result<serde_json::Value, LadderError> {
+        use cuttlefish_core::graph::Rung;
+
+        let mut backend = self.default_backend.clone();
+        let mut rung = 0usize;
+        let mut retries_left = 0u32;
+
+        'ladder: loop {
+            let (reason, envelope) = match self
+                .attempt(
+                    module_bytes,
+                    script,
+                    input.clone(),
+                    &backend,
+                    handles,
+                    usage,
+                )
+                .await
+            {
+                Ok(value) => return Ok(value),
+                Err(LadderError::Fatal(e)) => return Err(LadderError::Fatal(e)),
+                Err(LadderError::Exhausted {
+                    reason, envelope, ..
+                }) => (reason, envelope),
+            };
+
+            // Decide the next move. This inner loop only ever advances
+            // `rung`, so it cannot spin: a `Retry` sets a budget and falls
+            // straight back to the attempt, and every other arm either
+            // returns or re-attempts.
+            loop {
+                if retries_left > 0 {
+                    retries_left -= 1;
+                    continue 'ladder;
+                }
+                match self.on_fail.get(rung) {
+                    None => {
+                        return Err(LadderError::Exhausted {
+                            reason,
+                            escalated: false,
+                            envelope,
+                        })
+                    }
+                    Some(Rung::Retry(n)) => {
+                        rung += 1;
+                        retries_left = *n;
+                    }
+                    Some(Rung::Reroute(model)) => {
+                        rung += 1;
+                        match self.alternates.get(model) {
+                            Some(b) => {
+                                backend = b.clone();
+                                continue 'ladder;
+                            }
+                            // Startup resolution should have caught this, so
+                            // reaching here is a bug — but failing the node
+                            // beats taking the daemon down mid-campaign, and
+                            // the reason says exactly what happened.
+                            None => {
+                                return Err(LadderError::Exhausted {
+                                    reason: format!(
+                                        "reroute names model `{model}`, which was not resolved \
+                                         at startup (after: {reason})"
+                                    ),
+                                    escalated: false,
+                                    // Not the block's fault — this is an
+                                    // authoring/resolution error, so it keeps
+                                    // its own code rather than the last
+                                    // attempt's.
+                                    envelope: None,
+                                });
+                            }
+                        }
+                    }
+                    Some(Rung::Escalate) => {
+                        return Err(LadderError::Exhausted {
+                            reason,
+                            escalated: true,
+                            envelope,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// One attempt: run the block, then hold its output to the declared type
+    /// and to every `accept` check, in that order.
+    ///
+    /// Ordering is deliberate and cost-driven. The type check is free, a
+    /// schema costs a file's worth of validation, and a judge costs a whole
+    /// inference — so structurally broken output never pays for a judge, and
+    /// a judge is never asked to grade something it would grade incoherently.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt(
+        &self,
+        module_bytes: &[u8],
+        script: Option<&str>,
+        input: serde_json::Value,
+        backend: &Arc<dyn InferBackend>,
+        handles: &mut Handles,
+        usage: &mut Usage,
+    ) -> Result<serde_json::Value, LadderError> {
+        // A check said no. The block itself is fine, so there is no envelope
+        // to preserve.
+        let rejected = |reason: String| LadderError::Exhausted {
+            reason,
+            escalated: false,
+            envelope: None,
+        };
+
+        // The bounded loop. A node without `repeat_until` takes the `None`
+        // arm on its first pass and runs exactly once.
+        let mut current = input.clone();
+        let mut iterations: u32 = 0;
+        let value = loop {
+            let produced = match run_stage(
+                self.engine,
+                self.cache,
+                backend,
+                module_bytes,
+                current.clone(),
+                script,
+                self.caps,
+                handles,
+                self.events,
+                self.cancel,
+                usage,
+                self.started,
+                self.index,
+            )
+            .await
+            {
+                Ok(v) => v,
+                // A cancelled job stops the ladder dead; anything else is the
+                // block failing, which is exactly what a ladder exists to
+                // survive.
+                Err(envelope) if envelope.status == JobStatus::Cancelled => {
+                    return Err(LadderError::Fatal(Box::new(envelope)))
+                }
+                Err(envelope) => {
+                    let reason = envelope
+                        .error
+                        .as_ref()
+                        .map(|e| format!("{}: {}", e.code, e.message))
+                        .unwrap_or_else(|| "failed with no error detail".to_string());
+                    return Err(LadderError::Exhausted {
+                        reason,
+                        escalated: false,
+                        envelope: Some(Box::new(envelope)),
+                    });
+                }
+            };
+
+            let Some(field) = self.repeat_until else {
+                break produced;
+            };
+            iterations += 1;
+            if produced.get(field).and_then(|v| v.as_str()) == Some("done") {
+                break produced;
+            }
+            let max = self
+                .max_iterations
+                .expect("repeat_until requires max_iterations, enforced at parse time");
+            if iterations >= max {
+                return Err(rejected(format!(
+                    "did not reach repeat_until=\"done\" within max_iterations={max}"
+                )));
+            }
+            current = produced;
+        };
+
+        if !self.expected.matches_value(&value) {
+            return Err(rejected(format!(
+                "produced {value}, which doesn't match the declared output `{}`",
+                self.expected
+            )));
+        }
+
+        if let Err(why) = self.checks.check_schemas(&value) {
+            return Err(rejected(why));
+        }
+
+        match self
+            .checks
+            .run_judges(&input, &value, self.default_backend, self.alternates)
+            .await
+        {
+            crate::accept::JudgeVerdict::Accepted => Ok(value),
+            crate::accept::JudgeVerdict::Rejected(why) => Err(rejected(format!("judge: {why}"))),
+            // A broken grader is worth retrying — the next attempt may get a
+            // parseable verdict — but it is reported as what it is, so nobody
+            // reads the escalation as "the model said no".
+            crate::accept::JudgeVerdict::Unusable(why) => {
+                Err(rejected(format!("judge gave no usable verdict: {why}")))
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
