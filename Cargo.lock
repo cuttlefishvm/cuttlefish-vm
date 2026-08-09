@@ -518,7 +518,7 @@ name = "cf-block-rhai-interpreter"
 version = "0.0.7"
 dependencies = [
  "cuttlefish-sdk",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "regex",
  "rhai",
  "serde_json",
