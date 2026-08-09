@@ -47,6 +47,31 @@ fn run_submit_with(endpoint: &std::path::Path, spec: &str, input: &str) -> std::
         .expect("cuttlefish submit failed to run")
 }
 
+/// Run `cuttlefish specs --endpoint <endpoint>` and return its output.
+///
+/// The timing baseline: spawn a process, connect to the socket, make one
+/// request, print, exit. Everything `submit` and `run` do *except* the part
+/// under test, so subtracting it leaves only the waiting each one does.
+fn run_specs(endpoint: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cuttlefish"))
+        .args(["specs", "--endpoint"])
+        .arg(endpoint)
+        .output()
+        .expect("cuttlefish specs failed to run")
+}
+
+/// Run `cuttlefish run --endpoint <endpoint> --spec submit_test --input {}`.
+///
+/// The upper reference point: this one genuinely waits for the job.
+fn run_run(endpoint: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_cuttlefish"))
+        .args(["run", "--endpoint"])
+        .arg(endpoint)
+        .args(["--spec", "submit_test", "--input", "{}"])
+        .output()
+        .expect("cuttlefish run failed to run")
+}
+
 /// Run `cuttlefish jobs --endpoint <endpoint>` and return its output.
 fn run_jobs(endpoint: &std::path::Path) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_cuttlefish"))
@@ -149,18 +174,11 @@ async fn submit_returns_a_job_id_immediately_without_waiting_for_completion() {
     // `submit` accidentally polled to completion like `run` does) shows up as
     // a bounded timeout failure rather than an indefinitely hung test.
     let endpoint_for_cmd = endpoint.clone();
-    let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::task::spawn_blocking(move || run_submit(&endpoint_for_cmd)),
     )
     .await;
-    let elapsed = started.elapsed();
-
-    // Explicit at this test's natural end for clarity, though redundant with
-    // `DaemonGuard`'s `Drop` — which is what actually protects the panics
-    // above (e.g. the warm-up call's `.unwrap()`) from leaking the process.
-    daemon.kill();
 
     let output = result
         .expect(
@@ -184,27 +202,104 @@ async fn submit_returns_a_job_id_immediately_without_waiting_for_completion() {
         "stdout wasn't a UUID: {job_id}"
     );
 
-    // The real assertion: `submit` must return in a bounded, small amount of
-    // time, independent of how long the submitted job itself takes to run —
-    // it posts the job and prints, it never polls. `run`'s polling loop, by
-    // contrast, has to wait for the job to actually execute (real wasm
-    // module compilation and instantiation through wasmtime, plus at least
-    // one `POLL_INTERVAL` sleep), which is real, non-negligible work.
+    // The real assertion: `submit` must return without waiting for the job,
+    // whereas `run` has to wait for it to actually execute (wasm compilation
+    // and instantiation through wasmtime, plus at least one POLL_INTERVAL
+    // sleep). So the property is *relative* — submit does a fraction of
+    // run's waiting — and measuring it that way is what makes this test
+    // independent of how fast the machine is.
     //
-    // This bound was picked empirically against this repo's own timings, not
-    // guessed: on this machine, after the warm-up above, a *correct* `submit`
-    // consistently completed in 33-137ms across nine runs, while temporarily
-    // reintroducing the exact bug this test guards against (making `submit`
-    // poll `GET /jobs/{id}` to a terminal state before printing, i.e. copying
-    // `run`'s loop) consistently pushed it to 295-341ms across three runs — a
-    // clean, reproducible gap. 250ms sits in the middle of that gap with
-    // margin on both sides (113ms above the correct ceiling observed, 45ms
-    // below the buggy floor observed).
+    // This replaced an absolute `elapsed < 250ms` bound. That bound was
+    // carefully calibrated, but only against one machine: a correct submit
+    // measured 33-137ms there and the bug it guards measured 295-341ms. On a
+    // slower Windows CI runner a *correct* submit lands around 296ms, inside
+    // the old "buggy" band, and the test failed on `main` repeatedly for no
+    // reason but runner speed. Raising the constant would only move the
+    // goalpost and widen the window in which the real bug goes unnoticed.
+    //
+    // Every one of these timings includes the same fixed cost: spawning a
+    // process, connecting to the socket, printing. That cost is the entire
+    // reason the absolute bound was machine-dependent, and subtracting it is
+    // what makes the comparison portable — it is by far the dominant term on
+    // a slow runner, and it cancels.
+    //
+    // Verified the same way the old bound was, by reintroducing the bug
+    // (making `submit` poll `GET /jobs/{id}` to a terminal state before
+    // printing). Beyond the baseline, a correct `submit` spent 1.0-2.4ms
+    // against `run`'s ~217ms across three runs; the buggy one spent 214ms
+    // against `run`'s 216ms. That is a ~100x margin on one side and ~1x on
+    // the other, with the 2x threshold below sitting nowhere near either —
+    // which is the point of measuring a ratio instead of a stopwatch.
+    let baseline = fastest_of("specs", 3, || run_specs(&endpoint));
+    let run_elapsed = fastest_of("run", 2, || run_run(&endpoint));
+    // Re-measured rather than reusing `elapsed` above, so all three numbers
+    // come from the same conditions in the same window.
+    let submit_elapsed = fastest_of("submit", 3, || run_submit(&endpoint));
+
+    let excess = |t: std::time::Duration| t.saturating_sub(baseline);
+    let (submit_excess, run_excess) = (excess(submit_elapsed), excess(run_elapsed));
+
+    // If `run` isn't measurably slower than a bare round-trip, nothing here
+    // can tell a polling submit from a correct one, and passing would be
+    // meaningless. Fail loudly instead of reporting a green that proves
+    // nothing.
     assert!(
-        elapsed < std::time::Duration::from_millis(250),
-        "`cuttlefish submit` took {elapsed:?}, which is far more than a bare POST + print \
-         should ever take — it may have started waiting on the job's own completion again"
+        run_excess > std::time::Duration::from_millis(20),
+        "`run` spent only {run_excess:?} beyond a bare round-trip ({baseline:?}), so this test \
+         cannot distinguish a submit that polls from one that doesn't — the job is finishing \
+         too fast to measure, and this assertion needs rewriting rather than trusting"
     );
+    assert!(
+        submit_excess * 2 < run_excess,
+        "`cuttlefish submit` spent {submit_excess:?} beyond a bare round-trip ({baseline:?}) \
+         versus `run`'s {run_excess:?} — submit is doing a comparable amount of waiting, so it \
+         may have started polling for the job's completion again instead of returning \
+         immediately"
+    );
+
+    // Explicit at this test's natural end for clarity, though redundant with
+    // `DaemonGuard`'s `Drop` — which is what actually protects the panics
+    // above from leaking the process. It has to come after the measurements:
+    // every one of them needs a live daemon.
+    daemon.kill();
+}
+
+/// The fastest of `n` runs, as a noise filter.
+///
+/// The minimum, not the mean: a scheduler hiccup can only ever make a sample
+/// slower, so the fastest run is the closest to the work actually being
+/// measured. A genuinely-polling `submit` is slow on *every* sample, so this
+/// filters false failures without weakening what the test catches.
+fn fastest_of(
+    label: &str,
+    n: usize,
+    mut command: impl FnMut() -> std::process::Output,
+) -> std::time::Duration {
+    (0..n)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            let output = command();
+            let elapsed = started.elapsed();
+            // Deliberately not `status.success()`. `run` waits for the job
+            // and then reports its outcome in its exit code, and this
+            // suite's shared spec grants no capabilities, so the job fails
+            // — which is irrelevant here: the waiting still happened, and
+            // waiting is the whole quantity being measured. What must be
+            // ruled out is the command never reaching the daemon at all,
+            // which would produce a fast, meaningless sample. Every one of
+            // these prints to stdout on a real round-trip (a spec list, a
+            // job id, a result envelope) and nothing on a connection
+            // failure.
+            assert!(
+                !output.stdout.is_empty(),
+                "timing sample `{label}` never reached the daemon ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            elapsed
+        })
+        .min()
+        .expect("n must be non-zero")
 }
 
 #[tokio::test]
