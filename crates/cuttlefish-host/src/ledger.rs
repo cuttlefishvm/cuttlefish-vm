@@ -76,6 +76,13 @@ pub struct Escalation {
     pub item: Option<usize>,
     /// The failure that exhausted the ladder.
     pub reason: String,
+    /// What this item was working on, so it can be handed back as a
+    /// manifest line. `None` for a row written before inputs were recorded
+    /// — such an escalation cannot be drained, and callers must say so
+    /// rather than silently emitting one fewer line than they listed.
+    pub input: Option<serde_json::Value>,
+    /// When this was exported by a drain, or `None` while outstanding.
+    pub drained_at: Option<String>,
     /// When it was recorded.
     pub at: String,
 }
@@ -132,6 +139,28 @@ impl Ledger {
             return Err(LedgerError::StaleSchema);
         }
 
+        // `input_json` and `drained_at` are a different case entirely, and
+        // deliberately not a `StaleSchema` refusal: both are additive and
+        // nullable, and a ledger without them resumes perfectly — it simply
+        // can't be drained. Refusing would break resume for every job that
+        // predates draining in exchange for nothing. Old rows keep NULL,
+        // which is honest: an escalation recorded before inputs were kept
+        // genuinely has no input to hand back.
+        for (column, ddl) in [
+            (
+                "input_json",
+                "ALTER TABLE checkpoints ADD COLUMN input_json TEXT",
+            ),
+            (
+                "drained_at",
+                "ALTER TABLE checkpoints ADD COLUMN drained_at TEXT",
+            ),
+        ] {
+            if !existing_columns.is_empty() && !existing_columns.iter().any(|c| c == column) {
+                conn.execute(ddl, [])?;
+            }
+        }
+
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS checkpoints (
                 node_name    TEXT NOT NULL,
@@ -140,6 +169,8 @@ impl Ledger {
                 output_json  TEXT,
                 error_text   TEXT,
                 completed_at TEXT NOT NULL,
+                input_json   TEXT,
+                drained_at   TEXT,
                 PRIMARY KEY (node_name, item_index)
              );
              CREATE TABLE IF NOT EXISTS job_status (status TEXT NOT NULL, graph_fingerprint TEXT NOT NULL);
@@ -274,17 +305,27 @@ impl Ledger {
     /// here and never retried. That distinction is the entire basis of
     /// fan-out resume semantics: it separates "this chunk is bad" from "we
     /// were interrupted", without needing to ask which happened.
+    /// `input` is stored so the item can be handed back later — see
+    /// [`Ledger::escalations`]. Only failures carry it: a successful item's
+    /// input is still in the manifest and nobody needs it returned.
     pub fn write_item_failed(
         &self,
         node_name: &str,
         item_index: usize,
         error: &str,
+        input: Option<&serde_json::Value>,
     ) -> rusqlite::Result<()> {
         self.lock().execute(
             "INSERT OR REPLACE INTO checkpoints
-               (node_name, item_index, status, output_json, error_text, completed_at)
-             VALUES (?1, ?2, 'failed', NULL, ?3, ?4)",
-            rusqlite::params![node_name, item_index as i64, error, now_marker()],
+               (node_name, item_index, status, output_json, error_text, completed_at, input_json)
+             VALUES (?1, ?2, 'failed', NULL, ?3, ?4, ?5)",
+            rusqlite::params![
+                node_name,
+                item_index as i64,
+                error,
+                now_marker(),
+                input.map(|v| v.to_string())
+            ],
         )?;
         Ok(())
     }
@@ -372,39 +413,80 @@ impl Ledger {
         node_name: &str,
         item_index: Option<usize>,
         reason: &str,
+        input: Option<&serde_json::Value>,
     ) -> rusqlite::Result<()> {
         self.lock().execute(
             "INSERT OR REPLACE INTO checkpoints
-               (node_name, item_index, status, output_json, error_text, completed_at)
-             VALUES (?1, ?2, 'escalated', NULL, ?3, ?4)",
+               (node_name, item_index, status, output_json, error_text, completed_at, input_json)
+             VALUES (?1, ?2, 'escalated', NULL, ?3, ?4, ?5)",
             rusqlite::params![
                 node_name,
                 item_index.map(|i| i as i64).unwrap_or(-1),
                 reason,
-                now_marker()
+                now_marker(),
+                input.map(|v| v.to_string())
             ],
         )?;
         Ok(())
     }
 
-    /// Everything this job gave up on, for `cuttlefish escalations`.
+    /// What this job gave up on and nobody has handled yet — the queue.
     pub fn escalations(&self) -> rusqlite::Result<Vec<Escalation>> {
+        self.query_escalations(true)
+    }
+
+    /// Every escalation this job ever recorded, drained or not.
+    ///
+    /// Draining marks rather than deletes, so this is the historical
+    /// record. What went wrong stays worth knowing after it's been handled
+    /// — especially when the retry fails too.
+    pub fn all_escalations(&self) -> rusqlite::Result<Vec<Escalation>> {
+        self.query_escalations(false)
+    }
+
+    fn query_escalations(&self, outstanding_only: bool) -> rusqlite::Result<Vec<Escalation>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT node_name, item_index, error_text, completed_at FROM checkpoints
-             WHERE status = 'escalated' ORDER BY node_name, item_index",
+            "SELECT node_name, item_index, error_text, completed_at, input_json, drained_at
+             FROM checkpoints
+             WHERE status = 'escalated' AND (?1 = 0 OR drained_at IS NULL)
+             ORDER BY node_name, item_index",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([i64::from(outstanding_only)], |r| {
             let index: i64 = r.get(1)?;
+            let input: Option<String> = r.get(4)?;
             Ok(Escalation {
                 node: r.get(0)?,
                 // -1 is the whole-node sentinel, not a real item.
                 item: (index >= 0).then_some(index as usize),
                 reason: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 at: r.get(3)?,
+                // A row written before inputs were recorded parses as
+                // `None` here, which is exactly what it means: there is
+                // nothing to hand back. Callers must report that rather
+                // than quietly skipping the row.
+                input: input.and_then(|j| serde_json::from_str(&j).ok()),
+                drained_at: r.get(5)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// Stamp one escalation as exported.
+    ///
+    /// Called only after the manifest is safely on disk: a row claiming it
+    /// was handled when the write failed is worse than one exported twice.
+    pub fn mark_drained(&self, node_name: &str, item_index: Option<usize>) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE checkpoints SET drained_at = ?3
+             WHERE node_name = ?1 AND item_index = ?2 AND status = 'escalated'",
+            rusqlite::params![
+                node_name,
+                item_index.map(|i| i as i64).unwrap_or(-1),
+                now_marker()
+            ],
+        )?;
+        Ok(())
     }
 
     /// Record what `node_name` fanned out over, or verify it is unchanged.

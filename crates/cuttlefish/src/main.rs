@@ -141,6 +141,19 @@ mod cli {
             /// keep working; the name is simply wrong on Windows.
             #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
             endpoint: PathBuf,
+            /// Include escalations that were already drained. The default
+            /// listing is the outstanding queue; this is the history.
+            #[arg(long)]
+            all: bool,
+            /// Export the escalated items' inputs to this JSONL file and
+            /// mark them drained. Point a new spec's `over` at it.
+            ///
+            /// The escalated work is not re-run: its ladder was already
+            /// exhausted, so running it again unchanged would fail
+            /// identically. What to change — a stronger model, a looser
+            /// schema, a fixed block — is yours to decide.
+            #[arg(long, value_name = "PATH")]
+            manifest: Option<PathBuf>,
         },
         /// List what the daemon can run.
         Specs {
@@ -279,7 +292,14 @@ mod cli {
                 input,
             } => crate::daemon::submit(&endpoint, &spec, &input).await,
             Cmd::Jobs { endpoint } => crate::daemon::jobs(&endpoint).await,
-            Cmd::Escalations { endpoint } => crate::daemon::escalations(&endpoint).await,
+            Cmd::Escalations {
+                endpoint,
+                all,
+                manifest,
+            } => match manifest {
+                Some(path) => crate::daemon::drain(&endpoint, &path).await,
+                None => crate::daemon::escalations(&endpoint, all).await,
+            },
             Cmd::Resume { endpoint, job_id } => crate::daemon::resume(&endpoint, &job_id).await,
             Cmd::Cancel { endpoint, job_id } => crate::daemon::cancel(&endpoint, &job_id).await,
             Cmd::Shutdown { endpoint } => crate::daemon::shutdown(&endpoint).await,
@@ -776,9 +796,14 @@ mod daemon {
     /// Printed as a table rather than the raw JSON `jobs` prints, because
     /// this is read by a person deciding what to do next, and the one field
     /// that decides that — the reason — is the one a JSON dump buries.
-    pub async fn escalations(socket: &Path) -> anyhow::Result<()> {
+    pub async fn escalations(socket: &Path, all: bool) -> anyhow::Result<()> {
+        let url = if all {
+            "http://localhost/escalations?all=true"
+        } else {
+            "http://localhost/escalations"
+        };
         let body: serde_json::Value = client(socket)?
-            .get("http://localhost/escalations")
+            .get(url)
             .send()
             .await
             .with_context(|| format!("connecting to daemon at {}", socket.display()))?
@@ -793,16 +818,96 @@ mod daemon {
 
         for row in rows {
             let get = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("?");
-            // An item index is absent for a whole-node escalation, and
-            // printing `item ?` there would invent a distinction that isn't
-            // there.
-            let where_ = match row.get("item").and_then(|v| v.as_u64()) {
-                Some(i) => format!("{}[{i}]", get("node")),
-                None => get("node").to_string(),
-            };
-            println!("{}  {}  {}", get("job"), where_, get("at"));
+            let drained = row
+                .get("drained_at")
+                .and_then(|v| v.as_str())
+                .map(|at| format!("  drained {at}"))
+                .unwrap_or_default();
+            println!("{}  {}  {}{drained}", get("job"), where_of(row), get("at"));
             for line in get("reason").lines() {
                 println!("    {line}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `node[7]`, or bare `node` for a whole-node escalation — printing
+    /// `item ?` there would invent a distinction that isn't there.
+    fn where_of(row: &serde_json::Value) -> String {
+        let node = row.get("node").and_then(|v| v.as_str()).unwrap_or("?");
+        match row.get("item").and_then(|v| v.as_u64()) {
+            Some(i) => format!("{node}[{i}]"),
+            None => node.to_string(),
+        }
+    }
+
+    /// Export the escalated items' inputs as a manifest and mark them
+    /// drained.
+    ///
+    /// The file holds *only* the raw inputs, one JSON value per line —
+    /// byte-for-byte what `over` consumes. Provenance is deliberately not
+    /// embedded in the lines: adding a field would change each value's
+    /// shape and break the consuming block's declared input type, turning a
+    /// recovery tool into a source of type errors. It goes to stdout
+    /// instead, in the same order, from the same read.
+    pub async fn drain(socket: &Path, manifest: &Path) -> anyhow::Result<()> {
+        let body: serde_json::Value = client(socket)?
+            .post("http://localhost/escalations/drain")
+            .send()
+            .await
+            .with_context(|| format!("connecting to daemon at {}", socket.display()))?
+            .json()
+            .await?;
+
+        let empty = Vec::new();
+        let items = body["items"].as_array().unwrap_or(&empty);
+        let stranded = body["unrecoverable"].as_array().unwrap_or(&empty);
+
+        if items.is_empty() && stranded.is_empty() {
+            println!("no escalations to drain");
+            return Ok(());
+        }
+
+        // Write first, report second. The daemon has already marked these
+        // rows, so a failure here must be loud rather than leaving the
+        // caller thinking work was handed over.
+        let mut out = String::new();
+        for item in items {
+            out.push_str(&item["input"].to_string());
+            out.push('\n');
+        }
+        std::fs::write(manifest, out).with_context(|| format!("writing {}", manifest.display()))?;
+
+        println!("wrote {} item(s) to {}", items.len(), manifest.display());
+        for (line, item) in items.iter().enumerate() {
+            let job = item.get("job").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("  line {}: {job}  {}", line + 1, where_of(item));
+        }
+
+        // Never silently fewer lines than the queue listed.
+        if !stranded.is_empty() {
+            eprintln!(
+                "\n{} escalation(s) could not be drained — recorded before inputs were kept, \
+                 so there is nothing to hand back:",
+                stranded.len()
+            );
+            for item in stranded {
+                let job = item.get("job").and_then(|v| v.as_str()).unwrap_or("?");
+                eprintln!("  {job}  {}", where_of(item));
+            }
+            if items.is_empty() {
+                bail!("nothing was drainable");
+            }
+        }
+
+        if let Some(errors) = body["mark_errors"].as_array().filter(|e| !e.is_empty()) {
+            eprintln!(
+                "\nwarning: {} row(s) were exported but could not be marked drained, so they \
+                 may appear again on the next drain:",
+                errors.len()
+            );
+            for e in errors {
+                eprintln!("  {e}");
             }
         }
         Ok(())

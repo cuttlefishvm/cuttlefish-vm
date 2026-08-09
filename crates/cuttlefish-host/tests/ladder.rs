@@ -345,3 +345,69 @@ async fn an_accepted_first_attempt_climbs_no_rungs() {
     assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
     assert_eq!(calls.load(Ordering::SeqCst), 1, "success must not retry");
 }
+
+#[tokio::test]
+async fn an_escalation_carries_the_input_it_gave_up_on() {
+    // Without the input, an escalation names an item index against a
+    // manifest that may since have moved or been deleted -- not enough to
+    // act on. This is what makes the queue drainable.
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = ledger_in(dir.path());
+    let (backend, _) = counting("small");
+
+    let job_input = serde_json::json!({"doc": "q3.pdf", "chunk": 12});
+    let (tx, _rx) = mpsc::channel(1024);
+    let job = JobSpec {
+        nodes: vec![node(
+            vec![only_big_passes(dir.path())],
+            vec![Rung::Escalate],
+        )],
+        exclusive_to: HashMap::new(),
+        input: job_input.clone(),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Alternates::new(),
+    };
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        backend,
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+
+    let escalations = ledger.escalations().unwrap();
+    assert_eq!(escalations.len(), 1);
+    assert_eq!(
+        escalations[0].input.as_ref(),
+        Some(&job_input),
+        "the input must round-trip verbatim, not merely be non-null"
+    );
+    assert!(
+        escalations[0].drained_at.is_none(),
+        "a fresh escalation is outstanding, not drained"
+    );
+}
+
+#[tokio::test]
+async fn a_successful_run_records_no_input_to_drain() {
+    // Only failures pay the storage. A succeeded item's input is still in
+    // the manifest and nobody needs it handed back.
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = ledger_in(dir.path());
+    let (backend, _) = counting("big");
+    let envelope = run(
+        node(vec![only_big_passes(dir.path())], vec![Rung::Escalate]),
+        backend,
+        Alternates::new(),
+        &ledger,
+        dir.path(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    assert!(ledger.all_escalations().unwrap().is_empty());
+}

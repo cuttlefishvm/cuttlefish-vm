@@ -143,7 +143,7 @@ fn item_checkpoints_are_independent_of_each_other_and_of_the_node() {
     ledger
         .write_item_completed("map", 0, &serde_json::json!({"a": 1}))
         .unwrap();
-    ledger.write_item_failed("map", 1, "boom").unwrap();
+    ledger.write_item_failed("map", 1, "boom", None).unwrap();
 
     assert_eq!(
         ledger.get_item_completed("map", 0).unwrap(),
@@ -174,7 +174,9 @@ fn concluded_items_lists_successes_and_failures_in_index_order() {
     ledger
         .write_item_completed("map", 0, &serde_json::json!("a"))
         .unwrap();
-    ledger.write_item_failed("map", 1, "bad chunk").unwrap();
+    ledger
+        .write_item_failed("map", 1, "bad chunk", None)
+        .unwrap();
 
     let concluded = ledger.concluded_items("map").unwrap();
     assert_eq!(concluded.len(), 3);
@@ -231,4 +233,101 @@ fn a_changed_manifest_is_detected_on_resume() {
         .check_or_record_manifest("map", "digest-B", 500)
         .unwrap()
         .is_err());
+}
+
+#[test]
+fn a_failed_item_records_its_input_and_a_completed_one_does_not() {
+    // The input is what makes an escalation drainable. Only failures pay
+    // the storage: a successful item's input is recoverable from the
+    // manifest and nobody needs it back.
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+    let input = serde_json::json!({"chunk": "the quick brown fox", "doc": "q3.pdf"});
+
+    ledger
+        .write_item_completed("map", 0, &serde_json::json!({"ok": true}))
+        .unwrap();
+    ledger
+        .write_item_failed("map", 1, "boom", Some(&input))
+        .unwrap();
+    ledger
+        .write_escalated("map", Some(2), "judge: no numbers cited", Some(&input))
+        .unwrap();
+
+    let drainable = ledger.escalations().unwrap();
+    assert_eq!(drainable.len(), 1, "only the escalated item is drainable");
+    assert_eq!(
+        drainable[0].input.as_ref(),
+        Some(&input),
+        "the escalation must carry the input verbatim, or it can't be drained"
+    );
+
+    // A completed item stores nothing extra.
+    let all = ledger.concluded_items("map").unwrap();
+    assert_eq!(all.len(), 3);
+}
+
+#[test]
+fn draining_marks_rows_without_destroying_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+    let input = serde_json::json!({"n": 2});
+    ledger
+        .write_escalated("map", Some(0), "too small", Some(&input))
+        .unwrap();
+
+    assert_eq!(ledger.escalations().unwrap().len(), 1);
+    ledger.mark_drained("map", Some(0)).unwrap();
+
+    // The default queue means "outstanding work", so a drained row leaves
+    // it...
+    assert!(
+        ledger.escalations().unwrap().is_empty(),
+        "a drained escalation must drop out of the default listing"
+    );
+    // ...but the record of what went wrong survives.
+    let all = ledger.all_escalations().unwrap();
+    assert_eq!(all.len(), 1, "history must not be destroyed by draining");
+    assert!(all[0].drained_at.is_some(), "and must be marked drained");
+}
+
+#[test]
+fn a_ledger_without_the_drain_columns_gains_them_and_still_resumes() {
+    // Additive nullable columns don't warrant the StaleSchema refusal that
+    // a missing item_index gets: such a ledger resumes perfectly, it just
+    // can't be drained. Its old escalations come back with no input, which
+    // is honest -- see the CLI's unrecoverable reporting.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE checkpoints (
+                node_name    TEXT NOT NULL,
+                item_index   INTEGER NOT NULL DEFAULT -1,
+                status       TEXT NOT NULL,
+                output_json  TEXT,
+                error_text   TEXT,
+                completed_at TEXT NOT NULL,
+                PRIMARY KEY (node_name, item_index));
+             CREATE TABLE job_status (status TEXT NOT NULL, graph_fingerprint TEXT NOT NULL);
+             INSERT INTO job_status VALUES ('running', 'fp');
+             INSERT INTO checkpoints VALUES ('map', 3, 'escalated', NULL, 'gave up', 'then');",
+        )
+        .unwrap();
+    }
+
+    let ledger = Ledger::open(&path, "fp").expect("an additive migration must not refuse");
+    let rows = ledger.escalations().unwrap();
+    assert_eq!(rows.len(), 1, "the old escalation must still be readable");
+    assert_eq!(rows[0].reason, "gave up");
+    assert!(
+        rows[0].input.is_none(),
+        "it predates input recording, and must say so rather than invent one"
+    );
+    // Still a working ledger.
+    ledger
+        .write_item_completed("map", 4, &serde_json::json!({"ok": true}))
+        .unwrap();
+    assert!(ledger.item_concluded("map", 4).unwrap());
 }

@@ -614,7 +614,7 @@ pub async fn run_job(
                 .run(
                     &node.module_bytes,
                     node.script.as_deref(),
-                    node_input,
+                    node_input.clone(),
                     &mut handles,
                     &mut usage,
                 )
@@ -633,7 +633,12 @@ pub async fn run_job(
                     // the point: the whole reason to escalate is that nobody
                     // is watching right now.
                     if escalated {
-                        if let Err(e) = ledger.write_escalated(&node.name, None, &reason) {
+                        // With the input, so the escalation is drainable:
+                        // "here is exactly what this node was handed when it
+                        // gave up" is what reproducing it requires.
+                        if let Err(e) =
+                            ledger.write_escalated(&node.name, None, &reason, Some(&node_input))
+                        {
                             eprintln!("recording escalation for node `{}`: {e}", node.name);
                         }
                     }
@@ -1001,7 +1006,9 @@ async fn run_fanout_node(
                 "item {item_index} does not match the block's declared input `{}`",
                 node.signature.input
             );
-            if let Err(e) = ledger.write_item_failed(node_name, item_index, &message) {
+            if let Err(e) =
+                ledger.write_item_failed(node_name, item_index, &message, Some(item_input))
+            {
                 return Err(bail(
                     format!("node `{node_name}`: recording item {item_index} failure: {e}"),
                     usage,
@@ -1065,10 +1072,14 @@ async fn run_fanout_node(
                 // toward `failed` and lands in `failures.jsonl` like any
                 // other. The escalation row is *additional*: it is what makes
                 // this one findable later without re-reading every job.
+                // Both carry the item's input, so a later drain can hand
+                // the work back. Without it an escalation names an item
+                // index against a manifest that may since have moved, which
+                // is not enough to act on.
                 let recorded = if escalated {
-                    ledger.write_escalated(node_name, Some(item_index), &message)
+                    ledger.write_escalated(node_name, Some(item_index), &message, Some(item_input))
                 } else {
-                    ledger.write_item_failed(node_name, item_index, &message)
+                    ledger.write_item_failed(node_name, item_index, &message, Some(item_input))
                 };
                 if let Err(e) = recorded {
                     return Err(bail(

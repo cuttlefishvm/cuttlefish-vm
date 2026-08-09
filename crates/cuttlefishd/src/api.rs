@@ -5,7 +5,7 @@
 
 use crate::state::{Job, JobStore};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event as SseEvent, Sse},
@@ -94,6 +94,7 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs/{id}/events", get(job_events))
         .route("/jobs/{id}/resume", post(resume_job))
         .route("/escalations", get(list_escalations))
+        .route("/escalations/drain", post(drain_escalations))
         .route("/shutdown", post(shutdown))
         .with_state(state)
 }
@@ -125,64 +126,168 @@ async fn list_specs(State(st): State<AppState>) -> impl IntoResponse {
 /// A single unreadable ledger is skipped with a warning rather than failing
 /// the request: one job corrupted by a hard crash must not hide every other
 /// job's escalations.
-async fn list_escalations() -> impl IntoResponse {
-    let Some(jobs_root) = cuttlefish_host::ledger::jobs_root() else {
-        return (
+async fn list_escalations(Query(q): Query<EscalationQuery>) -> impl IntoResponse {
+    match collect_escalations(q.all) {
+        Ok(rows) => {
+            Json(rows.into_iter().map(render_escalation).collect::<Vec<_>>()).into_response()
+        }
+        Err(message) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "could not determine home directory; set CUTTLEFISH_HOME"
-            })),
+            Json(serde_json::json!({ "error": message })),
         )
-            .into_response();
+            .into_response(),
+    }
+}
+
+/// Export outstanding escalations and mark them drained, in one request.
+///
+/// Read-and-mark is deliberately a single operation. Splitting it into a
+/// list call followed by a mark call would leave a window in which a second
+/// caller drains the same rows into a second manifest — two planners, both
+/// convinced they own the work.
+///
+/// Rows with no recorded input are returned as `unrecoverable` and are
+/// *not* marked. They predate input recording, so there is nothing to hand
+/// back; reporting them is what stops a drain from silently emitting fewer
+/// lines than the queue listed.
+async fn drain_escalations() -> impl IntoResponse {
+    let found = match collect_escalations(false) {
+        Ok(rows) => rows,
+        Err(message) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
     };
 
-    let mut all = Vec::new();
-    if jobs_root.exists() {
-        let entries = match std::fs::read_dir(&jobs_root) {
-            Ok(e) => e,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("reading {}: {e}", jobs_root.display())
-                    })),
-                )
-                    .into_response()
-            }
-        };
-        for entry in entries.flatten() {
-            let ledger_path = entry.path().join("ledger.sqlite");
-            if !ledger_path.exists() {
-                continue;
-            }
-            let job_id = entry.file_name().to_string_lossy().into_owned();
-            // The fingerprint is only consulted when creating a ledger, and
-            // every ledger here already exists — its presence is what
-            // selected the directory.
-            let ledger = match cuttlefish_host::ledger::Ledger::open(&ledger_path, "") {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("warning: skipping unreadable ledger for job `{job_id}`: {e}");
-                    continue;
-                }
-            };
-            match ledger.escalations() {
-                Ok(rows) => all.extend(rows.into_iter().map(|e| {
-                    serde_json::json!({
-                        "job": job_id,
-                        "node": e.node,
-                        "item": e.item,
-                        "reason": e.reason,
-                        "at": e.at,
-                    })
-                })),
-                Err(e) => {
-                    eprintln!("warning: reading escalations for job `{job_id}`: {e}");
+    let (drainable, unrecoverable): (Vec<_>, Vec<_>) =
+        found.into_iter().partition(|(_, e)| e.input.is_some());
+
+    // Mark only after building the response body, so a row is never
+    // stamped for a payload the caller never received.
+    let items: Vec<serde_json::Value> = drainable
+        .iter()
+        .map(|(job, e)| {
+            serde_json::json!({
+                "job": job,
+                "node": e.node,
+                "item": e.item,
+                "input": e.input,
+            })
+        })
+        .collect();
+
+    let mut mark_errors: Vec<String> = Vec::new();
+    for (job, e) in &drainable {
+        match open_job_ledger(job) {
+            Some(ledger) => {
+                if let Err(err) = ledger.mark_drained(&e.node, e.item) {
+                    mark_errors.push(format!("{job}/{}: {err}", e.node));
                 }
             }
+            None => mark_errors.push(format!("{job}: ledger vanished between read and mark")),
         }
     }
-    Json(all).into_response()
+
+    Json(serde_json::json!({
+        "items": items,
+        "unrecoverable": unrecoverable
+            .iter()
+            .map(|(job, e)| serde_json::json!({
+                "job": job, "node": e.node, "item": e.item, "reason": e.reason,
+            }))
+            .collect::<Vec<_>>(),
+        // Surfaced rather than swallowed: the manifest is still valid, but
+        // the caller needs to know these rows may come back on a later
+        // drain.
+        "mark_errors": mark_errors,
+    }))
+    .into_response()
+}
+
+/// Whether to include already-drained rows.
+#[derive(Deserialize, Default)]
+pub struct EscalationQuery {
+    /// `?all=true` for the full history; absent means outstanding only.
+    #[serde(default)]
+    all: bool,
+}
+
+fn render_escalation((job, e): (String, cuttlefish_host::ledger::Escalation)) -> serde_json::Value {
+    serde_json::json!({
+        "job": job,
+        "node": e.node,
+        "item": e.item,
+        "reason": e.reason,
+        "at": e.at,
+        "input": e.input,
+        "drained_at": e.drained_at,
+    })
+}
+
+fn open_job_ledger(job_id: &str) -> Option<cuttlefish_host::ledger::Ledger> {
+    let path = cuttlefish_host::ledger::jobs_root()?
+        .join(job_id)
+        .join("ledger.sqlite");
+    // The fingerprint is only consulted when creating a ledger, and this
+    // one already exists.
+    cuttlefish_host::ledger::Ledger::open(&path, "").ok()
+}
+
+/// Walk every job's ledger and gather escalations, newest scan each call.
+///
+/// Sorted by `(job, node, item)` before returning: `escalations()` orders
+/// within one job, but `read_dir` order across jobs is unspecified, so
+/// without this two drains of the same set would emit the same lines in
+/// different orders.
+///
+/// A single unreadable ledger is skipped with a warning rather than failing
+/// the request: one job corrupted by a hard crash must not hide every other
+/// job's escalations.
+fn collect_escalations(
+    include_drained: bool,
+) -> Result<Vec<(String, cuttlefish_host::ledger::Escalation)>, String> {
+    let jobs_root = cuttlefish_host::ledger::jobs_root()
+        .ok_or("could not determine home directory; set CUTTLEFISH_HOME")?;
+
+    let mut all = Vec::new();
+    if !jobs_root.exists() {
+        return Ok(all);
+    }
+    let entries = std::fs::read_dir(&jobs_root)
+        .map_err(|e| format!("reading {}: {e}", jobs_root.display()))?;
+
+    for entry in entries.flatten() {
+        let ledger_path = entry.path().join("ledger.sqlite");
+        if !ledger_path.exists() {
+            continue;
+        }
+        let job_id = entry.file_name().to_string_lossy().into_owned();
+        let ledger = match cuttlefish_host::ledger::Ledger::open(&ledger_path, "") {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("warning: skipping unreadable ledger for job `{job_id}`: {e}");
+                continue;
+            }
+        };
+        let rows = if include_drained {
+            ledger.all_escalations()
+        } else {
+            ledger.escalations()
+        };
+        match rows {
+            Ok(rows) => all.extend(rows.into_iter().map(|e| (job_id.clone(), e))),
+            Err(e) => eprintln!("warning: reading escalations for job `{job_id}`: {e}"),
+        }
+    }
+    all.sort_by(|(ja, a), (jb, b)| {
+        ja.cmp(jb)
+            .then_with(|| a.node.cmp(&b.node))
+            .then_with(|| a.item.cmp(&b.item))
+    });
+    Ok(all)
 }
 
 async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl IntoResponse {
