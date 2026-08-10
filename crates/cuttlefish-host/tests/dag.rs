@@ -804,7 +804,7 @@ fn graph_fingerprint_closes_the_old_delimiter_collision() {
             hasher.update(node.signature.to_string().as_bytes());
             hasher.update(b"\0");
         }
-        format!("{:x}", hasher.finalize())
+        cuttlefish_host::hex::encode(hasher.finalize())
     }
     assert_eq!(
         old_broken_fingerprint(&sequence_a),
@@ -842,7 +842,7 @@ fn hash_length_prefixed_is_injective_across_a_boundary_shift() {
             hasher.update((part.len() as u64).to_be_bytes());
             hasher.update(part);
         }
-        format!("{:x}", hasher.finalize())
+        cuttlefish_host::hex::encode(hasher.finalize())
     }
 
     // Under a naive `\0`-join, "a\0b" + "\0" + "c\0" and "a\0" + "b\0c" +

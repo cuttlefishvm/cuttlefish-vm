@@ -244,7 +244,7 @@ async fn resume_does_not_repeat_items_that_already_concluded() {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(std::fs::read(&manifest).unwrap());
-        format!("{:x}", h.finalize())
+        cuttlefish_host::hex::encode(h.finalize())
     };
 
     let ledger_path = dir.path().join("ledger.sqlite");

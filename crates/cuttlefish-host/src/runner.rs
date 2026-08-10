@@ -919,7 +919,7 @@ async fn run_fanout_node(
     //
     // An item_index is only meaningful relative to one manifest, and no
     // graph fingerprint can see an edit to the manifest *file*.
-    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let digest = crate::hex::encode(Sha256::digest(&bytes));
     match ledger.check_or_record_manifest(node_name, &digest, items.len()) {
         Ok(Ok(())) => {}
         Ok(Err(previous)) => {

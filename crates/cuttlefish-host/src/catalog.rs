@@ -494,7 +494,7 @@ fn blobs_dir(root: &Path) -> PathBuf {
 }
 
 /// Whether `hex` is exactly 64 lowercase hex digits — the exact shape
-/// `write_blob` always produces via `format!("{:x}", Sha256::digest(bytes))`.
+/// `write_blob` always produces via `crate::hex::encode(Sha256::digest(bytes))`.
 /// This is the sole guard between an `Entry`'s `hash` field (read straight
 /// out of `index.json`, never format-validated elsewhere) and a filesystem
 /// path: without it, a hash like `../../../etc/passwd` or an absolute path
@@ -676,7 +676,7 @@ fn write_blob(root: &Path, bytes: &[u8]) -> Result<String, CatalogError> {
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    let hex = format!("{:x}", Sha256::digest(bytes));
+    let hex = crate::hex::encode(Sha256::digest(bytes));
     let dir = blobs_dir(root);
     fs::create_dir_all(&dir)?;
 
@@ -2269,7 +2269,7 @@ mod tests {
         // format-validated on read anywhere else in this module — read_blob
         // is the last line of defense before a hash string becomes a
         // filesystem path. A well-formed sha256 digest is always exactly 64
-        // lowercase hex digits (see write_blob's `format!("{:x}", ...)`), so
+        // lowercase hex digits (see write_blob's `hex::encode`), so
         // anything else — especially `../` traversal or an absolute path —
         // must be rejected before Path::join ever sees it.
         let dir = tempfile::tempdir().unwrap();

@@ -296,7 +296,7 @@ pub fn graph_fingerprint(nodes: &[CheckedNode]) -> String {
         // conclusions reached under two different rules.
         hash_length_prefixed(&mut hasher, policy_repr(node).as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    crate::hex::encode(hasher.finalize())
 }
 
 /// A node's `accept`/`on_fail` as one stable string, for fingerprinting.
