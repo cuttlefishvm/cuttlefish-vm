@@ -5,6 +5,13 @@ description: Use when building, linking, or packaging a .cuttlefish spec into a 
 
 # cuttlefish-build
 
+> **No `cuttlefish` on PATH?** Don't stop — the binaries are resolvable.
+> Dispatch the `cuttlefish-binary-resolver` agent (or follow
+> `cuttlefish-cli` inline), which checks PATH, a prior download in
+> `~/.cache/cuttlefish/bin/`, a dirty checkout, and finally a
+> checksum-verified GitHub Release download. "cuttlefish not found" is a
+> resolution step you haven't run yet, never a dead end.
+
 ## Overview
 
 `cuttlefish build` links and verifies a spec's pipeline into a distributable
