@@ -20,6 +20,11 @@ llamacpp = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:image"]
 # native dependency, and text extraction (always available) covers documents
 # that have a text layer.
 pdf-render = ["dep:pdfium-render", "dep:image"]
+# Decoding images so they can be resized/cropped before a vision model sees
+# them. Off by default for the same reason pdf-render is: a codec is real
+# weight, and image *metadata* (dimensions, EXIF, chunk structure) needs no
+# decoder and is already available to any script in the guest.
+image-ops = ["dep:image"]
 
 # Only built with the feature that needs it; see render_worker.
 [[bin]]

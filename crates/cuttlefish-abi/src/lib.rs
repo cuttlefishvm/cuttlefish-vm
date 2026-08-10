@@ -317,6 +317,39 @@ pub enum MediaKind {
     Binary,
 }
 
+/// One transformation [`Command::ImageOp`] can apply.
+///
+/// Deliberately a closed set rather than a general filter language: each of
+/// these answers a question an analysis pipeline actually asks, and a closed
+/// set is one a host can implement completely and a block can rely on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ImageOperation {
+    /// Scale to fit within these bounds, preserving aspect ratio.
+    ///
+    /// The common case before handing an image to a vision model, which
+    /// resamples to a fixed size anyway — sending a 48-megapixel original
+    /// costs encode time and tokens for detail the model cannot use.
+    Resize {
+        /// Maximum width in pixels.
+        max_width: u32,
+        /// Maximum height in pixels.
+        max_height: u32,
+    },
+    /// Cut out a region, for asking about part of an image rather than all
+    /// of it.
+    Crop {
+        /// Left edge, in pixels from the origin.
+        x: u32,
+        /// Top edge, in pixels from the origin.
+        y: u32,
+        /// Region width.
+        width: u32,
+        /// Region height.
+        height: u32,
+    },
+}
+
 /// What a guest asks the host to do, returned from its `init`/`step` exports.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -398,6 +431,26 @@ pub enum Command {
         handle: Handle,
         /// Zero-based page number.
         page: u32,
+    },
+    /// Transform an image handle, yielding a *new* image handle.
+    ///
+    /// Same indirection as [`Command::PageImage`], and for the same reason:
+    /// pixels stay host-side, and the result is usable exactly wherever a
+    /// file-backed image is — including as an [`Command::Infer`] image.
+    ///
+    /// This is the one image operation that needs a decoder, which is why it
+    /// lives here rather than in the guest. Metadata (dimensions, EXIF,
+    /// chunk structure) is header parsing and is available to any script
+    /// without a host round trip or a feature flag; *looking at the pixels*
+    /// is not.
+    ///
+    /// Hosts built without the `image-ops` feature reject this with a clear
+    /// message rather than pretending to succeed.
+    ImageOp {
+        /// Handle from a previous [`Command::Open`] or [`Command::PageImage`].
+        handle: Handle,
+        /// What to do to it.
+        op: ImageOperation,
     },
     /// Report progress to whoever is watching the job's event stream.
     Emit {

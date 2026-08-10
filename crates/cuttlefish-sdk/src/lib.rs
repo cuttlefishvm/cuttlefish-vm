@@ -65,7 +65,9 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-pub use cuttlefish_abi::{Command, Event, Handle, MediaKind, Signature, TokenAction, Ty};
+pub use cuttlefish_abi::{
+    Command, Event, Handle, ImageOperation, MediaKind, Signature, TokenAction, Ty,
+};
 
 /// How a guest hands a (pointer, length) pair back to the host.
 ///

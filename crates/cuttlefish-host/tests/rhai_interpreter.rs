@@ -553,3 +553,122 @@ async fn a_script_can_catch_a_gunzip_that_exceeds_its_ceiling() {
          ceiling — {result}"
     );
 }
+
+/// Image metadata end to end, with no feature flag and no decoder: a script
+/// reads a PNG's dimensions and spots a payload appended after IEND — a file
+/// that still renders as a normal image in any viewer.
+#[tokio::test]
+async fn a_rhai_script_reads_image_metadata_and_finds_an_appended_payload() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(&13u32.to_be_bytes());
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&1024u32.to_be_bytes());
+    png.extend_from_slice(&768u32.to_be_bytes());
+    png.extend_from_slice(&[8, 6, 0, 0, 0]);
+    png.extend_from_slice(&[0u8; 4]);
+    png.extend_from_slice(&0u32.to_be_bytes());
+    png.extend_from_slice(b"IEND");
+    png.extend_from_slice(&[0u8; 4]);
+    png.extend_from_slice(b"a stowaway payload");
+
+    let path = dir.path().join("photo.png");
+    std::fs::write(&path, &png).unwrap();
+
+    let script = r#"
+        let f = open(input.path);
+        let raw = slice_bytes(f.handle, 0, f.len);
+        let d = dimensions(raw.bytes_base64);
+        let chunks = png_chunks(raw.bytes_base64);
+        let trailing = 0;
+        for c in chunks { if c.type == "TRAILING" { trailing = c.length; } }
+        #{ width: d.width, height: d.height, trailing: trailing }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": path.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["width"], 1024);
+    assert_eq!(result["height"], 768);
+    assert_eq!(
+        result["trailing"], 18,
+        "bytes after IEND must be reported — silence here is the bug: {result}"
+    );
+}
+
+/// The host-side half, which needs a decoder. Gated on the same feature the
+/// operation is, so a default build's test run doesn't claim to have
+/// exercised something it cannot do.
+#[cfg(feature = "image-ops")]
+#[tokio::test]
+async fn a_rhai_script_resizes_an_image_through_the_real_host() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let img = image::RgbImage::from_fn(800, 400, |x, _| image::Rgb([(x % 256) as u8, 10, 20]));
+    let path = dir.path().join("big.png");
+    image::DynamicImage::ImageRgb8(img)
+        .save_with_format(&path, image::ImageFormat::Png)
+        .unwrap();
+
+    // The resized image comes back as a *handle*, so the script reads its
+    // bytes back through slice_bytes and re-reads the dimensions from the
+    // header — proving the transform really happened host-side rather than
+    // the handle merely being passed through.
+    let script = r#"
+        let f = open(input.path);
+        let small = image_resize(f.handle, 100, 100);
+        let raw = slice_bytes(small.handle, 0, small.len);
+        let d = dimensions(raw.bytes_base64);
+        #{ width: d.width, height: d.height }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": path.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    // 2:1 fitted into a square box, aspect ratio preserved.
+    assert_eq!(result["width"], 100);
+    assert_eq!(result["height"], 50);
+}

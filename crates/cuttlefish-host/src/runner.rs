@@ -1667,6 +1667,39 @@ async fn run_stage(
                 }
             }
 
+            Command::ImageOp { handle, op } => {
+                // Pixels stay host-side: the guest names a handle, gets a
+                // new handle, and never sees the bytes — same shape as
+                // PageImage, so a transformed image is usable exactly
+                // wherever a file-backed one is.
+                let bytes = match handles.read_all(handle) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return Err(fail(
+                            error_codes::CAPABILITY_DENIED,
+                            e.to_string(),
+                            usage.clone(),
+                        ));
+                    }
+                };
+                match crate::images::apply(&bytes, &op) {
+                    Ok(png) => {
+                        let (handle, len) = handles.insert_bytes(
+                            png,
+                            cuttlefish_abi::MediaKind::Image {
+                                format: "png".into(),
+                            },
+                        );
+                        Event::PageImaged { handle, len }
+                    }
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return Err(fail(error_codes::UNSUPPORTED, e.to_string(), usage.clone()));
+                    }
+                }
+            }
+
             Command::Infer {
                 prompt,
                 max_tokens,
