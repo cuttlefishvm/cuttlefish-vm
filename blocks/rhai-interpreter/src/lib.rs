@@ -68,6 +68,9 @@
 //! ships prebuilt, so nothing here costs an end user what a Rust
 //! proc-block doing the same extraction would (a wasm32 target).
 
+pub mod archive;
+pub mod binary;
+
 use cuttlefish_sdk::{export_block, Block, Command, Event};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -195,6 +198,111 @@ impl RhaiBlock {
         // ops; a script that calls this on an unparseable reply gets a
         // normal Rhai runtime error and the job fails, matching the
         // "throw on an unreadable answer, never default" rule.
+        // --- Binary inspection ---------------------------------------
+        //
+        // All pure, like parse_json: they take the base64 a script already
+        // holds from slice_bytes and compute. No host round trip means no
+        // call_index, no replay entry, and safe use inside try/catch.
+        //
+        // Base64 in and (where bytes come back) base64 out, so results feed
+        // straight into each other -- gunzip a .tar.gz, hand the result to
+        // tar_entries -- without inventing a byte type the replay log has no
+        // way to serialize.
+        {
+            use crate::{archive, binary};
+
+            fn bytes_of(b64: &str, who: &str) -> Result<Vec<u8>, Box<rhai::EvalAltResult>> {
+                binary::decode(b64).map_err(|e| format!("{who}: {e}").into())
+            }
+            fn to_dyn(
+                value: serde_json::Value,
+                who: &str,
+            ) -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                rhai::serde::to_dynamic(&value)
+                    .map_err(|e| format!("{who}: converting to a script value: {e}").into())
+            }
+
+            engine.register_fn(
+                "identify",
+                |b64: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    to_dyn(binary::identify(&bytes_of(b64, "identify")?), "identify")
+                },
+            );
+            engine.register_fn(
+                "entropy",
+                |b64: &str| -> Result<f64, Box<rhai::EvalAltResult>> {
+                    Ok(binary::entropy(&bytes_of(b64, "entropy")?))
+                },
+            );
+            engine.register_fn(
+                "byte_histogram",
+                |b64: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let counts = binary::byte_histogram(&bytes_of(b64, "byte_histogram")?);
+                    to_dyn(serde_json::json!(counts), "byte_histogram")
+                },
+            );
+            engine.register_fn(
+                "strings",
+                |b64: &str, min_len: i64| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let found =
+                        binary::strings(&bytes_of(b64, "strings")?, min_len.max(1) as usize);
+                    to_dyn(serde_json::json!(found), "strings")
+                },
+            );
+            engine.register_fn(
+                "hexdump",
+                |b64: &str, base_offset: i64| -> Result<String, Box<rhai::EvalAltResult>> {
+                    Ok(binary::hexdump(
+                        &bytes_of(b64, "hexdump")?,
+                        base_offset.max(0) as u64,
+                    ))
+                },
+            );
+            engine.register_fn(
+                "tar_entries",
+                |b64: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let entries = archive::tar_entries(&bytes_of(b64, "tar_entries")?)
+                        .map_err(|e| format!("tar_entries: {e}"))?;
+                    to_dyn(serde_json::json!(entries), "tar_entries")
+                },
+            );
+            engine.register_fn(
+                "zip_entries",
+                |b64: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let entries = archive::zip_entries(&bytes_of(b64, "zip_entries")?)
+                        .map_err(|e| format!("zip_entries: {e}"))?;
+                    to_dyn(serde_json::json!(entries), "zip_entries")
+                },
+            );
+            // max_bytes is required, not defaulted: a caller has to decide
+            // what it is willing to hold in memory, because running out is a
+            // wasm trap that kills the whole fan-out item rather than
+            // failing this one archive.
+            engine.register_fn(
+                "gunzip",
+                |b64: &str, max_bytes: i64| -> Result<String, Box<rhai::EvalAltResult>> {
+                    let out = archive::gunzip(&bytes_of(b64, "gunzip")?, max_bytes.max(0) as usize)
+                        .map_err(|e| format!("gunzip: {e}"))?;
+                    Ok(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        out,
+                    ))
+                },
+            );
+            engine.register_fn(
+                "inflate",
+                |b64: &str, max_bytes: i64| -> Result<String, Box<rhai::EvalAltResult>> {
+                    let out =
+                        archive::inflate(&bytes_of(b64, "inflate")?, max_bytes.max(0) as usize)
+                            .map_err(|e| format!("inflate: {e}"))?;
+                    Ok(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        out,
+                    ))
+                },
+            );
+        }
+
         engine.register_fn(
             "parse_json",
             |text: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {

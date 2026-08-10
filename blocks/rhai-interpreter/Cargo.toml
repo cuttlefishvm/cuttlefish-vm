@@ -54,3 +54,10 @@ getrandom = "0.3"
 # end user anything a Rust proc-block doing the same extraction would (a
 # wasm32 target, which isn't reliably present -- confirmed live, twice).
 regex = "1"
+# Scripts receive bytes from slice_bytes as base64 (the guest/host boundary
+# is JSON), so every binary builtin decodes that first.
+base64 = "0.23"
+# DEFLATE for archives. Pure Rust, no_std-friendly, compiles clean to
+# wasm32-unknown-unknown -- the reason archives are viable in the guest at
+# all, where a codec would not be.
+miniz_oxide = "0.8"

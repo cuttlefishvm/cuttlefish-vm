@@ -395,3 +395,161 @@ async fn a_script_node_resolved_from_the_catalog_and_run_through_run_job_gets_it
     let result = envelope.result.expect("a completed job carries a result");
     assert_eq!(result["tripled"], 42);
 }
+
+/// The binary toolkit end to end: a script opens a real archive it has never
+/// seen, identifies it from content, and lists what is inside — without the
+/// host learning any new commands. Everything below rides on `slice_bytes`,
+/// which already existed.
+#[tokio::test]
+async fn a_rhai_script_identifies_and_lists_a_real_gzipped_tar() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Build a genuine .tar.gz rather than a fixture, so the script is
+    // parsing bytes that a real tool would produce.
+    let mut tar = Vec::new();
+    for (name, body) in [("notes.txt", "hello"), ("data.bin", "xyz")] {
+        let mut header = vec![0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        let size = format!("{:011o}\0", body.len());
+        header[124..124 + size.len()].copy_from_slice(size.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[156] = b'0';
+        header[257..262].copy_from_slice(b"ustar");
+        tar.extend(header);
+        let mut content = body.as_bytes().to_vec();
+        content.resize(512, 0);
+        tar.extend(content);
+    }
+    tar.extend(vec![0u8; 1024]);
+
+    let deflated = miniz_oxide::deflate::compress_to_vec(&tar, 6);
+    let mut gz = vec![0x1f, 0x8b, 0x08, 0x00];
+    gz.extend_from_slice(&[0u8; 6]);
+    gz.extend_from_slice(&deflated);
+
+    let archive = dir.path().join("bundle.tar.gz");
+    std::fs::write(&archive, &gz).unwrap();
+
+    // Note what the script does NOT do: trust the file name. It reads the
+    // magic bytes, decompresses under an explicit ceiling, and only then
+    // parses the tar it actually found.
+    let script = r#"
+        let f = open(input.path);
+        let raw = slice_bytes(f.handle, 0, f.len);
+        let outer = identify(raw.bytes_base64);
+        let inner_b64 = gunzip(raw.bytes_base64, 1048576);
+        let inner = identify(inner_b64);
+        let entries = tar_entries(inner_b64);
+        let names = [];
+        for e in entries { names.push(e.name); }
+        #{
+            outer: outer.format,
+            inner: inner.format,
+            count: entries.len(),
+            names: names,
+            entropy_of_compressed: entropy(raw.bytes_base64),
+        }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": archive.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["outer"], "gzip");
+    assert_eq!(
+        result["inner"], "tar",
+        "the decompressed bytes must be identified as tar, which has no \
+         leading magic — its marker is at offset 257"
+    );
+    assert_eq!(result["count"], 2);
+    assert_eq!(result["names"][0], "notes.txt");
+    assert_eq!(result["names"][1], "data.bin");
+    assert!(
+        result["entropy_of_compressed"].as_f64().unwrap() > 3.0,
+        "compressed bytes should not look like plain text: {result}"
+    );
+}
+
+/// A decompression bomb must be refused by the declared ceiling, as an
+/// ordinary catchable error — not discovered by the guest running out of
+/// memory, which is a wasm trap that would kill the whole fan-out item.
+#[tokio::test]
+async fn a_script_can_catch_a_gunzip_that_exceeds_its_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Highly compressible: a megabyte of zeros in a few hundred bytes.
+    let payload = vec![0u8; 1024 * 1024];
+    let deflated = miniz_oxide::deflate::compress_to_vec(&payload, 9);
+    let mut gz = vec![0x1f, 0x8b, 0x08, 0x00];
+    gz.extend_from_slice(&[0u8; 6]);
+    gz.extend_from_slice(&deflated);
+    let bomb = dir.path().join("bomb.gz");
+    std::fs::write(&bomb, &gz).unwrap();
+
+    let script = r#"
+        let f = open(input.path);
+        let raw = slice_bytes(f.handle, 0, f.len);
+        let refused = false;
+        try {
+            gunzip(raw.bytes_base64, 4096);
+        } catch (err) {
+            refused = true;
+        }
+        #{ refused: refused, compressed_len: f.len }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": bomb.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(
+        result["refused"], true,
+        "the ceiling must stop it, and as a catchable error so the script \
+         can record the finding and carry on"
+    );
+    assert!(
+        result["compressed_len"].as_u64().unwrap() < 4096,
+        "the point of the case: a small file that would expand far past the \
+         ceiling — {result}"
+    );
+}
