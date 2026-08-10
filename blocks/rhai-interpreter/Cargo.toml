@@ -31,6 +31,15 @@ serde_json = { workspace = true }
 rhai = { version = "1", features = ["serde", "no_time"] }
 # Only needed to supply the "custom" backend rhai's transitive `getrandom`
 # dependency requires on wasm32-unknown-unknown; see ../../.cargo/config.toml.
+#
+# PINNED TO 0.3 ON PURPOSE -- do not let a bot bump this. Nothing here calls
+# getrandom; this entry exists so `__getrandom_v03_custom` in src/lib.rs
+# names the same `Error` type that rhai -> ahash -> getrandom 0.3 expects
+# back from it. That symbol is `#[no_mangle] extern "Rust"`, so the linker
+# matches it by name alone: pointing this at 0.4 still builds, still links,
+# and quietly hands 0.3 an error type it never agreed to. Bumping is only
+# correct once ahash itself moves to 0.4, and then the symbol has to be
+# renamed to match.
 getrandom = "0.3"
 # For regex_test/regex_find/regex_replace_all -- unlike jsonschema (kept out
 # of the wasm guest deliberately, see crates/cuttlefish/Cargo.toml), this is

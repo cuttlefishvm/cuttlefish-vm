@@ -43,7 +43,7 @@ impl ModuleCache {
         module_bytes: &[u8],
     ) -> anyhow::Result<Arc<wasmtime::Module>> {
         use sha2::{Digest, Sha256};
-        let key = format!("{:x}", Sha256::digest(module_bytes));
+        let key = crate::hex::encode(Sha256::digest(module_bytes));
 
         if let Some(cached) = self.modules.lock().unwrap().get(&key) {
             return Ok(cached.clone());
