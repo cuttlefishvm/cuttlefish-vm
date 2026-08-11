@@ -241,6 +241,45 @@ gives you `ratio` per entry — so a zip bomb is visible *before* anything is
 decompressed. Nothing is sanitized, because a block can't write files
 anyway and hiding the real name would only hide the attack.
 
+**Images** split across the same line, and it's worth knowing which side
+you're on. *What an image says about itself* is header parsing — free, no
+flag, no host call:
+
+| | |
+|---|---|
+| `dimensions(b64)` | `{width, height, format}` for PNG/JPEG/GIF/WebP |
+| `exif(b64)` | camera, timestamps, GPS, orientation, software |
+| `png_chunks(b64)` | every chunk — including a `TRAILING` entry for bytes appended after `IEND` |
+| `jpeg_segments(b64)` | every segment, by marker |
+
+*What an image looks like* needs a decoder, so it's a host call behind the
+`image-ops` feature (off by default, like `pdf-render`):
+
+| | |
+|---|---|
+| `image_resize(handle, max_w, max_h)` | fit within bounds, aspect preserved, **never upscales** |
+| `image_crop(handle, x, y, w, h)` | exact region; out-of-bounds is refused, not clamped |
+
+Both return a **new image handle**, usable anywhere a file-backed image is
+— including as an `infer()` image. Pixels never enter the script. On a host
+built without the feature these fail with a message naming the flag, rather
+than silently returning the original.
+
+The cheap pattern before asking a vision model anything: resize first. The
+model resamples to a fixed size regardless, so sending a 48-megapixel
+original costs encode time and tokens for detail it cannot use.
+
+```
+//! signature: {path: text} -> {answer: text}
+let f = open(input.path);
+let small = image_resize(f.handle, 1024, 1024);
+#{ answer: infer_with_images("What is in this photo?", 200, [small.handle]) }
+```
+
+Two findings worth looking for, since both survive normal viewing: bytes
+after `IEND` (a payload in a file that still renders), and EXIF whose
+dimensions disagree with the actual header (re-encoded or tampered with).
+
 To triage a whole corpus, don't write a loop: fan out with `over` and let
 each file be its own item, so one malformed file fails alone.
 

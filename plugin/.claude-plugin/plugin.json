@@ -1,7 +1,7 @@
 {
   "name": "cuttlefish-agent-tools",
   "description": "Skill and adversarial test harness for the cuttlefish block catalog and build CLI",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": {
     "name": "cuttlefishvm"
   },

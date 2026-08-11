@@ -46,6 +46,7 @@ pub mod dag;
 pub mod documents;
 pub mod handles;
 pub mod hex;
+pub mod images;
 pub mod infer;
 pub mod ledger;
 #[cfg(feature = "llamacpp")]

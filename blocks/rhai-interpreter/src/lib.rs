@@ -70,6 +70,7 @@
 
 pub mod archive;
 pub mod binary;
+pub mod image_meta;
 
 use cuttlefish_sdk::{export_block, Block, Command, Event};
 use std::cell::RefCell;
@@ -209,7 +210,7 @@ impl RhaiBlock {
         // tar_entries -- without inventing a byte type the replay log has no
         // way to serialize.
         {
-            use crate::{archive, binary};
+            use crate::{archive, binary, image_meta};
 
             fn bytes_of(b64: &str, who: &str) -> Result<Vec<u8>, Box<rhai::EvalAltResult>> {
                 binary::decode(b64).map_err(|e| format!("{who}: {e}").into())
@@ -256,6 +257,38 @@ impl RhaiBlock {
                         &bytes_of(b64, "hexdump")?,
                         base_offset.max(0) as u64,
                     ))
+                },
+            );
+            engine.register_fn(
+                "dimensions",
+                |b64: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let d = image_meta::dimensions(&bytes_of(b64, "dimensions")?)
+                        .map_err(|e| format!("dimensions: {e}"))?;
+                    to_dyn(d, "dimensions")
+                },
+            );
+            engine.register_fn(
+                "exif",
+                |b64: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let e = image_meta::exif(&bytes_of(b64, "exif")?)
+                        .map_err(|e| format!("exif: {e}"))?;
+                    to_dyn(e, "exif")
+                },
+            );
+            engine.register_fn(
+                "png_chunks",
+                |b64: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let c = image_meta::png_chunks(&bytes_of(b64, "png_chunks")?)
+                        .map_err(|e| format!("png_chunks: {e}"))?;
+                    to_dyn(serde_json::json!(c), "png_chunks")
+                },
+            );
+            engine.register_fn(
+                "jpeg_segments",
+                |b64: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let seg = image_meta::jpeg_segments(&bytes_of(b64, "jpeg_segments")?)
+                        .map_err(|e| format!("jpeg_segments: {e}"))?;
+                    to_dyn(serde_json::json!(seg), "jpeg_segments")
                 },
             );
             engine.register_fn(
@@ -485,6 +518,61 @@ impl RhaiBlock {
                 },
             );
         }
+        // Image transforms are host calls, unlike the metadata builtins
+        // above: they need a decoder, so they suspend and replay like
+        // infer/open rather than computing in the guest. Both yield a new
+        // image handle, usable anywhere a file-backed image is -- including
+        // as an infer() image.
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
+                "image_resize",
+                move |handle: i64,
+                      max_width: i64,
+                      max_height: i64|
+                      -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::ImageOp {
+                            handle: handle.max(0) as u32,
+                            op: cuttlefish_sdk::ImageOperation::Resize {
+                                max_width: max_width.max(0) as u32,
+                                max_height: max_height.max(0) as u32,
+                            },
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
+                "image_crop",
+                move |handle: i64,
+                      x: i64,
+                      y: i64,
+                      width: i64,
+                      height: i64|
+                      -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::ImageOp {
+                            handle: handle.max(0) as u32,
+                            op: cuttlefish_sdk::ImageOperation::Crop {
+                                x: x.max(0) as u32,
+                                y: y.max(0) as u32,
+                                width: width.max(0) as u32,
+                                height: height.max(0) as u32,
+                            },
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
 
         let result = engine.eval_with_scope::<rhai::Dynamic>(&mut scope, &self.script);
 
@@ -541,14 +629,18 @@ impl RhaiBlock {
     /// answering `Event` with it in `log`.
     fn run_and_track_pending(&mut self) -> Command {
         let cmd = self.run();
-        let is_host_call = matches!(
+        // Deliberately inverted: list the commands the host does *not*
+        // answer, and treat everything else as a host call. The allowlist
+        // this replaced was a `matches!`, so the compiler could not warn
+        // when a newly added command fell off it — and one that falls off
+        // is never stashed as pending, so the host's reply arrives to find
+        // nothing in flight and the guest panics. That is a wasm trap, i.e.
+        // the whole item, for a one-line omission. Getting it wrong this
+        // way round merely stashes a command that will never be answered,
+        // which is harmless because Done/Fail end the block anyway.
+        let is_host_call = !matches!(
             cmd,
-            Command::Infer { .. }
-                | Command::Open { .. }
-                | Command::Slice { .. }
-                | Command::SliceBytes { .. }
-                | Command::PageText { .. }
-                | Command::PageImage { .. }
+            Command::Emit { .. } | Command::Done { .. } | Command::Fail { .. }
         );
         self.pending_command = is_host_call.then(|| cmd.clone());
         cmd
