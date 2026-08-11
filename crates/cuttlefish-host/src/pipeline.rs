@@ -321,12 +321,34 @@ pub fn resolve_and_load(
                 path: path.clone(),
                 source,
             })?;
+            // A `.rhai` file has no magic bytes, so it is recognized by
+            // extension — the same rule `catalog add` itself uses.
+            //
+            // Referencing a script by path is what makes an edit-run-edit
+            // loop possible at all. A catalogued `name@version` is immutable
+            // all the way down (`catalog rm` drops the index entry but keeps
+            // the blob), which is right for anything a shipped spec depends
+            // on and unusable while the script is still being written: every
+            // edit would need a new version. Requiring the catalog here sent
+            // real users off to invent content-hash versions and generated
+            // specs to route around it.
+            if path.extension().is_some_and(|e| e == "rhai") {
+                let script =
+                    String::from_utf8(bytes).map_err(|e| PipelineError::Uninspectable {
+                        name: path.display().to_string(),
+                        message: format!("script is not valid UTF-8: {e}"),
+                    })?;
+                return Ok(ResolvedInput {
+                    name: name_of(&path),
+                    kind: crate::catalog::ArtifactKind::Script,
+                    // No `name@version`, because there deliberately isn't
+                    // one: this is a file on disk, and that is the point.
+                    resolved: None,
+                    bytes: crate::embedded_rhai_interpreter_bytes().to_vec(),
+                    script: Some(script),
+                });
+            }
             let kind = crate::catalog::sniff_artifact_kind(&bytes).ok_or_else(|| {
-                // A `.rhai` file has no magic bytes of its own to sniff — it
-                // is only ever recognized as a Script through the catalog
-                // (see the `Resolved::Cataloged` arm below), never by a
-                // direct filesystem path. Naming that explicitly here saves
-                // whoever hits this from having to already know it.
                 let message = if path.extension().is_some_and(|e| e == "rhai") {
                     "not a recognized artifact: a .rhai script must be `cuttlefish catalog \
                      add`ed before use — a pipeline can't reference one directly by path"

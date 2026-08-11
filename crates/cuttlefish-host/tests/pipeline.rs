@@ -564,8 +564,17 @@ fn a_missing_direct_path_names_the_path() {
     assert!(err.to_string().contains("block.wasm"), "{err}");
 }
 
+/// A script referenced by path resolves without the catalog.
+///
+/// This test previously asserted the opposite — that a direct `.rhai` path
+/// was refused with a hint to `catalog add` it first. That refusal is what
+/// made an edit-run-edit loop impossible: a catalogued `name@version` is
+/// immutable all the way down (`catalog rm` drops the index entry but keeps
+/// the blob), so every edit needed a brand-new version. Real users hit this
+/// and invented content-hash versions plus generated specs to route around
+/// it. Catalog when you ship; reference by path while you build.
 #[test]
-fn a_direct_path_to_an_uncataloged_rhai_script_hints_at_the_fix() {
+fn a_script_referenced_by_path_resolves_without_the_catalog() {
     let spec_dir = tempfile::tempdir().unwrap();
     let catalog = Catalog::open(spec_dir.path().join("unused-catalog"));
     std::fs::write(
@@ -574,17 +583,25 @@ fn a_direct_path_to_an_uncataloged_rhai_script_hints_at_the_fix() {
     )
     .unwrap();
 
-    let err = resolve_and_load(
+    let resolved = resolve_and_load(
         &catalog,
         spec_dir.path(),
         "stray.rhai",
         ResolutionContext::Interactive,
     )
-    .unwrap_err();
-    let msg = err.to_string();
+    .expect("a .rhai path that exists on disk must resolve");
+
+    assert_eq!(
+        resolved.kind,
+        cuttlefish_host::catalog::ArtifactKind::Script
+    );
+    // The script text travels alongside the shared interpreter, exactly as
+    // it does for a catalogued script — the only difference is where the
+    // bytes came from.
+    assert!(resolved.script.unwrap().contains("input"));
     assert!(
-        msg.contains("catalog add"),
-        "expected a hint to catalog the script first, got: {msg}"
+        resolved.resolved.is_none(),
+        "a path reference has no name@version, and that is the point"
     );
 }
 

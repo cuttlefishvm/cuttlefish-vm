@@ -33,6 +33,9 @@ clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+# Hashes the project path into a short socket name (sun_path is ~104 bytes)
+# and fingerprints a spec's contents so an in-place edit restarts the daemon.
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 wasmtime = { workspace = true }

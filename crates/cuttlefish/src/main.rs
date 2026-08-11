@@ -26,6 +26,8 @@
 //! Argument parsing is deliberately not split: one `clap` derive covers every
 //! subcommand on every platform.
 
+mod dev;
+mod init;
 mod models;
 
 mod cli {
@@ -154,6 +156,33 @@ mod cli {
             /// schema, a fixed block — is yours to decide.
             #[arg(long, value_name = "PATH")]
             manifest: Option<PathBuf>,
+        },
+        /// Ensure this project's daemon is serving a spec, then run a
+        /// client command against it. Everything after `--` is the command.
+        ///
+        /// Restarts the daemon when the spec's *contents* change, not just
+        /// its path -- a daemon loads its pipeline once at startup, so an
+        /// in-place edit would otherwise keep serving the previous graph.
+        Dev {
+            /// The spec to serve.
+            #[arg(long)]
+            spec: PathBuf,
+            /// Client command and arguments; `--endpoint` is supplied.
+            #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+            args: Vec<String>,
+        },
+        /// Stop this project's daemon, if one is running.
+        DevStop,
+        /// Scaffold a new project: spec, block, schema, fixture, and a
+        /// test harness that already asserts in both directions.
+        Init {
+            /// Where to create it. Defaults to the current directory.
+            #[arg(default_value = ".")]
+            dir: PathBuf,
+            /// Spec name; becomes the identifier in `spec <name> = {...}`.
+            /// Defaults to the directory's own name.
+            #[arg(long)]
+            name: Option<String>,
         },
         /// List what the daemon can run.
         Specs {
@@ -291,6 +320,20 @@ mod cli {
                 spec,
                 input,
             } => crate::daemon::submit(&endpoint, &spec, &input).await,
+            Cmd::Dev { spec, args } => crate::dev::run(&spec, &args).await,
+            Cmd::DevStop => crate::dev::stop().await,
+            Cmd::Init { dir, name } => {
+                // Default the name from the directory so `cuttlefish init`
+                // in an empty project needs no arguments at all.
+                let resolved = match name {
+                    Some(n) => n,
+                    None => std::fs::canonicalize(&dir)
+                        .ok()
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .unwrap_or_else(|| "pipeline".to_string()),
+                };
+                crate::init::run(&dir, &resolved)
+            }
             Cmd::Jobs { endpoint } => crate::daemon::jobs(&endpoint).await,
             Cmd::Escalations {
                 endpoint,
@@ -789,6 +832,52 @@ mod daemon {
 
         println!("{}", serde_json::to_string_pretty(&body)?);
         Ok(())
+    }
+
+    /// Is a daemon answering on this endpoint? No output either way.
+    ///
+    /// Separate from `specs` because `dev` polls this in a loop while
+    /// waiting for startup, where printing a spec list per attempt would
+    /// bury whatever the caller actually asked for.
+    pub async fn specs_quiet(socket: &Path) -> bool {
+        let Ok(client) = client(socket) else {
+            return false;
+        };
+        client
+            .get("http://localhost/specs")
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
+    /// Ask the daemon to stop, without printing anything.
+    ///
+    /// `dev` wraps another command and must leave its stdout alone: a
+    /// restart notice mixed into the wrapped command's output corrupts the
+    /// JSON a caller is parsing. The user-facing `shutdown` still prints.
+    pub async fn shutdown_quiet(socket: &Path) {
+        if let Ok(client) = client(socket) {
+            let _ = client.post("http://localhost/shutdown").send().await;
+        }
+    }
+
+    /// Job ids the daemon reports as `Interrupted`.
+    pub async fn interrupted_jobs(socket: &Path) -> anyhow::Result<Vec<String>> {
+        let body: serde_json::Value = client(socket)?
+            .get("http://localhost/jobs")
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(body
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|job| job["status"] == "interrupted")
+            .filter_map(|job| job["job_id"].as_str().map(str::to_string))
+            .collect())
     }
 
     /// Everything every job on this machine gave up on.
