@@ -591,7 +591,10 @@ fn a_script_referenced_by_path_resolves_without_the_catalog() {
     )
     .expect("a .rhai path that exists on disk must resolve");
 
-    assert_eq!(resolved.kind, cuttlefish_host::catalog::ArtifactKind::Script);
+    assert_eq!(
+        resolved.kind,
+        cuttlefish_host::catalog::ArtifactKind::Script
+    );
     // The script text travels alongside the shared interpreter, exactly as
     // it does for a catalogued script — the only difference is where the
     // bytes came from.
