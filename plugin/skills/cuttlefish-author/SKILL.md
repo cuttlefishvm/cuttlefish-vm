@@ -205,6 +205,45 @@ let judged = parse_json(infer(
 #{ verdict: judged.verdict }
 ```
 
+**Binary inspection** — for looking at bytes rather than text. Every one
+of these is a pure function taking the base64 that `slice_bytes` already
+hands you, so they're safe in `try`/`catch` and cost no host round-trip:
+
+| | |
+|---|---|
+| `identify(b64)` | `{format, mime, confidence}` from **content**, not the filename |
+| `entropy(b64)` | bits/byte, 0–8. Text ~4.5, compressed/encrypted ~7.99 |
+| `strings(b64, min_len)` | printable runs with their offsets |
+| `hexdump(b64, base_offset)` | hex+ASCII text a *model* can actually read |
+| `byte_histogram(b64)` | 256 counts |
+| `tar_entries(b64)` / `zip_entries(b64)` | list an archive without extracting |
+| `gunzip(b64, max_bytes)` / `inflate(b64, max_bytes)` | decompress, bounded; returns base64 |
+
+Two things worth knowing before you use them:
+
+**`max_bytes` is required on anything that decompresses**, because a
+decompression bomb that exhausts guest memory is a wasm trap, and a trap
+kills the whole fan-out item instead of recording "this one archive is
+malicious" and moving on. Pick a ceiling you're willing to hold, and catch
+the error:
+
+```
+//! signature: {path: text} -> {format: text, entries: json}
+let f = open(input.path);
+let raw = slice_bytes(f.handle, 0, f.len);
+let kind = identify(raw.bytes_base64);      // "gzip", never trusting the name
+let inner = gunzip(raw.bytes_base64, 1048576);
+#{ format: identify(inner).format, entries: tar_entries(inner) }
+```
+
+**`zip_entries` reports names verbatim**, traversal sequences and all, and
+gives you `ratio` per entry — so a zip bomb is visible *before* anything is
+decompressed. Nothing is sanitized, because a block can't write files
+anyway and hiding the real name would only hide the attack.
+
+To triage a whole corpus, don't write a loop: fan out with `over` and let
+each file be its own item, so one malformed file fails alone.
+
 (`try`/`catch` is a statement in Rhai, not an expression — if you want to
 handle a parse failure instead of letting it fail the job, assign into a
 variable declared beforehand rather than trying to use the `try`/`catch`

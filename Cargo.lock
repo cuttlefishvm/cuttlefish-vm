@@ -523,8 +523,10 @@ dependencies = [
 name = "cf-block-rhai-interpreter"
 version = "0.0.7"
 dependencies = [
+ "base64 0.23.1",
  "cuttlefish-sdk",
  "getrandom 0.3.4",
+ "miniz_oxide",
  "regex",
  "rhai",
  "serde_json",
@@ -1007,6 +1009,7 @@ dependencies = [
  "jsonschema",
  "llama-cpp-2",
  "lopdf 0.44.0",
+ "miniz_oxide",
  "pdf-extract",
  "pdfium-render",
  "reqwest",

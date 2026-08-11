@@ -79,6 +79,9 @@ rhai = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Builds genuine .tar.gz / bomb fixtures for the binary-toolkit tests, so a
+# script parses bytes a real tool would have produced.
+miniz_oxide = "0.8"
 wat = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 async-trait = "0.1"
