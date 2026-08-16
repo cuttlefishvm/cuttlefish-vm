@@ -280,6 +280,38 @@ Two findings worth looking for, since both survive normal viewing: bytes
 after `IEND` (a payload in a file that still renders), and EXIF whose
 dimensions disagree with the actual header (re-encoded or tampered with).
 
+**Spreadsheets** need a real reader, so they are a block rather than a
+builtin: `sheet-extract` (XLSX/XLSM/XLS). An XLSX opens as `kind: "binary"`
+with zero characters, so no amount of `slice`/`page_text` reaches the
+numbers.
+
+```
+nodes = {
+  read  = { block = "./blocks/sheet-extract.wasm"; over = "./books.jsonl"; };
+  clean = { block = "./blocks/clean.rhai"; in = read.out; };
+};
+```
+
+It returns `{path, sheets, schema, truncated}`:
+
+- `sheets` — rows as JSON arrays. **Numbers stay numbers**, so a downstream
+  node can do arithmetic without reparsing.
+- `schema` — where the table actually is and what the columns hold. Real
+  workbooks rarely put a header at A1: expect a title, a blank row, maybe an
+  inset from column A. Reports `header_row`, `data_start_row`, and per
+  column its `letter` (the real grid letter, so you can point at it in
+  Excel), `name`, `type`, and `filled`/`of`.
+- `truncated` — per sheet, if `max_rows` cut it off. Never silent: a caller
+  summing a column has to know it was cut, or the total is wrong and looks
+  right.
+
+Two things it deliberately does *not* do, because they are the Rhai block's
+job downstream: it never renames or drops a column, and it never resolves a
+`mixed` type. A numeric column with three stray `"N/A"` cells is reported as
+`mixed` with a sample, because silently calling it `number` is how a total
+ends up wrong and plausible. Header detection is a documented heuristic and
+reports its evidence, so a cleanup script can disagree with it.
+
 To triage a whole corpus, don't write a loop: fan out with `over` and let
 each file be its own item, so one malformed file fails alone.
 
