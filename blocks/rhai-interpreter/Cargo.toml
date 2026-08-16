@@ -60,4 +60,4 @@ base64 = "0.23"
 # DEFLATE for archives. Pure Rust, no_std-friendly, compiles clean to
 # wasm32-unknown-unknown -- the reason archives are viable in the guest at
 # all, where a codec would not be.
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
