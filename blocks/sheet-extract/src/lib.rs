@@ -27,7 +27,7 @@
 //! The whole workbook is pulled into guest memory before parsing, because
 //! `calamine` needs `Read + Seek` over the complete file — a zip's central
 //! directory is at the end. That is a real ceiling and the reason
-//! [`MAX_BYTES`] exists: a workbook past it fails as one item with a clear
+//! `MAX_BYTES` exists: a workbook past it fails as one item with a clear
 //! message rather than trapping the guest and taking the whole fan-out item
 //! with it.
 
