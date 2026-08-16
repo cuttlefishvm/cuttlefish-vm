@@ -122,6 +122,12 @@ spec summarize_docs = {
     failed: json}`. A downstream node must declare *that* as its input;
     declaring the per-item shape is the natural mistake and won't
     typecheck. Read the results with `open`/`slice` on `results_path`.
+  - **Each line of `results.jsonl` is `{"item": N, "result": {...}}`** — the
+    block's own output is nested under `result`, not spliced into the line.
+    Reading `r.my_field` instead of `r.result.my_field` yields unit and
+    costs a run to discover. The wrapper is deliberate: `item` is what makes
+    a result traceable back to its manifest line and cross-referenceable
+    with `failures.jsonl`, whose lines are `{"item": N, "error": "..."}`.
   - **One bad item doesn't kill the run.** An item whose input doesn't
     match the declared type, or whose block fails, is recorded in
     `failures.jsonl` and the rest continue. What *does* fail the whole job:
