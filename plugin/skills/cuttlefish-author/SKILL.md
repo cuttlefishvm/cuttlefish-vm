@@ -350,12 +350,25 @@ the whole script body at that point (not just the header) — a script with a
 syntax error is rejected immediately, rather than cataloging fine and only
 failing the first time a job actually runs it.
 
-**A script must be cataloged before a spec can reference it** — a spec node
-pointing directly at an uncataloged `.rhai` path (bypassing `catalog add`)
-is not supported, unlike a `.wasm` block which can be referenced by path
-directly. Always `catalog add` first, then reference by `name@version`.
+**Reference a script by path while you build; catalog it when you ship.**
+A spec node can point straight at a `.rhai` file — `block =
+"./blocks/check.rhai"` — and an edit is picked up on the next run. Catalog
+it once it is stable and something else needs to depend on it.
+
+Do not reach for `catalog add` during an edit-run-edit loop. A catalogued
+`name@version` is immutable all the way down: `catalog rm` drops the index
+entry but the blob stays, so a version can never be re-pointed at different
+bytes. That is right for anything a shipped spec depends on and unusable
+while the script is still being written, where every edit would need a new
+version.
 
 ## Things worth knowing
+
+- **Rhai's string methods mutate in place and return unit.** `t.trim()`
+  trims `t` and evaluates to `()`, so `parse_json(line.trim())` fails with
+  `Function not found: parse_json (())` — an accurate message that names
+  the argument type rather than the cause. Trim on its own line, then use
+  the variable. The same holds for other in-place string methods.
 
 - Rust and Rhai blocks compose freely in the same spec — a pipeline can mix
   both kinds of node.
