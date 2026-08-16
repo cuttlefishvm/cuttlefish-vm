@@ -13,6 +13,7 @@ members = [
     "crates/cuttlefishd",     # the daemon
     "blocks/echo-summarize",  # example block; publish = false
     "blocks/rhai-interpreter", # shared cuttlefish-author Script interpreter; publish = false
+    "blocks/sheet-extract",   # XLSX/XLSM/XLS reader; publish = false
 ]
 
 [workspace.package]
