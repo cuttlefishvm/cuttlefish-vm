@@ -1481,6 +1481,8 @@ async fn run_stage(
     // too, and both are dropped together when the stage ends.
     let mut doc_texts: std::collections::HashMap<u32, std::sync::Arc<String>> =
         std::collections::HashMap::new();
+    // Page-tree counts, memoized the same way and for the same reason.
+    let mut doc_pages: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
 
     let mut guest = match Guest::new(engine, cache, module_bytes) {
         Ok(g) => g,
@@ -1650,9 +1652,12 @@ async fn run_stage(
                 // The page-tree count is what makes the error honest: it can
                 // say "1 addressable segment, 227 pages in the tree" rather
                 // than blaming a scan.
-                let page_tree_count = crate::documents::inspect(&path)
-                    .map(|info| info.pages)
-                    .unwrap_or(0);
+                //
+                // From `page_count`, never `inspect`: inspect also answers
+                // has_text_layer, which it can only do by extracting the
+                // whole document. Reaching for it here re-introduced the
+                // very quadratic walk the text cache had just removed.
+                let page_tree_count = doc_page_count(&mut doc_pages, handle, &path);
                 match crate::documents::page_text_from(&text, page, page_tree_count) {
                     Ok(text) => Event::PageTexted { text },
                     Err(e) => {
@@ -1891,4 +1896,22 @@ fn doc_text(
     let text = std::sync::Arc::new(crate::documents::document_text(path)?);
     cache.insert(handle, text.clone());
     Ok(text)
+}
+
+/// The page-tree count for `handle`, read once.
+///
+/// Zero when the document cannot be loaded: this value exists only to make
+/// an error message more informative, so failing to obtain it must never
+/// turn into a second failure.
+fn doc_page_count(
+    cache: &mut std::collections::HashMap<u32, u32>,
+    handle: u32,
+    path: &std::path::Path,
+) -> u32 {
+    if let Some(hit) = cache.get(&handle) {
+        return *hit;
+    }
+    let count = crate::documents::page_count(path).unwrap_or(0);
+    cache.insert(handle, count);
+    count
 }

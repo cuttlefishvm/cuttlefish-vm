@@ -54,6 +54,19 @@ pub fn inspect(path: &Path) -> anyhow::Result<DocumentInfo> {
     })
 }
 
+/// How many pages the PDF's own page tree reports.
+///
+/// Separate from [`inspect`] on purpose: `inspect` also answers
+/// `has_text_layer`, and the only honest way to answer that is to extract
+/// the text and look. Calling it merely to learn a page count therefore
+/// costs a full extraction — which is exactly the trap that made a page
+/// walk quadratic even *after* the text itself was cached.
+pub fn page_count(path: &Path) -> anyhow::Result<u32> {
+    let doc = lopdf::Document::load(path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    Ok(doc.get_pages().len() as u32)
+}
+
 /// Every character of text in the document, in one call.
 ///
 /// This is what `pdf_extract` produces internally and what most callers
