@@ -280,6 +280,56 @@ Two findings worth looking for, since both survive normal viewing: bytes
 after `IEND` (a payload in a file that still renders), and EXIF whose
 dimensions disagree with the actual header (re-encoded or tampered with).
 
+**Reading a PDF: use `document_text(handle)`.** It returns every character
+in the document, which is what most callers want and what the extractor
+produces internally anyway.
+
+Do **not** reach for `page_text(handle, 0)` to mean "the whole thing", and
+do not walk `0..kind.pages` expecting one page each. Those are two different
+counts:
+
+- `open().kind.pages` comes from the PDF's **page tree** — 227 for a
+  227-page filing.
+- `page_text` indexes **text segments**, which come from splitting the
+  extracted text on form feeds. Plenty of real PDFs carry none, so a
+  227-page document can expose exactly **one** addressable segment.
+
+When they disagree, `page_text(h, 1)` fails and says so, naming both counts.
+Walking pages is still fine when a document genuinely has them — the
+extraction is cached per handle, so a page walk costs one extraction, not
+one per page.
+
+**A scanned PDF has no text to extract** — `open` reports
+`has_text_layer: false` and `document_text` returns nothing. Read it with a
+vision model instead: render the page, then send the handle.
+
+```
+//! signature: {path: text} -> {text: text}
+let f = open(input.path);
+let text = "";
+if f.kind.has_text_layer {
+    text = document_text(f.handle).text;
+} else {
+    let img = page_image(f.handle, 0);          // needs `pdf-render`
+    text = infer_with_images("Transcribe this page verbatim.", 2000,
+                             [img.handle]).text;
+}
+#{ text: text }
+```
+
+Two things to know before relying on it:
+
+- **`page_image` needs the `pdf-render` feature**, which is off by default
+  because pdfium is a large native dependency. Without it, rendering fails
+  naming the feature rather than returning a blank page.
+- **The model must accept images.** Ollama does; a text-only backend
+  refuses loudly rather than answering about nothing, which is the failure
+  that would otherwise read as a bad model instead of a misconfigured job.
+
+Pass the `handle` field, not the record: `[img.handle]`, not `[img]`. The
+wrong shape is named as an error rather than dropped, because a dropped
+image produces a confident answer about nothing.
+
 **Spreadsheets** need a real reader, so they are a block rather than a
 builtin: `sheet-extract` (XLSX/XLSM/XLS). An XLSX opens as `kind: "binary"`
 with zero characters, so no amount of `slice`/`page_text` reaches the

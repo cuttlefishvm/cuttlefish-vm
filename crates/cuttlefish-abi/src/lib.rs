@@ -432,6 +432,22 @@ pub enum Command {
         /// Zero-based page number.
         page: u32,
     },
+    /// Every character of text in a document, in one call.
+    ///
+    /// What most callers reading a PDF actually want, and the direct way to
+    /// ask for it. Before this existed the only route was
+    /// [`Command::PageText`] with `page: 0`, which reads like "the first
+    /// page" and quietly means "everything" whenever the extractor emitted
+    /// no page breaks — a gap that cost a real user two iterations and
+    /// nearly a wrong conclusion about whether cuttlefish could read their
+    /// corpus at all.
+    ///
+    /// Prefer this over walking pages unless the pages are genuinely needed
+    /// separately: the whole document is one extraction either way.
+    DocumentText {
+        /// Handle from a previous [`Command::Open`].
+        handle: Handle,
+    },
     /// Transform an image handle, yielding a *new* image handle.
     ///
     /// Same indirection as [`Command::PageImage`], and for the same reason:
@@ -523,7 +539,12 @@ pub enum Event {
         /// truncation, so this is always `offset + len` clamped to the file.
         next_offset: u64,
     },
-    /// A document page was extracted as text.
+    /// Text extracted from a document — one page, or the whole thing.
+    ///
+    /// Shared by [`Command::PageText`] and [`Command::DocumentText`]: both
+    /// answer with text and nothing else, so a second variant carrying an
+    /// identical payload would add surface without adding information. The
+    /// *command* is what names the intent.
     PageTexted {
         /// The page's text.
         text: String,

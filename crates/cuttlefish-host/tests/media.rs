@@ -219,8 +219,8 @@ fn inspecting_a_pdf_reports_pages_and_a_text_layer() {
 }
 
 #[test]
-fn extracting_page_text_returns_the_documents_words() {
-    let text = documents::page_text(&sample_pdf(), 0).expect("page 0 should extract");
+fn extracting_document_text_returns_the_documents_words() {
+    let text = documents::document_text(&sample_pdf()).expect("the document should extract");
     assert!(
         text.to_lowercase().contains("cuttlefish"),
         "expected the document's text, got: {text:?}"
@@ -228,9 +228,18 @@ fn extracting_page_text_returns_the_documents_words() {
 }
 
 #[test]
-fn a_page_past_the_end_is_refused() {
-    let err = documents::page_text(&sample_pdf(), 99).unwrap_err();
-    assert!(err.to_string().contains("out of range"), "{err}");
+fn a_page_past_the_end_is_refused_and_names_both_counts() {
+    // Extraction and indexing are separate now, so the caller supplies the
+    // page-tree count and the error can report both numbers rather than
+    // guessing that the page was scanned.
+    let text = documents::document_text(&sample_pdf()).unwrap();
+    let err = documents::page_text_from(&text, 99, 1).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("out of range"), "{message}");
+    assert!(
+        message.contains("addressable text segment"),
+        "the count that would have told the caller what to do: {message}"
+    );
 }
 
 #[test]

@@ -1476,6 +1476,13 @@ async fn run_stage(
     // two are dropped together at the end of the job.
     let mut doc_paths: std::collections::HashMap<u32, std::path::PathBuf> =
         std::collections::HashMap::new();
+    // Extracted text, memoized per handle for this stage. Scoped exactly as
+    // `doc_paths` is: a handle is job-scoped, so the text keyed by it can be
+    // too, and both are dropped together when the stage ends.
+    let mut doc_texts: std::collections::HashMap<u32, std::sync::Arc<String>> =
+        std::collections::HashMap::new();
+    // Page-tree counts, memoized the same way and for the same reason.
+    let mut doc_pages: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
 
     let mut guest = match Guest::new(engine, cache, module_bytes) {
         Ok(g) => g,
@@ -1630,8 +1637,51 @@ async fn run_stage(
                         usage.clone(),
                     ));
                 };
-                match crate::documents::page_text(&path, page) {
+                // Extract once per handle, not once per page. The old shape
+                // re-extracted the whole document on every call, which made
+                // a page walk quadratic: a 342-page filing meant 342 full
+                // extractions, and across thousands of documents that is not
+                // slow but unrunnable.
+                let text = match doc_text(&mut doc_texts, handle, &path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return Err(fail(error_codes::UNSUPPORTED, e.to_string(), usage.clone()));
+                    }
+                };
+                // The page-tree count is what makes the error honest: it can
+                // say "1 addressable segment, 227 pages in the tree" rather
+                // than blaming a scan.
+                //
+                // From `page_count`, never `inspect`: inspect also answers
+                // has_text_layer, which it can only do by extracting the
+                // whole document. Reaching for it here re-introduced the
+                // very quadratic walk the text cache had just removed.
+                let page_tree_count = doc_page_count(&mut doc_pages, handle, &path);
+                match crate::documents::page_text_from(&text, page, page_tree_count) {
                     Ok(text) => Event::PageTexted { text },
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return Err(fail(error_codes::UNSUPPORTED, e.to_string(), usage.clone()));
+                    }
+                }
+            }
+
+            Command::DocumentText { handle } => {
+                let Some(path) = doc_paths.get(&handle).cloned() else {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return Err(fail(
+                        error_codes::CAPABILITY_DENIED,
+                        format!("no such handle: {handle}"),
+                        usage.clone(),
+                    ));
+                };
+                match doc_text(&mut doc_texts, handle, &path) {
+                    // Cloned out of the Arc only here, at the point the text
+                    // actually crosses to the guest.
+                    Ok(text) => Event::PageTexted {
+                        text: text.as_ref().clone(),
+                    },
                     Err(e) => {
                         usage.duration_ms = started.elapsed().as_millis() as u64;
                         return Err(fail(error_codes::UNSUPPORTED, e.to_string(), usage.clone()));
@@ -1829,4 +1879,39 @@ async fn run_stage(
             }
         };
     }
+}
+
+/// Extracted text for `handle`, extracting only on the first ask.
+///
+/// A `String` behind an `Arc` because a large PDF's text is megabytes and
+/// every page of a walk would otherwise clone it.
+fn doc_text(
+    cache: &mut std::collections::HashMap<u32, std::sync::Arc<String>>,
+    handle: u32,
+    path: &std::path::Path,
+) -> anyhow::Result<std::sync::Arc<String>> {
+    if let Some(hit) = cache.get(&handle) {
+        return Ok(hit.clone());
+    }
+    let text = std::sync::Arc::new(crate::documents::document_text(path)?);
+    cache.insert(handle, text.clone());
+    Ok(text)
+}
+
+/// The page-tree count for `handle`, read once.
+///
+/// Zero when the document cannot be loaded: this value exists only to make
+/// an error message more informative, so failing to obtain it must never
+/// turn into a second failure.
+fn doc_page_count(
+    cache: &mut std::collections::HashMap<u32, u32>,
+    handle: u32,
+    path: &std::path::Path,
+) -> u32 {
+    if let Some(hit) = cache.get(&handle) {
+        return *hit;
+    }
+    let count = crate::documents::page_count(path).unwrap_or(0);
+    cache.insert(handle, count);
+    count
 }

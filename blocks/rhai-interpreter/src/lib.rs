@@ -503,6 +503,66 @@ impl RhaiBlock {
         }
         {
             let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            // The vision path. Without this a script could render a page with
+            // `page_image` and then have no way to show it to a model, which
+            // made OCR of a scanned document reachable only from a Rust block
+            // -- and a Rust block needs a wasm32 toolchain that real users
+            // repeatedly turn out not to have.
+            engine.register_fn(
+                "infer_with_images",
+                move |prompt: &str,
+                      max_tokens: i64,
+                      images: rhai::Array|
+                      -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    // Handles are integers; anything else is a script bug
+                    // worth naming rather than silently dropping, since a
+                    // dropped image means the model answers about nothing
+                    // and sounds confident doing it.
+                    let mut handles = Vec::with_capacity(images.len());
+                    for (i, value) in images.iter().enumerate() {
+                        match value.as_int() {
+                            Ok(h) => handles.push(h.max(0) as u32),
+                            Err(actual) => {
+                                return Err(format!(
+                                    "infer_with_images: image {i} is {actual}, not a handle \
+                                     -- pass the `handle` field, as in \
+                                     `infer_with_images(p, n, [img.handle])`"
+                                )
+                                .into())
+                            }
+                        }
+                    }
+                    issue_or_replay(
+                        Command::Infer {
+                            prompt: prompt.to_string(),
+                            max_tokens: max_tokens.max(0) as u32,
+                            images: handles,
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
+                "document_text",
+                move |handle: i64| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::DocumentText {
+                            handle: handle.max(0) as u32,
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
             engine.register_fn(
                 "page_image",
                 move |handle: i64, page: i64| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {

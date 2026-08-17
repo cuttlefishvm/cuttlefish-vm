@@ -10,7 +10,7 @@ use cuttlefish_core::graph::{Branches, Node, NodeGraph};
 use cuttlefish_host::caps::Capabilities;
 use cuttlefish_host::catalog::{ArtifactKind, Catalog, ResolutionContext};
 use cuttlefish_host::dag::{check_graph, CheckedNode};
-use cuttlefish_host::infer::StubBackend;
+use cuttlefish_host::infer::{InferBackend, InferRequest, InferResult, StubBackend};
 use cuttlefish_host::module_cache::ModuleCache;
 use cuttlefish_host::pipeline::resolve_and_load;
 use cuttlefish_host::runner::{run_job, JobSpec};
@@ -671,4 +671,234 @@ async fn a_rhai_script_resizes_an_image_through_the_real_host() {
     // 2:1 fitted into a square box, aspect ratio preserved.
     assert_eq!(result["width"], 100);
     assert_eq!(result["height"], 50);
+}
+
+/// `document_text` returns the whole document, and a page walk over the same
+/// handle extracts once rather than once per page.
+///
+/// Measured as a **ratio against a single read**, not against a stopwatch.
+/// An absolute bound was tried first and failed on CI at 119s where the same
+/// code took 5s locally — the same mistake, and the same fix, as the submit
+/// timing test: subtract the machine by comparing two measurements taken on
+/// it, rather than guessing a constant that holds everywhere.
+///
+/// That first failure was not a flake. It caught a real defect: the text was
+/// cached, but the page-tree count was then fetched per call via `inspect`,
+/// which extracts the whole document to answer `has_text_layer`. The walk
+/// stayed quadratic with the cost merely moved.
+#[tokio::test]
+async fn document_text_reads_the_whole_pdf_and_a_page_walk_extracts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/docs/sample.pdf");
+    let local = dir.path().join("sample.pdf");
+    std::fs::copy(&pdf, &local).unwrap();
+
+    async fn timed(
+        script: &str,
+        path: &std::path::Path,
+        dir: &std::path::Path,
+    ) -> (serde_json::Value, std::time::Duration) {
+        let (tx, _rx) = mpsc::channel(64);
+        let job = JobSpec {
+            nodes: vec![script_node(script)],
+            exclusive_to: HashMap::new(),
+            input: serde_json::json!({ "path": path.to_str().unwrap() }),
+            caps: Capabilities::new(vec![dir.to_path_buf()]),
+            alternates: Default::default(),
+        };
+        let ledger = cuttlefish_host::ledger::Ledger::open(
+            &dir.join(format!("ledger-{}.sqlite", script.len())),
+            "fp",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let envelope = run_job(
+            Arc::new(Engine::default()),
+            Arc::new(StubBackend::default()),
+            job,
+            tx,
+            CancellationToken::new(),
+            &ledger,
+            &ModuleCache::new(),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+        (envelope.result.expect("a result"), elapsed)
+    }
+
+    // One read, as the baseline: process start, wasm instantiation, and
+    // exactly one extraction.
+    let (one, one_took) = timed(
+        r#"
+        let f = open(input.path);
+        let whole = document_text(f.handle);
+        #{ len: whole.text.len() }
+        "#,
+        &local,
+        dir.path(),
+    )
+    .await;
+
+    // Eleven reads of the same handle. Uncached, that is eleven extractions.
+    let (many, many_took) = timed(
+        r#"
+        let f = open(input.path);
+        let whole = document_text(f.handle);
+        let n = 0;
+        for i in [0,0,0,0,0,0,0,0,0,0] {
+            n += page_text(f.handle, 0).text.len();
+        }
+        #{ len: whole.text.len(), walked: n }
+        "#,
+        &local,
+        dir.path(),
+    )
+    .await;
+
+    let len = one["len"].as_u64().unwrap();
+    assert!(len > 0, "the document must have text: {one}");
+    // Each read returned the same segment, which also proves page 0 of an
+    // unsplit document is the whole document rather than nothing.
+    assert_eq!(many["walked"].as_u64().unwrap(), len * 10);
+
+    // Eleven cached reads must cost far less than eleven extractions. Five
+    // times the single-read cost is a generous ceiling that still catches an
+    // order-of-magnitude regression: uncached, this would be about eleven.
+    assert!(
+        many_took < one_took * 5,
+        "eleven reads took {many_took:?} against {one_took:?} for one — that ratio \
+         says the per-handle extraction is happening again per call"
+    );
+}
+
+/// A backend that reports how many images it was handed.
+///
+/// The assertion that matters for the vision path is not what a model says
+/// but whether the image reached it at all: a dropped image produces a
+/// confident answer about nothing, which is indistinguishable downstream
+/// from a real one.
+#[derive(Default)]
+struct ImageCountingBackend;
+
+#[async_trait::async_trait]
+impl InferBackend for ImageCountingBackend {
+    async fn infer(
+        &self,
+        req: InferRequest<'_>,
+        _on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
+    ) -> anyhow::Result<InferResult> {
+        Ok(InferResult {
+            text: format!("saw {} image(s)", req.images.len()),
+            tokens_in: 0,
+            tokens_out: 0,
+        })
+    }
+    fn model_name(&self) -> String {
+        "image-counting".into()
+    }
+    fn supports_images(&self) -> bool {
+        true
+    }
+}
+
+/// A script can hand an image to a vision model.
+///
+/// This is the last link in the scanned-document path: `open` reports
+/// `has_text_layer: false`, `page_image` renders the page, and this sends it
+/// to a model. Before `infer_with_images` existed a script could do the
+/// first two and then had nowhere to go — OCR was reachable only from a Rust
+/// block, which needs a wasm32 toolchain that users repeatedly lack.
+#[tokio::test]
+async fn a_script_can_send_an_image_to_a_vision_model() {
+    let dir = tempfile::tempdir().unwrap();
+    // A real PNG, so the host classifies it as an image and the handle is
+    // the same kind a rendered page produces.
+    let png = dir.path().join("page.png");
+    std::fs::write(
+        &png,
+        [
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0,
+            0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89,
+        ],
+    )
+    .unwrap();
+
+    let script = r#"
+        let f = open(input.path);
+        #{ answer: infer_with_images("Read this page.", 64, [f.handle]) }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": png.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(ImageCountingBackend),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(
+        result["answer"], "saw 1 image(s)",
+        "the image must reach the backend, not be silently dropped: {result}"
+    );
+}
+
+#[tokio::test]
+async fn passing_something_that_is_not_a_handle_says_so() {
+    // A dropped or malformed image is the failure that hides: the model
+    // answers about nothing and sounds certain. Naming it beats guessing.
+    let dir = tempfile::tempdir().unwrap();
+    let doc = dir.path().join("x.txt");
+    std::fs::write(&doc, "hello").unwrap();
+
+    let script = r#"
+        let f = open(input.path);
+        #{ answer: infer_with_images("Read it.", 16, ["not-a-handle"]) }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": doc.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(ImageCountingBackend),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+    let message = envelope.error.unwrap().message;
+    assert!(
+        message.contains("not a handle"),
+        "must name the mistake: {message}"
+    );
 }
