@@ -331,3 +331,71 @@ fn a_ledger_without_the_drain_columns_gains_them_and_still_resumes() {
         .unwrap();
     assert!(ledger.item_concluded("map", 4).unwrap());
 }
+
+#[test]
+fn a_read_only_open_never_writes_to_the_ledger() {
+    // Load-bearing, not tidy. `Ledger::open` runs CREATE TABLE / ALTER TABLE
+    // to bring a ledger up to date, and DDL takes an exclusive lock — so
+    // *listing* escalations across every job on the machine could lock the
+    // ledger of a job that is currently running and fail it. That is exactly
+    // what happened: a resume test failed roughly one run in three until the
+    // escalations walk stopped opening other jobs' ledgers for writing.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    {
+        let ledger = Ledger::open(&path, "fp").unwrap();
+        ledger
+            .write_escalated(
+                "map",
+                Some(0),
+                "gave up",
+                Some(&serde_json::json!({"n": 1})),
+            )
+            .unwrap();
+    }
+
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let reader = Ledger::open_read_only(&path).expect("an existing ledger must open read-only");
+    assert_eq!(reader.escalations().unwrap().len(), 1, "it must still read");
+    // A write attempt through a read-only handle has to fail rather than
+    // silently succeed, or the guarantee is worthless.
+    assert!(
+        reader.mark_drained("map", Some(0)).is_err(),
+        "a read-only ledger must refuse writes"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before,
+        "opening and reading must not modify the file"
+    );
+}
+
+#[test]
+fn a_ledger_without_the_drain_columns_still_reads_read_only() {
+    // A read-only open cannot migrate, so the query has to tolerate the older
+    // shape rather than erroring on a missing column. Such rows genuinely
+    // have no input, which is what they report.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE checkpoints (
+                node_name TEXT NOT NULL, item_index INTEGER NOT NULL DEFAULT -1,
+                status TEXT NOT NULL, output_json TEXT, error_text TEXT,
+                completed_at TEXT NOT NULL, PRIMARY KEY (node_name, item_index));
+             CREATE TABLE job_status (status TEXT NOT NULL, graph_fingerprint TEXT NOT NULL);
+             INSERT INTO job_status VALUES ('failed', 'fp');
+             INSERT INTO checkpoints VALUES ('map', 3, 'escalated', NULL, 'ancient', 'then');",
+        )
+        .unwrap();
+    }
+
+    let reader = Ledger::open_read_only(&path).unwrap();
+    let rows = reader
+        .escalations()
+        .expect("an older ledger must still read");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].reason, "ancient");
+    assert!(rows[0].input.is_none(), "it has no input, and says so");
+}
