@@ -26,8 +26,8 @@
 //!
 //! That does not work for tests: a libtest binary cannot re-exec itself, because
 //! libtest would read the worker's arguments as test filters. So
-//! [`WORKER_EXE_ENV`] can name an executable instead, and the crate ships a
-//! `cuttlefish-render-worker` binary for exactly that purpose.
+//! `WORKER_EXE_ENV` can name an executable instead, and
+//! the crate ships a `cuttlefish-render-worker` binary for that purpose.
 //!
 //! The cost is one process spawn per rendered page. Against the render itself
 //! and the vision-model inference that follows it, that is not measurable.
