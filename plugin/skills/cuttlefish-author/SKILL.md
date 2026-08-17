@@ -317,14 +317,36 @@ if f.kind.has_text_layer {
 #{ text: text }
 ```
 
-Two things to know before relying on it:
+Rendering has **three** prerequisites, and missing any one of them fails in
+a way that does not obviously point at rendering. In order:
 
-- **`page_image` needs the `pdf-render` feature**, which is off by default
-  because pdfium is a large native dependency. Without it, rendering fails
-  naming the feature rather than returning a blank page.
-- **The model must accept images.** Ollama does; a text-only backend
-  refuses loudly rather than answering about nothing, which is the failure
-  that would otherwise read as a bad model instead of a misconfigured job.
+1. **Build the daemon with the feature** — `cargo build -p cuttlefishd
+   --features pdf-render`. Enabling it only on `cuttlefish-host` is not
+   enough: rendering runs out-of-process by re-invoking the daemon binary,
+   so that binary needs the feature too.
+2. **Install pdfium.** It is a *runtime* dependency, not a build-time one,
+   so a successful build proves nothing. Download a prebuilt library from
+   `github.com/bblanchon/pdfium-binaries/releases` and
+   `export PDFIUM_DYNAMIC_LIB_PATH=/path/to/pdfium/lib`.
+3. **Use a model that accepts images.** Ollama does — `glm-ocr` and the
+   vision-capable families work. A text-only backend refuses loudly rather
+   than answering about nothing.
+
+A document that already has a text layer needs none of this: check
+`has_text_layer` first and use `document_text`, which is both cheaper and
+more accurate than reading pixels.
+
+**`infer_with_images` returns a string, not a record.** Write
+`let text = infer_with_images(...)`, not `.text` — only `document_text` and
+`slice` return records.
+
+**Expect packaging artifacts in OCR output.** Vision models routinely add
+markdown fences, horizontal rules, and occasionally repeat a block. On a
+real four-page scan every page came back with the content correct and some
+wrapper around it. An `accept` schema that only checks length will pass all
+of it, so use a `Judge` or a stricter schema if the text feeds a knowledge
+base — and do the tidying in a downstream Rhai block rather than hoping the
+prompt prevents it.
 
 Pass the `handle` field, not the record: `[img.handle]`, not `[img]`. The
 wrong shape is named as an error rather than dropped, because a dropped

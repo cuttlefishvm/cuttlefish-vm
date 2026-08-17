@@ -167,6 +167,70 @@ fn candidate_starts_with(candidate: &[std::ffi::OsString], root: &[std::ffi::OsS
     candidate.len() >= root.len() && candidate[..root.len()] == *root
 }
 
+impl Spec {
+    /// Refuse a spec whose host-read paths sit outside its granted roots.
+    ///
+    /// Fan-out manifests and acceptance schemas are read by the *host*,
+    /// which is not sandboxed — so nothing would otherwise stop either
+    /// reading a path the spec never granted. Requiring them inside a
+    /// declared `Read` root keeps the capability list a truthful description
+    /// of everything the job touches, which is the property the whole
+    /// capability model rests on.
+    ///
+    /// Call this **after** resolving `read_roots`, `over` and schema paths
+    /// against the spec's directory, so both sides are absolute and
+    /// canonical. Comparing them as written cannot work: a spec that grants
+    /// an absolute root and names a relative manifest is entirely ordinary,
+    /// and lexically a relative path never starts with an absolute one.
+    pub fn validate_host_read_paths(&self) -> Result<(), SpecError> {
+        for (name, node) in &self.nodes.nodes {
+            if let Some(manifest) = &node.over {
+                if !self
+                    .read_roots
+                    .iter()
+                    .any(|root| path_covers(root, manifest))
+                {
+                    return Err(SpecError::Malformed(format!(
+                        "node `{name}`'s manifest {} is outside every path granted by \
+                         `capabilities` — add a `Read` covering it. Granted: {}",
+                        manifest.display(),
+                        roots_for_error(&self.read_roots)
+                    )));
+                }
+            }
+            for check in &node.accept {
+                if let crate::graph::AcceptCheck::Schema(schema) = check {
+                    if !self.read_roots.iter().any(|root| path_covers(root, schema)) {
+                        return Err(SpecError::Malformed(format!(
+                            "node `{name}`'s accept schema {} is outside every path granted \
+                             by `capabilities` — add a `Read` covering it. Granted: {}",
+                            schema.display(),
+                            roots_for_error(&self.read_roots)
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Granted roots, for an error message.
+///
+/// Listed because the failure is nearly always a path that looks right: the
+/// grant and the target differ by a symlink, or by one being relative. Naming
+/// what *was* granted turns a guess into a comparison.
+fn roots_for_error(roots: &[PathBuf]) -> String {
+    if roots.is_empty() {
+        return "(nothing)".to_string();
+    }
+    roots
+        .iter()
+        .map(|r| r.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Parse a spec.
 ///
 /// Recursive descent over tokens, not splitting on punctuation — see
@@ -320,34 +384,14 @@ impl<'a> Parser<'a> {
         let read_roots = read_roots.ok_or(SpecError::MissingField("capabilities"))?;
         let nodes = nodes.ok_or(SpecError::MissingField("block"))?;
 
-        // Fan-out manifests and acceptance schemas are both read by the
-        // *host*, which is not sandboxed — so nothing would stop either
-        // reading a path the spec never granted. Requiring them inside a
-        // declared `Read` root keeps the capability list a truthful
-        // description of everything the job touches, which is the property
-        // the whole capability model rests on.
-        for (name, node) in &nodes.nodes {
-            if let Some(manifest) = &node.over {
-                if !read_roots.iter().any(|root| path_covers(root, manifest)) {
-                    return Err(SpecError::Malformed(format!(
-                        "node `{name}`'s manifest {} is outside every path granted by \
-                         `capabilities` — add a `Read` for it",
-                        manifest.display()
-                    )));
-                }
-            }
-            for check in &node.accept {
-                if let crate::graph::AcceptCheck::Schema(schema) = check {
-                    if !read_roots.iter().any(|root| path_covers(root, schema)) {
-                        return Err(SpecError::Malformed(format!(
-                            "node `{name}`'s accept schema {} is outside every path granted by \
-                             `capabilities` — add a `Read` for it",
-                            schema.display()
-                        )));
-                    }
-                }
-            }
-        }
+        // The equivalent check on manifests and acceptance schemas lives in
+        // `validate_host_read_paths`, called once these paths have been
+        // resolved against the spec's directory. It cannot be done here: a
+        // spec may grant an absolute root and name a relative manifest, and
+        // comparing those as written is not merely imprecise but *always*
+        // wrong — a relative path can never begin with an absolute one, so
+        // every such spec was rejected regardless of where the file actually
+        // sat.
 
         Ok(Spec {
             name,

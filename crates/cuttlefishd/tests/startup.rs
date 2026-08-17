@@ -223,3 +223,42 @@ async fn cancelling_an_interrupted_job_persists_to_its_ledger() {
          it Interrupted, discarding the cancel decision"
     );
 }
+
+/// A binary spawned as a render worker must recognise that, even when it
+/// cannot render.
+///
+/// The failure this pins: `cuttlefish-host` can carry `pdf-render` while the
+/// daemon binary does not, because they are separate features and enabling
+/// only the host's compiles fine. Rendering then spawns this binary as a
+/// worker, the worker argument goes unrecognised, and the daemon parses it
+/// as its own arguments — answering a render request with usage text, which
+/// surfaces as a per-item job failure reading `Error: usage: cuttlefishd
+/// <spec> ...`. That names neither rendering nor the feature.
+#[test]
+fn a_render_worker_invocation_is_never_mistaken_for_a_usage_error() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cuttlefishd"))
+        .args([
+            "--__cuttlefish_render_worker",
+            "/nonexistent.pdf",
+            "0",
+            "256",
+        ])
+        .output()
+        .expect("cuttlefishd should run");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("usage: cuttlefishd"),
+        "a worker invocation must never fall through to argument parsing: {combined}"
+    );
+    // Whether it renders or refuses depends on the feature; either way it
+    // must speak about rendering.
+    assert!(
+        combined.to_lowercase().contains("render") || combined.contains("pdfium"),
+        "the failure must name rendering: {combined}"
+    );
+}

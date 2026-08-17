@@ -17,7 +17,10 @@ async fn main() -> anyhow::Result<()> {
     // First, before argument parsing or anything else: this process may be a
     // render worker that the daemon spawned, in which case it renders one page
     // and exits. Doing this later would have a worker try to start a daemon.
-    #[cfg(feature = "pdf-render")]
+    // Unconditional: a build without `pdf-render` still has to recognise
+    // the worker argument, because the *host* library may have the feature
+    // even when this binary does not. That mismatch used to answer a render
+    // request with this program's usage text.
     cuttlefish_host::render_worker::run_if_worker();
 
     let usage = "usage: cuttlefishd <spec> [--wasm <path>] [endpoint]";
@@ -56,7 +59,24 @@ async fn main() -> anyhow::Result<()> {
     let spec_dir = spec_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    spec.read_roots = spec.read_roots.iter().map(|r| spec_dir.join(r)).collect();
+    // Canonicalized, not merely joined. A grant and the path being checked
+    // have to be the *same string* to match, and on macOS `/tmp` is a symlink
+    // to `/private/tmp` — so `Read "/tmp/corpus"` failed to cover a manifest
+    // the host had already resolved to `/private/tmp/corpus`. Same directory,
+    // no match, and an error that only said "outside every path granted",
+    // which reads as a permissions mistake rather than a symlink one.
+    //
+    // A root that does not exist yet is kept as-is rather than dropped:
+    // granting a directory a job will create is legitimate, and silently
+    // discarding the grant would deny access for a reason nothing states.
+    spec.read_roots = spec
+        .read_roots
+        .iter()
+        .map(|r| {
+            let joined = spec_dir.join(r);
+            std::fs::canonicalize(&joined).unwrap_or(joined)
+        })
+        .collect();
     // Fan-out manifests are spec-relative for exactly the same reason, and
     // are read by the host rather than a block — so if this resolution were
     // skipped, a daemon started from another directory would read the wrong
@@ -70,14 +90,24 @@ async fn main() -> anyhow::Result<()> {
     // path was interpreted against the wrong directory.
     for (_, node) in spec.nodes.nodes.iter_mut() {
         if let Some(manifest) = node.over.take() {
-            node.over = Some(spec_dir.join(manifest));
+            let joined = spec_dir.join(manifest);
+            // Canonicalized for the same reason the read roots are: the
+            // capability check compares these two paths literally.
+            node.over = Some(std::fs::canonicalize(&joined).unwrap_or(joined));
         }
         for check in node.accept.iter_mut() {
             if let cuttlefish_core::graph::AcceptCheck::Schema(path) = check {
-                *path = spec_dir.join(&*path);
+                let joined = spec_dir.join(&*path);
+                *path = std::fs::canonicalize(&joined).unwrap_or(joined);
             }
         }
     }
+
+    // Now that manifests, schemas and roots are all resolved and canonical,
+    // the host-read paths can actually be compared. Doing this before
+    // resolution compared a relative manifest against an absolute grant,
+    // which is unanswerable rather than merely imprecise.
+    spec.validate_host_read_paths()?;
 
     // The spec names a provider; the registry decides what serves it. Adding a
     // backend therefore changes neither this file nor the spec parser.

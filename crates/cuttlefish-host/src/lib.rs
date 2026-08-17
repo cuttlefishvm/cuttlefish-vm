@@ -72,6 +72,12 @@ pub fn embedded_rhai_interpreter_bytes() -> &'static [u8] {
 }
 /// Rendering PDF pages out-of-process, so a renderer crash cannot take the
 /// daemon with it.
-#[cfg(feature = "pdf-render")]
+///
+/// Compiled unconditionally, unlike the rendering it performs. A binary that
+/// *might* be spawned as a worker has to recognise the worker argument even
+/// when it cannot render, or it falls through to its own argument parsing
+/// and answers a render request with usage text — which then surfaces as a
+/// per-item job failure reading `Error: usage: cuttlefishd <spec> ...` and
+/// says nothing about the real mismatch.
 pub mod render_worker;
 pub mod runner;

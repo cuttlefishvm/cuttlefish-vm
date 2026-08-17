@@ -170,11 +170,25 @@ pub(crate) fn render_page_in_process(
         _ => Pdfium::bind_to_system_library(),
     }
     .map_err(|e| {
+        // The instruction comes first and the loader's own error last, on
+        // purpose. `dlopen` failures print every path they tried, which runs
+        // to hundreds of characters and pushes the actionable part out of
+        // any truncated view — so the reader sees a wall of paths and no
+        // remedy. Lead with what to do.
         anyhow::anyhow!(
-            "could not load the pdfium shared library ({e}). It is a runtime \
-             dependency of the `pdf-render` feature, not a build-time one: \
-             install pdfium-binaries and set PDFIUM_DYNAMIC_LIB_PATH to its lib \
-             directory, or use the document's text layer instead."
+            "pdfium is missing. It is a *runtime* dependency of the `pdf-render` feature, \
+             not a build-time one, so building with the feature is not enough — the shared \
+             library has to be on the system separately.\n\
+             \n\
+             Fix: download a prebuilt pdfium for this platform from \
+             https://github.com/bblanchon/pdfium-binaries/releases, then point cuttlefish \
+             at the directory holding it:\n\
+             \n    export PDFIUM_DYNAMIC_LIB_PATH=/path/to/pdfium/lib\n\
+             \n\
+             Or avoid rendering altogether: a document with a text layer needs none of \
+             this — check `has_text_layer` and use `document_text`.\n\
+             \n\
+             The loader reported: {e}"
         )
     })?;
     let pdfium = Pdfium::new(bindings);
