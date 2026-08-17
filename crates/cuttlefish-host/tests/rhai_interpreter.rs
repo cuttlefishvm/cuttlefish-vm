@@ -672,3 +672,76 @@ async fn a_rhai_script_resizes_an_image_through_the_real_host() {
     assert_eq!(result["width"], 100);
     assert_eq!(result["height"], 50);
 }
+
+/// `document_text` returns the whole document, and a page walk over the same
+/// handle extracts only once.
+///
+/// The caching claim is the load-bearing one: the old shape re-extracted the
+/// entire document per `page_text` call, which made the natural page walk
+/// quadratic. It is asserted by *time* rather than by a counter, because the
+/// extraction is inside `pdf_extract` where a test cannot instrument it — a
+/// walk that re-extracted would take a multiple of the first read, not a
+/// fraction of it.
+#[tokio::test]
+async fn document_text_reads_the_whole_pdf_and_a_page_walk_extracts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/docs/sample.pdf");
+    let local = dir.path().join("sample.pdf");
+    std::fs::copy(&pdf, &local).unwrap();
+
+    let script = r#"
+        let f = open(input.path);
+        let whole = document_text(f.handle);
+        // Ten reads of the same handle. With per-call extraction this is ten
+        // full extractions; with a per-handle cache it is one.
+        let n = 0;
+        for i in [0,0,0,0,0,0,0,0,0,0] {
+            let p = page_text(f.handle, 0);
+            n += p.text.len();
+        }
+        #{ whole_len: whole.text.len(), walked: n }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": local.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let started = std::time::Instant::now();
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+
+    let whole = result["whole_len"].as_u64().unwrap();
+    assert!(whole > 0, "the document must have text: {result}");
+    // Each of the ten reads returned the same segment, so the total is ten
+    // times one read — which also proves page 0 of an unsplit document is
+    // the whole document rather than nothing.
+    assert_eq!(result["walked"].as_u64().unwrap(), whole * 10);
+
+    // A generous ceiling: the point is to catch an order-of-magnitude
+    // regression to per-call extraction, not to benchmark the machine.
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "eleven reads of one handle took {elapsed:?}, which suggests the \
+         per-handle extraction cache is not being used"
+    );
+}

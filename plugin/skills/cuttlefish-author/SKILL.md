@@ -280,6 +280,25 @@ Two findings worth looking for, since both survive normal viewing: bytes
 after `IEND` (a payload in a file that still renders), and EXIF whose
 dimensions disagree with the actual header (re-encoded or tampered with).
 
+**Reading a PDF: use `document_text(handle)`.** It returns every character
+in the document, which is what most callers want and what the extractor
+produces internally anyway.
+
+Do **not** reach for `page_text(handle, 0)` to mean "the whole thing", and
+do not walk `0..kind.pages` expecting one page each. Those are two different
+counts:
+
+- `open().kind.pages` comes from the PDF's **page tree** — 227 for a
+  227-page filing.
+- `page_text` indexes **text segments**, which come from splitting the
+  extracted text on form feeds. Plenty of real PDFs carry none, so a
+  227-page document can expose exactly **one** addressable segment.
+
+When they disagree, `page_text(h, 1)` fails and says so, naming both counts.
+Walking pages is still fine when a document genuinely has them — the
+extraction is cached per handle, so a page walk costs one extraction, not
+one per page.
+
 **Spreadsheets** need a real reader, so they are a block rather than a
 builtin: `sheet-extract` (XLSX/XLSM/XLS). An XLSX opens as `kind: "binary"`
 with zero characters, so no amount of `slice`/`page_text` reaches the

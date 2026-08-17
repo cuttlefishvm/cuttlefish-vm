@@ -504,6 +504,22 @@ impl RhaiBlock {
         {
             let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
             engine.register_fn(
+                "document_text",
+                move |handle: i64| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::DocumentText {
+                            handle: handle.max(0) as u32,
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            engine.register_fn(
                 "page_image",
                 move |handle: i64, page: i64| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
                     issue_or_replay(

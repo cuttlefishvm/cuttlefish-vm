@@ -65,10 +65,11 @@ fn a_page_that_yields_no_text_fails_rather_than_returning_empty() {
     // text it found. When those disagree, returning "" would make a caller
     // summarize nothing and report success.
     //
-    // Page 0 of the sample extracts fine, so this asks for a page that the tree
-    // does not have — the out-of-range path — and then the harder case is
-    // covered by the assertion in `page_text` itself.
-    let err = documents::page_text(&sample_pdf(), 5).unwrap_err();
+    // Page 0 of the sample extracts fine, so this asks for a page beyond what
+    // the extracted text can address — the out-of-range path — and the harder
+    // case is covered by the assertions in `documents`' own tests.
+    let text = documents::document_text(&sample_pdf()).unwrap();
+    let err = documents::page_text_from(&text, 5, 1).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("out of range"),
@@ -79,7 +80,8 @@ fn a_page_that_yields_no_text_fails_rather_than_returning_empty() {
 #[test]
 fn an_extractable_page_still_returns_its_text() {
     // The guard above must not have made the working path fail.
-    let text = documents::page_text(&sample_pdf(), 0).expect("page 0 extracts");
+    let whole = documents::document_text(&sample_pdf()).expect("the document extracts");
+    let text = documents::page_text_from(&whole, 0, 1).expect("segment 0 extracts");
     assert!(text.to_lowercase().contains("cuttlefish"), "got: {text:?}");
 }
 

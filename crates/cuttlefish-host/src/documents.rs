@@ -54,36 +54,64 @@ pub fn inspect(path: &Path) -> anyhow::Result<DocumentInfo> {
     })
 }
 
-/// Extract one page's text, zero-based.
-pub fn page_text(path: &Path, page: u32) -> anyhow::Result<String> {
-    // pdf_extract works a whole document at a time, so this extracts everything
-    // and takes the page wanted. Wasteful for a large document read page by
-    // page, and worth replacing when that becomes a real workload rather than a
-    // hypothetical one.
-    let doc = lopdf::Document::load(path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-    let count = doc.get_pages().len() as u32;
-    if page >= count {
-        anyhow::bail!("page {page} is out of range; the document has {count}");
-    }
+/// Every character of text in the document, in one call.
+///
+/// This is what `pdf_extract` produces internally and what most callers
+/// actually want. It exists as its own entry point because the only way to
+/// ask for it used to be `page_text(handle, 0)`, which *reads* like "give me
+/// the first page" and silently meant something else whenever the extractor
+/// emitted no page breaks.
+pub fn document_text(path: &Path) -> anyhow::Result<String> {
+    pdf_extract::extract_text(path)
+        .map_err(|e| anyhow::anyhow!("extracting text from {}: {e}", path.display()))
+}
 
-    let text = pdf_extract::extract_text(path)
-        .map_err(|e| anyhow::anyhow!("extracting text from {}: {e}", path.display()))?;
+/// How many text segments [`page_text_from`] can actually address.
+///
+/// Deliberately not the same number as [`DocumentInfo::pages`], and that is
+/// the entire point. `pages` comes from the PDF's page tree; this comes from
+/// splitting the extracted text on form feeds, which is all `pdf_extract`
+/// gives us to locate a page boundary with. For many real documents — every
+/// PDF in the CMS section 1115 corpus, for instance — the extractor emits no
+/// form feeds at all, so a 227-page document has exactly one addressable
+/// segment.
+///
+/// Two numbers with the same name meaning different things is what made the
+/// old failure so confusing. Now both are computable, so an error can name
+/// them both.
+pub fn text_segments(text: &str) -> usize {
+    text.split('\u{c}').count()
+}
 
-    // Page breaks are form feeds in pdf_extract's output. When they are absent —
-    // a single-page document, or one it did not mark — the whole text is the
-    // only sensible answer for page zero.
-    let pages: Vec<&str> = text.split('\u{c}').collect();
-    match pages.get(page as usize) {
+/// Take one segment of already-extracted text, zero-based.
+///
+/// Separated from extraction so a caller reading a document page by page
+/// pays for the extraction once rather than once per page. The old shape
+/// re-extracted the whole document on every call, which made the natural
+/// page-walk quadratic — a 342-page filing meant 342 full extractions, and
+/// on a corpus of thousands that is not slow, it is unrunnable.
+pub fn page_text_from(text: &str, page: u32, page_tree_count: u32) -> anyhow::Result<String> {
+    let segments: Vec<&str> = text.split('\u{c}').collect();
+    match segments.get(page as usize) {
         Some(found) => Ok(found.to_string()),
-        None if page == 0 => Ok(text),
+        // A document the extractor never split still has all its text, and
+        // page zero is the only sensible place to hand it back.
+        None if page == 0 => Ok(text.to_string()),
         // Returning an empty string here would be a silent wrong answer: the
-        // caller would summarize nothing and report success. The page exists
-        // according to the document's own page tree, so failing to extract it is
-        // a real failure and says so.
+        // caller would summarize nothing and report success.
+        //
+        // The message names both counts, because the difference between them
+        // *is* the problem. Its predecessor said the page "may be scanned"
+        // and to check `has_text_layer` — advice that sent at least one real
+        // user toward replacing the extractor, when `has_text_layer` was
+        // `true` and the text was right there in segment zero.
         None => anyhow::bail!(
-            "page {page} exists but no text could be extracted for it; \
-             the page may be scanned — check `has_text_layer` and render it instead"
+            "page {page} is out of range for extracted text: this document exposes \
+             {} addressable text segment(s), though its page tree reports {page_tree_count} \
+             page(s). The extractor emitted no page break there, so the text for page \
+             {page} is not separately addressable — read the whole document with \
+             `document_text` instead, or render the page if it is genuinely scanned.",
+            segments.len()
         ),
     }
 }
@@ -178,4 +206,50 @@ pub fn render_page(_path: &Path, _page: u32, _width: u16) -> anyhow::Result<Vec<
         "this build cannot render PDF pages to images: rebuild with the \
          `pdf-render` feature, or use the document's text layer instead"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_document_the_extractor_never_split_is_all_of_segment_zero() {
+        // The shape of every PDF in the CMS 1115 corpus: real text, no form
+        // feeds. Page zero must be the whole thing rather than nothing.
+        let text = "227 pages of policy with no page breaks at all";
+        assert_eq!(text_segments(text), 1);
+        assert_eq!(page_text_from(text, 0, 227).unwrap(), text);
+    }
+
+    #[test]
+    fn asking_past_the_last_segment_names_both_counts_and_neither_blames_a_scan() {
+        // The message this replaces said the page "may be scanned" and to
+        // check `has_text_layer` — which was `true`, with the text sitting
+        // in segment zero. A real user followed that advice toward replacing
+        // the extractor entirely.
+        let err = page_text_from("one segment only", 1, 227)
+            .expect_err("page 1 of a single-segment document must fail");
+        let message = err.to_string();
+
+        assert!(message.contains("1 addressable text segment"), "{message}");
+        assert!(message.contains("227 page(s)"), "{message}");
+        assert!(
+            message.contains("document_text"),
+            "the remedy must be the one that works: {message}"
+        );
+        assert!(
+            !message.contains("has_text_layer"),
+            "must not send the reader back to a flag that is already true: {message}"
+        );
+    }
+
+    #[test]
+    fn a_document_with_real_page_breaks_still_indexes_by_page() {
+        // The case the old code got right, which must keep working.
+        let text = "first\u{c}second\u{c}third";
+        assert_eq!(text_segments(text), 3);
+        assert_eq!(page_text_from(text, 0, 3).unwrap(), "first");
+        assert_eq!(page_text_from(text, 2, 3).unwrap(), "third");
+        assert!(page_text_from(text, 3, 3).is_err());
+    }
 }
