@@ -389,17 +389,74 @@ fn over_and_repeat_until_on_one_node_is_rejected() {
 
 #[test]
 fn a_manifest_outside_every_read_root_is_rejected() {
-    let err = parse_spec(
+    // The check now runs on resolved paths, so parsing succeeds and
+    // `validate_host_read_paths` is what refuses. Both sides here are
+    // relative and stay comparable, which is the case that always worked.
+    let spec = parse_spec(
         r#"spec s = {
   description = "d"; model = Stub "x"; data_policy = Any;
   capabilities = [ Read "./corpus" ];
   nodes = { a = { block = "a@1"; over = "./elsewhere/manifest.jsonl"; }; };
 }"#,
     )
-    .expect_err("a manifest outside the read roots must be rejected");
+    .expect("this parses; the path check is a separate step");
+
+    let err = spec
+        .validate_host_read_paths()
+        .expect_err("a manifest outside the read roots must be rejected");
     let msg = err.to_string();
     assert!(msg.contains("elsewhere/manifest.jsonl"), "{msg}");
     assert!(msg.contains("capabilities"), "{msg}");
+    // The granted roots are listed, because the failure is nearly always a
+    // path that looks right and differs by a symlink or by being relative.
+    assert!(
+        msg.contains("./corpus"),
+        "must name what was granted: {msg}"
+    );
+}
+
+/// An absolute grant with a relative manifest is ordinary, and used to be
+/// rejected outright.
+///
+/// This is the bug that surfaced running a real OCR pipeline: `capabilities
+/// = [ Read "/tmp/work" ]` with `over = "./corpus/m.jsonl"` failed with
+/// "outside every path granted", which reads as a permissions mistake. It is
+/// not — lexically a relative path can never begin with an absolute one, so
+/// *every* spec of this shape was refused no matter where the files were.
+/// Resolving both against the spec's directory first is what makes the
+/// question answerable at all.
+#[test]
+fn an_absolute_grant_covers_a_relative_manifest_once_both_are_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir_all(root.join("corpus")).unwrap();
+    std::fs::write(root.join("corpus/m.jsonl"), "{}\n").unwrap();
+
+    let mut spec = parse_spec(&format!(
+        r#"spec s = {{
+  description = "d"; model = Stub "x"; data_policy = Any;
+  capabilities = [ Read "{}" ];
+  nodes = {{ a = {{ block = "a@1"; over = "./corpus/m.jsonl"; }}; }};
+}}"#,
+        root.display()
+    ))
+    .expect("a spec of this shape must parse");
+
+    // What cuttlefishd does before validating: resolve everything against
+    // the spec's own directory, then canonicalize.
+    spec.read_roots = spec
+        .read_roots
+        .iter()
+        .map(|r| std::fs::canonicalize(root.join(r)).unwrap_or_else(|_| root.join(r)))
+        .collect();
+    for (_, node) in spec.nodes.nodes.iter_mut() {
+        if let Some(m) = node.over.take() {
+            node.over = Some(std::fs::canonicalize(root.join(&m)).unwrap_or(root.join(m)));
+        }
+    }
+
+    spec.validate_host_read_paths()
+        .expect("an absolute grant covering the manifest's real location must pass");
 }
 
 /// `./corpus` and `corpus` name the same directory. A naive
@@ -540,15 +597,21 @@ fn a_node_without_on_fail_has_no_ladder() {
 
 #[test]
 fn a_schema_path_outside_every_read_root_is_rejected() {
-    // Same rule and same reason as a fan-out manifest: the host reads it,
-    // and the host is not sandboxed.
-    let err = parse_spec(
+    // Same move as the manifest check: parsing succeeds, and the path check
+    // is its own step on resolved paths.
+    let spec = parse_spec(
         r#"spec s = {
   description = "d"; model = Stub "x"; data_policy = Any;
-  capabilities = [ Read "./schemas" ];
+  capabilities = [ Read "./corpus" ];
   nodes = { a = { block = "a@1"; accept = [ Schema "./elsewhere/v.json" ]; }; };
 }"#,
     )
-    .expect_err("a schema outside the read roots must be rejected");
-    assert!(err.to_string().contains("elsewhere/v.json"), "{err}");
+    .expect("this parses; the path check is a separate step");
+
+    let err = spec
+        .validate_host_read_paths()
+        .expect_err("a schema outside the read roots must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("elsewhere/v.json"), "{msg}");
+    assert!(msg.contains("capabilities"), "{msg}");
 }

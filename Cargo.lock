@@ -1038,6 +1038,7 @@ dependencies = [
 name = "cuttlefish-core"
 version = "0.0.8"
 dependencies = [
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

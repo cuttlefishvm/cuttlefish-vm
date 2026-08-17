@@ -32,7 +32,11 @@
 //! The cost is one process spawn per rendered page. Against the render itself
 //! and the vision-model inference that follows it, that is not measurable.
 
-use std::io::{Read, Write};
+// `Write` is only reached by the rendering path, which is feature-gated —
+// importing it unconditionally warns in a build without the feature.
+use std::io::Read;
+#[cfg(feature = "pdf-render")]
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -57,28 +61,48 @@ pub fn run_if_worker() {
         return;
     };
 
-    let fail = |message: &str| -> ! {
-        eprintln!("{message}");
+    // Recognised, but this build cannot render. Say exactly that. The
+    // alternative — returning and letting the caller parse these arguments
+    // as its own — produced `Error: usage: cuttlefishd <spec> ...` as a
+    // per-item failure, which names neither rendering nor the feature and
+    // sends the reader looking at their spec.
+    #[cfg(not(feature = "pdf-render"))]
+    {
+        let _ = position;
+        eprintln!(
+            "this binary was spawned as a PDF render worker but was built without the \
+             `pdf-render` feature. The daemon binary does the rendering, so it needs the \
+             feature too: `cargo build -p cuttlefishd --features pdf-render`. Enabling it \
+             only on cuttlefish-host is not enough."
+        );
         std::process::exit(2);
-    };
+    }
 
-    let (Some(path), Some(page), Some(width)) = (
-        args.get(position + 1),
-        args.get(position + 2).and_then(|s| s.parse::<u32>().ok()),
-        args.get(position + 3).and_then(|s| s.parse::<u16>().ok()),
-    ) else {
-        fail("render worker: expected <path> <page> <width>");
-    };
+    #[cfg(feature = "pdf-render")]
+    {
+        let fail = |message: &str| -> ! {
+            eprintln!("{message}");
+            std::process::exit(2);
+        };
 
-    match crate::documents::render_page_in_process(Path::new(path), page, width) {
-        Ok(png) => {
-            if let Err(e) = std::io::stdout().write_all(&png) {
-                fail(&format!("render worker: writing output: {e}"));
+        let (Some(path), Some(page), Some(width)) = (
+            args.get(position + 1),
+            args.get(position + 2).and_then(|s| s.parse::<u32>().ok()),
+            args.get(position + 3).and_then(|s| s.parse::<u16>().ok()),
+        ) else {
+            fail("render worker: expected <path> <page> <width>");
+        };
+
+        match crate::documents::render_page_in_process(Path::new(path), page, width) {
+            Ok(png) => {
+                if let Err(e) = std::io::stdout().write_all(&png) {
+                    fail(&format!("render worker: writing output: {e}"));
+                }
+                let _ = std::io::stdout().flush();
+                std::process::exit(0);
             }
-            let _ = std::io::stdout().flush();
-            std::process::exit(0);
+            Err(e) => fail(&format!("{e}")),
         }
-        Err(e) => fail(&format!("{e}")),
     }
 }
 
