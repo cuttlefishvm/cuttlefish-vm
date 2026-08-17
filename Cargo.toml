@@ -21,7 +21,7 @@ members = [
 # release tag — .github/workflows/release.yml refuses to publish when the tag
 # and this field disagree, because a tag that lies about what it published
 # cannot be corrected afterwards.
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/cuttlefishvm/cuttlefish-vm.git"
@@ -48,10 +48,10 @@ rust-version = "1.94"
 # its dependents. crates.io rejects a package whose dependency has only a path,
 # so omitting the version breaks `cargo publish` and nothing else — the
 # workspace builds fine right up until release day.
-cuttlefish-abi = { path = "crates/cuttlefish-abi", version = "0.0.8" }
-cuttlefish-core = { path = "crates/cuttlefish-core", version = "0.0.8" }
-cuttlefish-sdk = { path = "crates/cuttlefish-sdk", version = "0.0.8" }
-cuttlefish-host = { path = "crates/cuttlefish-host", version = "0.0.8" }
+cuttlefish-abi = { path = "crates/cuttlefish-abi", version = "0.0.9" }
+cuttlefish-core = { path = "crates/cuttlefish-core", version = "0.0.9" }
+cuttlefish-sdk = { path = "crates/cuttlefish-sdk", version = "0.0.9" }
+cuttlefish-host = { path = "crates/cuttlefish-host", version = "0.0.9" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -265,7 +265,12 @@ fn collect_escalations(
             continue;
         }
         let job_id = entry.file_name().to_string_lossy().into_owned();
-        let ledger = match cuttlefish_host::ledger::Ledger::open(&ledger_path, "") {
+        // Read-only, and that is load-bearing rather than tidy. `Ledger::open`
+        // runs CREATE TABLE / ALTER TABLE to bring a ledger up to date, and
+        // DDL takes an exclusive lock — so listing escalations across every
+        // job could lock the ledger of a job that is *currently running* and
+        // fail it. Reading somebody else's ledger must never write to it.
+        let ledger = match cuttlefish_host::ledger::Ledger::open_read_only(&ledger_path) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("warning: skipping unreadable ledger for job `{job_id}`: {e}");

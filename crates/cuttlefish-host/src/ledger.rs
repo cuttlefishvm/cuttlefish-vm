@@ -430,6 +430,49 @@ impl Ledger {
         Ok(())
     }
 
+    /// Open an existing ledger **read-only**, running no schema statements.
+    ///
+    /// [`Ledger::open`] is a writer: it runs `CREATE TABLE IF NOT EXISTS` and
+    /// `ALTER TABLE` so a fresh or older ledger becomes usable. That is right
+    /// when opening the ledger you are about to write, and wrong for reading
+    /// somebody else's — DDL takes an exclusive lock, so merely *listing*
+    /// escalations across every job on the machine could lock the ledger of a
+    /// job that is currently running and fail it.
+    ///
+    /// This opens with `SQLITE_OPEN_READ_ONLY` and touches no schema. A ledger
+    /// predating the drain columns therefore reads with them absent, which is
+    /// handled rather than migrated: such rows come back with no input, which
+    /// is exactly what they have.
+    pub fn open_read_only(path: &Path) -> Result<Self, LedgerError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            job_dir: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+        })
+    }
+
+    /// Whether this ledger has the columns draining needs.
+    ///
+    /// Read-only opens do not migrate, so a caller has to be able to ask.
+    fn has_drain_columns(&self) -> bool {
+        let conn = self.lock();
+        let Ok(mut stmt) = conn.prepare("PRAGMA table_info(checkpoints)") else {
+            return false;
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(1)) else {
+            return false;
+        };
+        let columns: Vec<String> = rows.filter_map(Result::ok).collect();
+        columns.iter().any(|c| c == "input_json") && columns.iter().any(|c| c == "drained_at")
+    }
+
     /// What this job gave up on and nobody has handled yet — the queue.
     pub fn escalations(&self) -> rusqlite::Result<Vec<Escalation>> {
         self.query_escalations(true)
@@ -445,6 +488,29 @@ impl Ledger {
     }
 
     fn query_escalations(&self, outstanding_only: bool) -> rusqlite::Result<Vec<Escalation>> {
+        // A ledger opened read-only is never migrated, so it may genuinely
+        // lack these columns. Selecting them would error; reporting the rows
+        // without an input is both correct and what the drain path already
+        // knows how to describe.
+        if !self.has_drain_columns() {
+            let conn = self.lock();
+            let mut stmt = conn.prepare(
+                "SELECT node_name, item_index, error_text, completed_at FROM checkpoints
+                 WHERE status = 'escalated' ORDER BY node_name, item_index",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                let index: i64 = r.get(1)?;
+                Ok(Escalation {
+                    node: r.get(0)?,
+                    item: (index >= 0).then_some(index as usize),
+                    reason: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    at: r.get(3)?,
+                    input: None,
+                    drained_at: None,
+                })
+            })?;
+            return rows.collect();
+        }
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT node_name, item_index, error_text, completed_at, input_json, drained_at
