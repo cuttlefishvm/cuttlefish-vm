@@ -5,12 +5,17 @@ description: Use when creating a new cuttlefish proc block — a Rhai script by 
 
 # cuttlefish-author
 
-> **No `cuttlefish` on PATH?** Don't stop — the binaries are resolvable.
-> Dispatch the `cuttlefish-binary-resolver` agent (or follow
-> `cuttlefish-cli` inline), which checks PATH, a prior download in
-> `~/.cache/cuttlefish/bin/`, a dirty checkout, and finally a
-> checksum-verified GitHub Release download. "cuttlefish not found" is a
-> resolution step you haven't run yet, never a dead end.
+> **No `cuttlefish` on PATH? Download it from GitHub Releases.** That is
+> the answer, not a last resort: dispatch the `cuttlefish-binary-resolver`
+> agent, or follow `cuttlefish-cli` inline and run its download script. It
+> resolves the latest tag, verifies a checksum, and caches per tag, so
+> re-running costs nothing.
+>
+> Two things not to do. Don't report "binaries unavailable" — they are
+> downloadable on every supported platform. And don't reuse an older
+> cached tag such as `~/.cache/cuttlefish/bin/v0.0.7`; releases carry
+> fixes that change behaviour, and one API call settles which tag is
+> current.
 
 ## Overview
 

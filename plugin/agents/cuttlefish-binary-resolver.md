@@ -17,7 +17,14 @@ speculative exploration of the repo.
 
 ## Procedure
 
-Run through in order; stop at the first that applies.
+**Default action: download from GitHub Releases.** Step 4's script is the
+answer unless one of the narrow exceptions below applies. It resolves the
+latest tag, verifies a checksum, and caches per tag, so running it is cheap
+and repeatable.
+
+Never report "binaries unavailable" or "needs build". They are downloadable
+on every supported platform, and saying otherwise sends the caller looking
+for a problem that does not exist.
 
 ### 1. Already on PATH
 
@@ -25,19 +32,9 @@ Run through in order; stop at the first that applies.
 command -v cuttlefish && command -v cuttlefishd
 ```
 
-Both found → report `SOURCE=PATH` and stop, no need to name a directory.
+Both found → report `SOURCE=PATH` and stop.
 
-### 2. Cached from a prior release download
-
-```bash
-ls -1 ~/.cache/cuttlefish/bin/ 2>/dev/null
-```
-
-If any `v*` directory exists there with both binaries inside, use the
-newest one. Don't hit the network just to check whether a newer tag
-exists -- a cached binary from a prior session is close enough.
-
-### 3. A dirty cuttlefish-vm checkout
+### 2. A dirty cuttlefish-vm checkout
 
 ```bash
 root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
@@ -47,16 +44,30 @@ if [ -n "$root" ] && [ -f "$root/crates/cuttlefish/Cargo.toml" ] && \
 fi
 ```
 
-If that prints, a released binary can't reflect the uncommitted edits —
-build instead:
+Only if that prints: a released binary cannot reflect uncommitted edits, so
+build instead.
 
 ```bash
 nix develop --command cargo build -p cuttlefish -p cuttlefishd
 ```
 
-(If `nix` isn't available, fall back to a plain `cargo build` and note
-that in your report — it may use a different toolchain version than this
-repo pins.) Binaries land at `<root>/target/debug/{cuttlefish,cuttlefishd}`.
+(If `nix` is absent, fall back to plain `cargo build` and say so — it may
+use a different toolchain than this repo pins.) Binaries land at
+`<root>/target/debug/{cuttlefish,cuttlefishd}`.
+
+A *clean* checkout is not this case. Download instead: the release matches
+what is committed and costs no build time.
+
+### 3. A cached download of the current tag
+
+The download script already does this: it resolves the latest tag, then
+returns immediately if `~/.cache/cuttlefish/bin/<tag>/` is populated. So do
+not inspect the cache by hand first.
+
+In particular, **do not reuse an older cached tag** — a `v0.0.7` directory
+left by an earlier session is not close enough. Releases carry fixes that
+change behaviour, and running a stale binary reproduces bugs that were
+fixed long ago. One API call settles which tag is current.
 
 ### 4. Otherwise: download the latest release
 

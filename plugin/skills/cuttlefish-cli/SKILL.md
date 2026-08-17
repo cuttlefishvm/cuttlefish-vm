@@ -23,43 +23,52 @@ build it.
 
 ## Resolving a binary
 
-Run through in order; stop at the first that applies.
+**If `cuttlefish` is not on `PATH`, download it from GitHub Releases.** That
+is the answer in almost every case, and it is one command — the script in
+"Download the release" below. Run it. It resolves the latest tag, verifies a
+checksum, extracts to `~/.cache/cuttlefish/bin/<tag>/`, and prints the
+directory to put on `PATH`.
 
-### 1. Already resolvable
+Do not stop at "not found on PATH" and report that binaries are unavailable.
+They are downloadable, always, on every supported platform.
 
-- `cuttlefish`/`cuttlefishd` already on `PATH`? Use them, done.
-- Otherwise, if `~/.cache/cuttlefish/bin/` already has *any* tag directory
-  with both binaries in it, use the newest one, done — don't hit the
-  network just to check whether a newer tag exists; a cached binary from
-  a prior session is close enough. On a genuinely cold cache (directory
-  doesn't exist, or is empty), skip straight to step 3 — its script
-  checks the real latest tag once and both resolves and downloads in the
-  same pass, instead of this step and step 3 each doing their own
-  separate "what's the latest release" round trip.
+Two things worth knowing before you run it:
 
-### 2. Actively editing this checkout? Build from source.
+- **It caches by tag and re-running is nearly free.** A second run finds the
+  tag directory already populated and exits immediately. So there is no
+  reason to avoid it, and no reason to hunt through `~/.cache` by hand
+  first — the script does that lookup itself, against the *current* release
+  rather than whatever happens to be lying around.
+- **Never reuse an old cached tag without checking.** A `~/.cache/cuttlefish/bin/v0.0.7`
+  left by a previous session is not "close enough": releases carry fixes
+  that change behaviour, and silently running a stale binary produces bugs
+  that were fixed months ago. The script compares against the real latest
+  tag every time, which costs one API call.
+
+### Building from source instead
+
+Only when this *is* a `cuttlefish-vm` checkout with uncommitted changes
+under `crates/` or `blocks/` — a released binary cannot reflect edits that
+are not in a release:
 
 ```bash
 root=$(git rev-parse --show-toplevel 2>/dev/null) || root=""
 if [ -n "$root" ] && [ -f "$root/crates/cuttlefish/Cargo.toml" ] && \
    [ -n "$(git -C "$root" status --porcelain -- crates blocks)" ]; then
-  echo "dirty cuttlefish-vm checkout — build from source"
+  nix develop --command cargo build -p cuttlefish -p cuttlefishd
+  # binaries at ./target/debug/{cuttlefish,cuttlefishd}
 fi
 ```
 
-If that prints — this is a `cuttlefish-vm` checkout with uncommitted
-changes touching `crates/` or `blocks/` — a released binary can't reflect
-those edits, so build from source instead:
-
-```bash
-nix develop --command cargo build -p cuttlefish -p cuttlefishd
-```
-
-Binaries land at `./target/debug/{cuttlefish,cuttlefishd}`. Always run
-cargo/the binaries through `nix develop --command ...` in this repo — the
+Always run cargo through `nix develop --command ...` in this repo — the
 system toolchain is a different, unsupported version.
 
-### 3. Otherwise: download the latest release
+Anywhere else — an empty project directory, someone else's repo, a
+scratch dir — download. Do not build from source just because a checkout
+happens to be nearby.
+
+### Download the release
+
 
 One script, plain bash — no `python3`, no inline heredoc. Both matter:
 a `curl && python3 -c "<inline script>"` one-liner embeds a different
