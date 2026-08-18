@@ -1273,3 +1273,170 @@ async fn a_path_outside_every_grant_is_denied_without_revealing_existence() {
     );
     assert_eq!(seen[0], "capability_denied");
 }
+
+/// `page_text_opt` reports a bad page as a value, so the block keeps going.
+///
+/// The friction this removes was measured on a real corpus: because a host
+/// call cannot be wrapped in `try`/`catch` without breaking replay, one
+/// unreadable page killed the whole fan-out item. In a 300-page filing that
+/// loses the document over 1/300th of it.
+#[tokio::test]
+async fn a_bad_page_costs_a_page_rather_than_the_whole_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/docs/sample.pdf");
+    let local = dir.path().join("sample.pdf");
+    std::fs::copy(&pdf, &local).unwrap();
+
+    // Page 0 is readable; page 50 is past every addressable segment. The
+    // ordinary `page_text` fails the block on the second one — this walk has
+    // to survive it and still report what it did read.
+    let script = r#"
+        let f = open(input.path);
+        let good = page_text_opt(f.handle, 0);
+        let bad = page_text_opt(f.handle, 50);
+        #{
+            good_ok: good.ok,
+            good_len: good.text.len(),
+            bad_ok: bad.ok,
+            bad_error: bad.error,
+            bad_text_len: bad.text.len(),
+        }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": local.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+        embedder: None,
+        warehouse: None,
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    // The whole point: the job finished despite the bad page.
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+
+    assert_eq!(result["good_ok"], true);
+    assert!(
+        result["good_len"].as_u64().unwrap() > 0,
+        "the readable page still came back: {result}"
+    );
+
+    assert_eq!(result["bad_ok"], false);
+    assert_eq!(
+        result["bad_text_len"], 0,
+        "a failed read must not hand back text that looks usable"
+    );
+    // The reason is carried, not flattened — so a fan-out item can record
+    // which page failed and why rather than "extraction failed".
+    let reason = result["bad_error"].as_str().unwrap();
+    assert!(
+        reason.contains("out of range") || reason.contains("addressable"),
+        "the reason names what was actually wrong: {reason}"
+    );
+}
+
+/// The ordinary `page_text` still fails hard on the same page.
+///
+/// Pinned so the degrading variant cannot quietly become the behaviour of
+/// both: a block that never asked to degrade must keep learning that its
+/// page walk is wrong.
+#[tokio::test]
+async fn page_text_still_fails_the_block_on_a_page_it_cannot_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/docs/sample.pdf");
+    let local = dir.path().join("sample.pdf");
+    std::fs::copy(&pdf, &local).unwrap();
+
+    let script = r#"
+        let f = open(input.path);
+        #{ text: page_text(f.handle, 50) }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "path": local.to_str().unwrap() }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+        embedder: None,
+        warehouse: None,
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+}
+
+/// A handle that names nothing still fails hard, even through `_opt`.
+///
+/// `_opt` degrades properties of the *corpus*, not mistakes in the script.
+/// Returning `ok: false` here would let a typo read as "every page of every
+/// document is unreadable", which is the kind of wrong answer a whole
+/// campaign can be built on before anyone notices.
+#[tokio::test]
+async fn page_text_opt_does_not_soften_a_handle_that_names_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"#{ out: page_text_opt(9999, 0).ok }"#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+        embedder: None,
+        warehouse: None,
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+    let error = envelope.error.unwrap();
+    assert!(
+        error.message.contains("no such handle"),
+        "{}",
+        error.message
+    );
+}
