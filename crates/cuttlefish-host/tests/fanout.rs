@@ -127,6 +127,7 @@ async fn run_on(nodes: Vec<CheckedNode>, dir: &Path, ledger: &Ledger) -> cuttlef
         caps: Capabilities::new(vec![dir.to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     run_job(
         Arc::new(Engine::default()),
@@ -257,7 +258,7 @@ async fn resume_does_not_repeat_items_that_already_concluded() {
     // A sentinel value the script could never produce -- if item 0 were
     // re-run, this would be replaced by {"doubled": 2}.
     ledger
-        .write_item_completed("map", 0, &serde_json::json!({"sentinel": true}))
+        .write_item_completed("map", 0, &serde_json::json!({"sentinel": true}), None)
         .unwrap();
     ledger
         .write_item_failed("map", 1, "bad chunk", None)

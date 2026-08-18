@@ -111,6 +111,10 @@ pub struct JobSpec {
     /// spec naming one this build cannot serve fails as the daemon comes up
     /// rather than partway through a corpus.
     pub embedder: Option<Arc<dyn InferBackend>>,
+    /// Where to write a medallion warehouse of this job's results, and the
+    /// lineage to stamp on every row. `None` for a spec that declared no
+    /// `warehouse`, which is every spec that existed before this.
+    pub warehouse: Option<WarehousePlan>,
     /// Backends for models beyond the job's own — see [`Alternates`].
     /// Empty for a spec with no `reroute` rung and no model-bearing `Judge`,
     /// which is every spec that existed before acceptance contracts.
@@ -361,6 +365,241 @@ fn cancelled(usage: Usage, message: &str) -> Envelope {
     }
 }
 
+/// Where a job's warehouse goes, and what lineage its rows carry.
+///
+/// The job-level half of [`crate::warehouse::Lineage`]: the per-row half comes
+/// from the ledger. Assembled once at submit time so the runner never has to
+/// reach back into the spec.
+#[derive(Debug, Clone)]
+pub struct WarehousePlan {
+    /// The warehouse root, already resolved against the spec's directory.
+    pub root: std::path::PathBuf,
+    /// The spec's name, stamped on every row.
+    pub spec_name: String,
+    /// The chat model, as resolved.
+    pub model: String,
+    /// The embedding model, if the spec declared one.
+    pub embedding_model: Option<String>,
+}
+
+/// What the warehouse needs to know about a node.
+///
+/// Deliberately not a [`crate::dag::CheckedNode`]: that carries the node's
+/// compiled wasm, and the warehouse would have to clone every byte of every
+/// module to hold onto it past the run.
+#[derive(Debug, Clone)]
+pub struct WarehouseNode {
+    name: String,
+    /// Only a fan-out node has per-item rows to put in bronze and silver.
+    is_fanout: bool,
+    /// The declared per-item output, which silver types against.
+    item_output: Option<cuttlefish_abi::Ty>,
+    /// The declared node output, which gold types against.
+    output_ty: cuttlefish_abi::Ty,
+}
+
+impl WarehouseNode {
+    fn of(node: &crate::dag::CheckedNode) -> Self {
+        Self {
+            name: node.name.clone(),
+            is_fanout: node.over.is_some(),
+            item_output: node.item_output.clone(),
+            output_ty: node.signature.output.clone(),
+        }
+    }
+}
+
+/// Write the job's warehouse, reading everything back from the ledger.
+///
+/// Written once, at the end, rather than per node as each concludes. The
+/// ledger is the authority and the warehouse is a projection of it — so a job
+/// that dies partway leaves no half-warehouse to mistake for a whole one, and
+/// a resumed job rewrites the projection from the complete record rather than
+/// appending to a partial one.
+///
+/// Failures here are reported and swallowed. A warehouse is a *projection* of
+/// results the job already computed and already recorded; discarding a
+/// finished corpus because a disk filled while writing a derived file would
+/// throw away the expensive thing to protect the cheap one. Re-running the
+/// job — or simply resuming it — rewrites it.
+fn write_warehouse(
+    plan: &WarehousePlan,
+    nodes: &[WarehouseNode],
+    ledger: &crate::ledger::Ledger,
+    envelope: &Envelope,
+) {
+    use crate::warehouse as wh;
+
+    let job_id = ledger
+        .job_dir()
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+
+    let lineage = wh::Lineage {
+        job_id: job_id.clone(),
+        spec_name: plan.spec_name.clone(),
+        spec_fingerprint: ledger.graph_fingerprint().unwrap_or_default(),
+        model: plan.model.clone(),
+        embedding_model: plan.embedding_model.clone(),
+        cuttlefish_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    let (mut bronze, mut silver, mut gold) = (
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::new(),
+    );
+
+    for node in nodes {
+        // Only a fan-out node has per-item rows. A plain node's single output
+        // is the job result, and lands in gold.
+        if !node.is_fanout {
+            continue;
+        }
+        let rows: Vec<wh::Row> = match ledger.concluded_rows(&node.name) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| wh::Row {
+                    node: node.name.clone(),
+                    item: r.item,
+                    status: r.status,
+                    concluded_at: r.concluded_at,
+                    source_input: r.source_input,
+                    output: r.output,
+                    error: r.error,
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!("warning: warehouse: reading node `{}`: {e}", node.name);
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+
+        match wh::bronze_batch(&rows, &lineage) {
+            Ok(batch) => {
+                let path = plan
+                    .root
+                    .join("bronze")
+                    .join(format!("{}.parquet", node.name));
+                match wh::write_parquet(&path, &batch) {
+                    Ok(()) => {
+                        bronze.insert(
+                            node.name.clone(),
+                            wh::Layer::Written(wh::entry_for(&plan.root, &path, &batch)),
+                        );
+                    }
+                    Err(e) => eprintln!("warning: warehouse: writing bronze: {e}"),
+                }
+            }
+            Err(e) => eprintln!("warning: warehouse: building bronze: {e}"),
+        }
+
+        let item_output = node.item_output.clone().unwrap_or(cuttlefish_abi::Ty::Json);
+        match wh::silver_batch(&rows, &lineage, &item_output) {
+            Ok(Some(batch)) => {
+                let path = plan
+                    .root
+                    .join("silver")
+                    .join(format!("{}.parquet", node.name));
+                match wh::write_parquet(&path, &batch) {
+                    Ok(()) => {
+                        silver.insert(
+                            node.name.clone(),
+                            wh::Layer::Written(wh::entry_for(&plan.root, &path, &batch)),
+                        );
+                    }
+                    Err(e) => eprintln!("warning: warehouse: writing silver: {e}"),
+                }
+            }
+            // Recorded, not omitted: a reader finding no silver table has to
+            // be able to tell "the author declared no shape to validate
+            // against" from "the job broke before writing it".
+            Ok(None) => {
+                silver.insert(
+                    node.name.clone(),
+                    wh::Layer::Skipped {
+                        skipped: format!(
+                            "node `{}` declares its per-item output as `{}`, which names no \
+                             fields to validate against — declare a record of `text`, `number` \
+                             or `bool` fields to get a typed silver table",
+                            node.name,
+                            item_output.describe()
+                        ),
+                    },
+                );
+            }
+            Err(e) => eprintln!("warning: warehouse: building silver: {e}"),
+        }
+    }
+
+    // Gold is the job's own result: the rollup, curated by whoever wrote the
+    // spec. One row, typed against the final node's declared output for the
+    // same reason silver is.
+    if let (Some(value), Some(last)) = (envelope.result.as_ref(), nodes.last()) {
+        let row = wh::Row {
+            node: last.name.clone(),
+            item: 0,
+            status: "completed".into(),
+            concluded_at: wh::now_rfc3339(),
+            source_input: None,
+            output: Some(value.clone()),
+            error: None,
+        };
+        let ty = last.output_ty.clone();
+        match wh::silver_batch(std::slice::from_ref(&row), &lineage, &ty) {
+            Ok(Some(batch)) => {
+                let path = plan
+                    .root
+                    .join("gold")
+                    .join(format!("{}.parquet", last.name));
+                match wh::write_parquet(&path, &batch) {
+                    Ok(()) => {
+                        gold.insert(
+                            last.name.clone(),
+                            wh::Layer::Written(wh::entry_for(&plan.root, &path, &batch)),
+                        );
+                    }
+                    Err(e) => eprintln!("warning: warehouse: writing gold: {e}"),
+                }
+            }
+            Ok(None) => {
+                gold.insert(
+                    last.name.clone(),
+                    wh::Layer::Skipped {
+                        skipped: format!(
+                            "node `{}` declares its output as `{}`, which names no fields to \
+                             validate against",
+                            last.name,
+                            ty.describe()
+                        ),
+                    },
+                );
+            }
+            Err(e) => eprintln!("warning: warehouse: building gold: {e}"),
+        }
+    }
+
+    let manifest = wh::Manifest {
+        job_id,
+        spec_name: plan.spec_name.clone(),
+        spec_fingerprint: lineage.spec_fingerprint.clone(),
+        model: plan.model.clone(),
+        embedding_model: plan.embedding_model.clone(),
+        cuttlefish_version: lineage.cuttlefish_version.clone(),
+        written_at: wh::now_rfc3339(),
+        bronze,
+        silver,
+        gold,
+    };
+    if let Err(e) = wh::write_manifest(&plan.root, &manifest) {
+        eprintln!("warning: warehouse: writing the manifest: {e}");
+    }
+}
+
 /// Drive one job to completion.
 ///
 /// Always returns an [`Envelope`]; failures are values, not errors, because the
@@ -397,6 +636,14 @@ pub async fn run_job(
     // same work, while adding nothing, since the job boundary is what the
     // security property rests on.
     let mut handles = Handles::default();
+
+    // Captured before the run consumes `job`: the warehouse is written after
+    // the run block, and only what it needs is kept — see [`WarehouseNode`].
+    let job_warehouse = job.warehouse.clone();
+    let warehouse_nodes: Vec<WarehouseNode> = match &job_warehouse {
+        Some(_) => job.nodes.iter().map(WarehouseNode::of).collect(),
+        None => Vec::new(),
+    };
 
     let envelope = 'run: {
         if job.nodes.is_empty() {
@@ -799,6 +1046,12 @@ pub async fn run_job(
         // that already succeeded or failed for its own, unrelated reason.
         eprintln!("warning: failed to record job {ledger_status} status in ledger: {e}");
     }
+
+    // After `finish`, so the warehouse never describes a job the ledger still
+    // calls running.
+    if let Some(plan) = &job_warehouse {
+        write_warehouse(plan, &warehouse_nodes, ledger, &envelope);
+    }
     envelope
 }
 
@@ -1062,7 +1315,9 @@ async fn run_fanout_node(
         {
             Ok(value) => {
                 succeeded += 1;
-                if let Err(e) = ledger.write_item_completed(node_name, item_index, &value) {
+                if let Err(e) =
+                    ledger.write_item_completed(node_name, item_index, &value, Some(item_input))
+                {
                     return Err(bail(
                         format!("node `{node_name}`: recording item {item_index} result: {e}"),
                         usage,
@@ -1628,13 +1883,25 @@ async fn run_stage(
 
             Command::Open { path } => {
                 let p = std::path::PathBuf::from(&path);
-                if !caps.allows_read(&p) {
+                if let Some(denial) = caps.read_denial(&p) {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return Err(fail(
-                        error_codes::CAPABILITY_DENIED,
-                        format!("read not permitted: {path}"),
-                        usage.clone(),
-                    ));
+                    // A missing file is not a permissions problem, and saying
+                    // so costs an iteration every time somebody's manifest
+                    // names a file that moved.
+                    let (code, message) = match denial {
+                        crate::caps::ReadDenial::Missing => (
+                            error_codes::NOT_FOUND,
+                            format!(
+                                "no such file: {path} — it is inside a granted root, so this is \
+                                 the path being wrong rather than the grant"
+                            ),
+                        ),
+                        crate::caps::ReadDenial::NotGranted => (
+                            error_codes::CAPABILITY_DENIED,
+                            format!("read not permitted: {path}"),
+                        ),
+                    };
+                    return Err(fail(code, message, usage.clone()));
                 }
                 match handles.open(&p) {
                     Ok((handle, len, kind)) => {

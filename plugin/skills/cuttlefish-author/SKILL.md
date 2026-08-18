@@ -65,6 +65,11 @@ cuttlefish block new <name> --input <type> --output <type> [--description <text>
   already use, e.g. `"{path: text}"`, `"[text]"`, `"json"`. Required
   rather than defaulting to `json` — a `json` seam typechecks
   unconditionally, defeating the point of declaring a signature.
+  The leaf types are `text`, `number`, `bool`, `bytes`, `image`,
+  `document`, and `json`; `[t]` is a list and `{a: t, b: u}` a record.
+  Reach for `number` and `bool` over `json` when you know which it is —
+  besides catching a block that returns `"12"` where a count was
+  promised, they are what a warehouse column's type is derived from.
 - `--lang` — `rhai` (default) or `rust`.
 
 ### Rhai example
@@ -374,6 +379,54 @@ embedding_model = Ollama "nomic-embed-text";
 - **Chunk before you embed.** Every model has an input ceiling and quietly
   truncates past it, so a whole 227-page filing embedded as one string is a
   vector for its first few pages wearing the whole document's name.
+
+**`warehouse = "./warehouse"` writes the results as Parquet**, in the
+bronze/silver/gold layout, next to the JSONL rather than instead of it — so
+`results_path` keeps working for downstream nodes and for anything you
+already wrote.
+
+```
+spec index_corpus = {
+  ...
+  warehouse = "./warehouse";
+}
+```
+
+You get:
+
+- **`bronze/<node>.parquet`** — every concluded item, **failures included**,
+  with the raw output as JSON. This is the layer you audit: "which items
+  failed and why" is answerable here without opening a log.
+- **`silver/<node>.parquet`** — the successful items, one column per field of
+  the node's declared per-item output. A field declared `number` is an
+  integer or float column and a `bool` is a boolean column, so `SUM`, `AVG`
+  and range filters work with no cast.
+- **`gold/<node>.parquet`** — the job's own result, the rollup you curated.
+- **`manifest.json`** — every table, its row count and columns, plus the job
+  id, spec fingerprint and models.
+
+Every bronze and silver row carries its own **lineage**: `job_id`, `node`,
+`item`, `status`, `concluded_at`, `source_input` (the item's input verbatim —
+where the row came from), `spec_name`, `spec_fingerprint`, `model`,
+`embedding_model` and `cuttlefish_version`. Duplicated on purpose: a Parquet
+file gets copied and forwarded, and a row that cannot say where it came from
+once separated from its manifest is one whose provenance depends on luck.
+
+Two things worth knowing:
+
+- **A node declaring `json` output gets no silver table.** There is no shape
+  to validate against, so the manifest records the layer as skipped with that
+  reason rather than emitting one JSON-blob column and calling it typed. If
+  you want silver, declare a record.
+- **Payload columns are prefixed `f_`** (`f_title`, `f_pages`), so a field
+  named `model` or `item` cannot collide with a lineage column.
+
+Read it with anything — no Python needed to *write* it:
+
+```python
+import pyarrow.parquet as pq
+pq.read_table("warehouse/silver/extract.parquet")
+```
 
 **A scanned PDF has no text to extract** — `open` reports
 `has_text_layer: false` and `document_text` returns nothing. Read it with a

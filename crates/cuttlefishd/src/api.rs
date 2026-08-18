@@ -80,6 +80,24 @@ pub struct SubmitJob {
 /// written — it depends on the job id. Granting it here, scoped to the one
 /// directory this job's own results live in, is what lets a reduce node
 /// `open` them without the spec author having to predict the path.
+/// The warehouse plan for this spec, if it asked for one.
+///
+/// Built per job rather than stored on [`AppState`] because the lineage it
+/// carries — model names above all — is what gets stamped on every row, and
+/// reading it from the live spec here keeps one source for it rather than a
+/// copy that can drift.
+fn warehouse_plan(st: &AppState) -> Option<cuttlefish_host::runner::WarehousePlan> {
+    st.spec
+        .warehouse
+        .as_ref()
+        .map(|root| cuttlefish_host::runner::WarehousePlan {
+            root: root.clone(),
+            spec_name: st.spec.name.clone(),
+            model: st.backend.model_name(),
+            embedding_model: st.embedder.as_ref().map(|e| e.model_name()),
+        })
+}
+
 fn fanout_aware_roots(st: &AppState, job_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut roots = st.spec.read_roots.clone();
     roots.push(job_dir.join("results"));
@@ -369,6 +387,7 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
             .with_fetch(st.spec.fetch_prefixes.clone()),
         alternates: (*st.alternates).clone(),
         embedder: st.embedder.clone(),
+        warehouse: warehouse_plan(&st),
     };
 
     // Every event goes through `publish`, so it lands in the replay log as well
@@ -562,6 +581,7 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
             .with_fetch(st.spec.fetch_prefixes.clone()),
         alternates: (*st.alternates).clone(),
         embedder: st.embedder.clone(),
+        warehouse: warehouse_plan(&st),
     };
 
     // Atomic guard against a concurrent second /resume call racing to this

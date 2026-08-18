@@ -183,6 +183,7 @@ async fn run(input: serde_json::Value, dir: &std::path::Path) -> cuttlefish_abi:
         caps: Capabilities::new(vec![dir.to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger = cuttlefish_host::ledger::Ledger::open(&dir.join("ledger.sqlite"), "fp").unwrap();
     run_job(

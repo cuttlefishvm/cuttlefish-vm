@@ -141,7 +141,7 @@ fn item_checkpoints_are_independent_of_each_other_and_of_the_node() {
     let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
 
     ledger
-        .write_item_completed("map", 0, &serde_json::json!({"a": 1}))
+        .write_item_completed("map", 0, &serde_json::json!({"a": 1}), None)
         .unwrap();
     ledger.write_item_failed("map", 1, "boom", None).unwrap();
 
@@ -169,10 +169,10 @@ fn concluded_items_lists_successes_and_failures_in_index_order() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
     ledger
-        .write_item_completed("map", 2, &serde_json::json!("c"))
+        .write_item_completed("map", 2, &serde_json::json!("c"), None)
         .unwrap();
     ledger
-        .write_item_completed("map", 0, &serde_json::json!("a"))
+        .write_item_completed("map", 0, &serde_json::json!("a"), None)
         .unwrap();
     ledger
         .write_item_failed("map", 1, "bad chunk", None)
@@ -245,7 +245,7 @@ fn a_failed_item_records_its_input_and_a_completed_one_does_not() {
     let input = serde_json::json!({"chunk": "the quick brown fox", "doc": "q3.pdf"});
 
     ledger
-        .write_item_completed("map", 0, &serde_json::json!({"ok": true}))
+        .write_item_completed("map", 0, &serde_json::json!({"ok": true}), None)
         .unwrap();
     ledger
         .write_item_failed("map", 1, "boom", Some(&input))
@@ -327,7 +327,7 @@ fn a_ledger_without_the_drain_columns_gains_them_and_still_resumes() {
     );
     // Still a working ledger.
     ledger
-        .write_item_completed("map", 4, &serde_json::json!({"ok": true}))
+        .write_item_completed("map", 4, &serde_json::json!({"ok": true}), None)
         .unwrap();
     assert!(ledger.item_concluded("map", 4).unwrap());
 }

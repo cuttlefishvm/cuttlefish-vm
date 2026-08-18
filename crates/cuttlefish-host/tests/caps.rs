@@ -4,7 +4,7 @@
 //! The naive implementation is a string prefix check (`path.starts_with(root)`),
 //! and every test here except the happy path defeats it.
 
-use cuttlefish_host::caps::Capabilities;
+use cuttlefish_host::caps::{Capabilities, ReadDenial};
 use std::fs;
 
 #[test]
@@ -206,4 +206,110 @@ fn no_fetch_grant_means_no_fetching() {
     let caps = Capabilities::new(vec!["/tmp".into()]);
     assert!(!caps.allows_fetch("https://anything.test/"));
     assert!(caps.fetch_prefixes().is_empty());
+}
+
+#[test]
+fn a_missing_file_inside_a_grant_is_reported_as_missing_not_forbidden() {
+    // The friction this removes: a manifest naming a file that moved failed
+    // with "read not permitted", sending the reader to re-check their
+    // `capabilities` line when the grant was never the problem.
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+
+    let absent = dir.path().join("gone.txt");
+    assert_eq!(caps.read_denial(&absent), Some(ReadDenial::Missing));
+
+    // A file that is there is not denied at all.
+    let present = dir.path().join("here.txt");
+    std::fs::write(&present, b"x").unwrap();
+    assert_eq!(caps.read_denial(&present), None);
+}
+
+#[test]
+fn absence_outside_the_grant_is_not_reported() {
+    // The security property: distinguishing "absent" from "forbidden" for a
+    // path the job was never granted is exactly the probe a capability list
+    // exists to prevent. Both must come back as the same undifferentiated
+    // refusal.
+    let granted = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![granted.path().to_path_buf()]);
+
+    let real = elsewhere.path().join("real.txt");
+    std::fs::write(&real, b"secret").unwrap();
+    let imaginary = elsewhere.path().join("imaginary.txt");
+
+    assert_eq!(caps.read_denial(&real), Some(ReadDenial::NotGranted));
+    assert_eq!(
+        caps.read_denial(&imaginary),
+        Some(ReadDenial::NotGranted),
+        "a caller must not be able to tell an absent file from a forbidden one \
+         outside the grant — that difference is an existence oracle"
+    );
+}
+
+#[test]
+fn a_missing_directory_inside_a_grant_still_reports_missing() {
+    // The nearest *existing* ancestor is what decides, so a path several
+    // levels below a granted root that does not exist yet is still diagnosed
+    // as a wrong path rather than a wrong grant.
+    let dir = tempfile::tempdir().unwrap();
+    let caps = Capabilities::new(vec![dir.path().to_path_buf()]);
+    let deep = dir.path().join("a/b/c/report.pdf");
+    assert_eq!(caps.read_denial(&deep), Some(ReadDenial::Missing));
+}
+
+#[test]
+fn traversal_out_of_a_grant_is_still_refused_outright() {
+    // `..` must not become a way to ask about files elsewhere: the resolved
+    // location decides, and a path resolving outside the grant is refused
+    // without saying whether anything is there.
+    let granted = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("secret.txt"), b"s").unwrap();
+    let caps = Capabilities::new(vec![granted.path().to_path_buf()]);
+
+    let escape = granted
+        .path()
+        .join("..")
+        .join(elsewhere.path().file_name().unwrap())
+        .join("secret.txt");
+    assert_eq!(caps.read_denial(&escape), Some(ReadDenial::NotGranted));
+}
+
+#[test]
+fn a_symlink_inside_a_grant_pointing_out_is_refused_not_called_missing() {
+    // It is right there — the refusal is about where it resolves. Reporting
+    // "no such file" would send somebody hunting for a typo in a path they
+    // spelled correctly, and it is the one case where the nearest existing
+    // ancestor is inside the grant while the target is not.
+    let granted = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let secret = elsewhere.path().join("secret.txt");
+    fs::write(&secret, b"s").unwrap();
+
+    let link = granted.path().join("link.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&secret, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&secret, &link).unwrap();
+
+    let caps = Capabilities::new(vec![granted.path().to_path_buf()]);
+    assert_eq!(caps.read_denial(&link), Some(ReadDenial::NotGranted));
+}
+
+#[test]
+fn a_dangling_symlink_inside_a_grant_is_not_called_missing_either() {
+    // `exists()` follows the link and would report this as absent, which
+    // would then be diagnosed as a wrong path. The link is not absent; its
+    // target is, and that is a different sentence.
+    let granted = tempfile::tempdir().unwrap();
+    let link = granted.path().join("dangling.txt");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(granted.path().join("nothing-here"), &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(granted.path().join("nothing-here"), &link).unwrap();
+
+    let caps = Capabilities::new(vec![granted.path().to_path_buf()]);
+    assert_eq!(caps.read_denial(&link), Some(ReadDenial::NotGranted));
 }

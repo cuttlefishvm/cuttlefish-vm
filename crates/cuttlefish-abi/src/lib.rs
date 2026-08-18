@@ -72,6 +72,17 @@ pub type Handle = u32;
 pub enum Ty {
     /// A UTF-8 string.
     Text,
+    /// A JSON number, integral or fractional.
+    ///
+    /// One variant rather than an int/float pair: JSON itself does not
+    /// distinguish them, so a block returning `3` where `3.0` was meant would
+    /// fail a check that exists only in the type system and nowhere in the
+    /// data. Where the distinction matters downstream — a Parquet column type,
+    /// say — it is decided by looking at the values, which is the only place
+    /// the information actually exists.
+    Number,
+    /// A JSON boolean.
+    Bool,
     /// Opaque bytes, base64-encoded on the wire.
     Bytes,
     /// A handle naming an image the host holds.
@@ -129,6 +140,8 @@ impl Ty {
         match self {
             Ty::Json | Ty::Bytes | Ty::Image | Ty::Document => true,
             Ty::Text => value.is_string(),
+            Ty::Number => value.is_number(),
+            Ty::Bool => value.is_boolean(),
             Ty::List(inner) => value
                 .as_array()
                 .is_some_and(|items| items.iter().all(|v| inner.matches_value(v))),
@@ -144,6 +157,8 @@ impl Ty {
     pub fn describe(&self) -> String {
         match self {
             Ty::Text => "text".into(),
+            Ty::Number => "number".into(),
+            Ty::Bool => "bool".into(),
             Ty::Bytes => "bytes".into(),
             Ty::Image => "image".into(),
             Ty::Document => "document".into(),
@@ -193,6 +208,8 @@ fn parse_ty(s: &str) -> Result<Ty, String> {
     let s = s.trim();
     match s {
         "text" => return Ok(Ty::Text),
+        "number" => return Ok(Ty::Number),
+        "bool" => return Ok(Ty::Bool),
         "bytes" => return Ok(Ty::Bytes),
         "image" => return Ok(Ty::Image),
         "document" => return Ok(Ty::Document),
@@ -738,6 +755,14 @@ pub mod error_codes {
     /// A command needed a capability this build does not have — asking for a
     /// page image without document rendering compiled in, say.
     pub const UNSUPPORTED: &str = "unsupported";
+    /// A path the job may read names nothing.
+    ///
+    /// Distinct from [`CAPABILITY_DENIED`] on purpose: one is a wrong path
+    /// and the other a wrong grant, and they are fixed in different files.
+    /// Only used where the job could have discovered the absence itself —
+    /// outside a grant, absence and refusal stay indistinguishable, because
+    /// telling them apart is an existence oracle.
+    pub const NOT_FOUND: &str = "not_found";
 }
 
 impl Default for MediaKind {

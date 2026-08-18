@@ -130,6 +130,17 @@ pub struct Spec {
     /// chat model for vectors — which either fails or returns something
     /// shaped like an embedding that is not one.
     pub embedding_model: Option<ModelRef>,
+    /// Where to write a medallion warehouse of this job's results, if
+    /// anywhere.
+    ///
+    /// Opt-in, and *alongside* the JSONL projection rather than instead of
+    /// it: downstream nodes read `results_path` with `open`/`slice`, so
+    /// replacing it would break every existing spec. A job that just wants an
+    /// answer pays nothing for a warehouse it never asked for.
+    ///
+    /// Relative paths resolve against the spec's own directory, like every
+    /// other path in a spec.
+    pub warehouse: Option<PathBuf>,
     /// The proc-blocks implementing the job, as a graph of nodes.
     ///
     /// Each node's declared input is typechecked against the nodes feeding
@@ -342,6 +353,7 @@ impl<'a> Parser<'a> {
 
         let mut fetch_prefixes: Vec<String> = Vec::new();
         let mut embedding_model: Option<ModelRef> = None;
+        let mut warehouse: Option<PathBuf> = None;
         let (mut description, mut model, mut data_policy, mut read_roots, mut nodes, mut branches) =
             (None, None, None, None, None, None);
 
@@ -375,6 +387,7 @@ impl<'a> Parser<'a> {
                     branches = Some(b);
                 }
                 "embedding_model" => embedding_model = Some(self.model()?),
+                "warehouse" => warehouse = Some(PathBuf::from(self.string("warehouse")?)),
                 "capabilities" => {
                     let (roots, fetch) = self.capabilities()?;
                     read_roots = Some(roots);
@@ -423,6 +436,7 @@ impl<'a> Parser<'a> {
             read_roots,
             fetch_prefixes,
             embedding_model,
+            warehouse,
             nodes,
             branches: branches.unwrap_or_default(),
         })
