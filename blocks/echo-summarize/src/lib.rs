@@ -127,9 +127,9 @@ impl Block for EchoSummarize {
             Event::InferDone { text, .. } => Command::Done {
                 result: serde_json::json!({ "path": self.path, "summary": text }),
             },
-            Event::SlicedBytes { .. } | Event::Emitted => Command::Fail {
+            Event::SlicedBytes { .. } | Event::Emitted | Event::Embedded { .. } => Command::Fail {
                 code: "unexpected_event".into(),
-                message: "this block requests neither raw bytes nor progress".into(),
+                message: "this block requests neither raw bytes, progress, nor embeddings".into(),
             },
         }
     }

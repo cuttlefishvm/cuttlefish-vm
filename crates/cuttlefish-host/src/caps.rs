@@ -14,12 +14,45 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
     read_roots: Vec<PathBuf>,
+    fetch_prefixes: Vec<String>,
 }
 
 impl Capabilities {
-    /// Grant read access beneath each of `read_roots`.
+    /// Grant read access beneath each of `read_roots`, and nothing else.
     pub fn new(read_roots: Vec<PathBuf>) -> Self {
-        Self { read_roots }
+        Self {
+            read_roots,
+            fetch_prefixes: Vec::new(),
+        }
+    }
+
+    /// Also grant fetching any URL beginning with one of `fetch_prefixes`.
+    pub fn with_fetch(mut self, fetch_prefixes: Vec<String>) -> Self {
+        self.fetch_prefixes = fetch_prefixes;
+        self
+    }
+
+    /// Whether `url` may be fetched.
+    ///
+    /// Prefix matching on the URL as written, deliberately: it is the rule a
+    /// spec author can predict from reading their own capability line. No
+    /// normalisation, no host-only matching — `Fetch "https://x.org/docs/"`
+    /// grants that subtree and not `https://x.org/other`, and not
+    /// `http://` either, since the scheme is part of the prefix.
+    ///
+    /// The one thing checked beyond the prefix is that the URL cannot climb
+    /// out with `..`, which would otherwise let a granted prefix reach
+    /// anywhere on the host.
+    pub fn allows_fetch(&self, url: &str) -> bool {
+        if url.contains("..") {
+            return false;
+        }
+        self.fetch_prefixes.iter().any(|p| url.starts_with(p))
+    }
+
+    /// The granted fetch prefixes, as configured.
+    pub fn fetch_prefixes(&self) -> &[String] {
+        &self.fetch_prefixes
     }
 
     /// Whether `path` may be read.

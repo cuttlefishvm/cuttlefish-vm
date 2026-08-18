@@ -117,6 +117,7 @@ fn spec(f: &Fixture, input: serde_json::Value) -> JobSpec {
         input,
         caps: f.caps.clone(),
         alternates: Default::default(),
+        embedder: None,
     }
 }
 
@@ -286,6 +287,7 @@ async fn a_module_that_is_not_wasm_fails_as_a_trap() {
             input: serde_json::json!({ "path": f.doc.to_str().unwrap() }),
             caps: f.caps.clone(),
             alternates: Default::default(),
+            embedder: None,
         },
         tx,
         CancellationToken::new(),
@@ -526,6 +528,7 @@ async fn a_fan_in_node_receives_both_upstream_outputs() {
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -593,6 +596,7 @@ export_block!(NeverDone);
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -661,6 +665,7 @@ export_block!(DoneFirst);
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -761,6 +766,7 @@ export_block!(MustNotRun);
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -862,6 +868,7 @@ export_block!(MustNotRun);
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -966,6 +973,7 @@ export_block!(MustNotRun);
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -1044,6 +1052,7 @@ export_block!(MustNotRun);
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (_ledger_dir, ledger) = test_ledger();
@@ -1163,6 +1172,7 @@ export_block!(MustNotRun);
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (_ledger_dir, ledger) = test_ledger();
@@ -1228,6 +1238,7 @@ async fn a_node_whose_output_violates_its_declared_signature_fails_loudly() {
         input: serde_json::json!({}),
         caps,
         alternates: Default::default(),
+        embedder: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);

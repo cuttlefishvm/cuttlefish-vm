@@ -209,6 +209,78 @@ impl InferBackend for OllamaBackend {
     fn supports_images(&self) -> bool {
         true
     }
+
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `/api/embed` (not the older `/api/embeddings`) because it takes an
+        // array and answers with one vector per input. The legacy endpoint
+        // is one text per request, which on a corpus is the difference
+        // between minutes and hours.
+        let response = self
+            .client
+            .post(format!("{}/api/embed", self.host))
+            .json(&serde_json::json!({ "model": self.model, "input": texts }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("embedding via {}: {e}", self.host))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("reading the embedding response: {e}"))?;
+        if !status.is_success() {
+            anyhow::bail!("embedding with `{}`: {status}: {body}", self.model);
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("embedding response was not JSON: {e}: {body}"))?;
+        let rows = parsed
+            .get("embeddings")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!("embedding response had no `embeddings` array: {body}")
+            })?;
+
+        // One vector per input, in order. A mismatch means the rows can no
+        // longer be paired with their texts, and pairing them wrongly is
+        // worse than failing: every downstream similarity would be against
+        // the wrong content.
+        if rows.len() != texts.len() {
+            anyhow::bail!(
+                "asked `{}` for {} embeddings and got {} — refusing to pair vectors with \
+                 texts by guesswork",
+                self.model,
+                texts.len(),
+                rows.len()
+            );
+        }
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            let vector: Vec<f32> = row
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("embedding {i} was not an array: {row}"))?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(f64::NAN) as f32)
+                .collect();
+            if vector.is_empty() || vector.iter().any(|v| v.is_nan()) {
+                anyhow::bail!(
+                    "embedding {i} from `{}` is empty or contains non-numbers; storing it \
+                     would poison every similarity computed against it",
+                    self.model
+                );
+            }
+            out.push(vector);
+        }
+        Ok(out)
+    }
+
+    fn supports_embeddings(&self) -> bool {
+        true
+    }
 }
 
 /// Builds [`OllamaBackend`], registered as the `ollama` provider.

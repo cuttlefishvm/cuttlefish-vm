@@ -85,6 +85,7 @@ async fn a_rhai_scripted_block_computes_pure_output_through_the_real_host() {
         input: serde_json::json!({ "n": 21 }),
         caps: Capabilities::new(Vec::new()),
         alternates: Default::default(),
+        embedder: None,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -117,6 +118,7 @@ async fn a_rhai_script_can_round_trip_an_infer_call_through_the_real_host() {
         input: serde_json::json!({ "text": "some document text" }),
         caps: Capabilities::new(Vec::new()),
         alternates: Default::default(),
+        embedder: None,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -149,6 +151,7 @@ async fn a_rhai_script_can_parse_json_out_of_a_real_infer_reply() {
         input: serde_json::Value::Null,
         caps: Capabilities::new(Vec::new()),
         alternates: Default::default(),
+        embedder: None,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -198,6 +201,7 @@ async fn a_rhai_script_can_open_and_slice_a_real_file() {
         input: serde_json::json!({ "path": doc.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
 
     let ledger =
@@ -240,6 +244,7 @@ async fn a_rhai_script_s_open_is_denied_outside_its_granted_capabilities() {
         // Granted a real, but unrelated, root -- not `outside`.
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
 
     let ledger =
@@ -290,6 +295,7 @@ async fn a_rhai_script_extracts_a_section_by_regex_from_a_real_file() {
         input: serde_json::json!({ "path": doc.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
 
     let ledger =
@@ -374,6 +380,7 @@ async fn a_script_node_resolved_from_the_catalog_and_run_through_run_job_gets_it
         input: serde_json::json!({ "n": 14 }),
         caps: Capabilities::new(Vec::new()),
         alternates: Default::default(),
+        embedder: None,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -458,6 +465,7 @@ async fn a_rhai_script_identifies_and_lists_a_real_gzipped_tar() {
         input: serde_json::json!({ "path": archive.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -525,6 +533,7 @@ async fn a_script_can_catch_a_gunzip_that_exceeds_its_ceiling() {
         input: serde_json::json!({ "path": bomb.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -593,6 +602,7 @@ async fn a_rhai_script_reads_image_metadata_and_finds_an_appended_payload() {
         input: serde_json::json!({ "path": path.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -651,6 +661,7 @@ async fn a_rhai_script_resizes_an_image_through_the_real_host() {
         input: serde_json::json!({ "path": path.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -706,6 +717,7 @@ async fn document_text_reads_the_whole_pdf_and_a_page_walk_extracts_once() {
             input: serde_json::json!({ "path": path.to_str().unwrap() }),
             caps: Capabilities::new(vec![dir.to_path_buf()]),
             alternates: Default::default(),
+            embedder: None,
         };
         let ledger = cuttlefish_host::ledger::Ledger::open(
             &dir.join(format!("ledger-{}.sqlite", script.len())),
@@ -837,6 +849,7 @@ async fn a_script_can_send_an_image_to_a_vision_model() {
         input: serde_json::json!({ "path": png.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -880,6 +893,7 @@ async fn passing_something_that_is_not_a_handle_says_so() {
         input: serde_json::json!({ "path": doc.to_str().unwrap() }),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -901,4 +915,237 @@ async fn passing_something_that_is_not_a_handle_says_so() {
         message.contains("not a handle"),
         "must name the mistake: {message}"
     );
+}
+
+/// A script fetches a URL and reads it, with no download step outside the
+/// pipeline.
+///
+/// This is the gap that sent a real run into 120 lines of Python before
+/// cuttlefish saw a byte: the corpus was on the web, and nothing here could
+/// reach it. Work done outside the pipeline gets none of what the pipeline
+/// provides — no capability check, no per-item isolation, no resume.
+///
+/// Served from a local socket rather than the internet, so the test is
+/// hermetic and still exercises the real client, the real capability check,
+/// and the real handle path.
+#[tokio::test]
+async fn a_script_can_fetch_a_url_and_read_it_like_a_file() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        // One tiny HTTP/1.1 response, by hand — this needs no server crate.
+        while let Ok((mut sock, _)) = listener.accept().await {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let body = "transmittal R123 nephrology ESRD";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let base = format!("http://127.0.0.1:{port}/");
+    let script = r#"
+        let f = fetch(input.url);
+        let s = slice(f.handle, 0, f.len);
+        #{ len: f.len, text: s.text }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({ "url": format!("{base}transmittals") }),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]).with_fetch(vec![base.clone()]),
+        alternates: Default::default(),
+        embedder: None,
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["text"], "transmittal R123 nephrology ESRD");
+    assert_eq!(result["len"], 32);
+}
+
+/// A URL outside every granted prefix is refused, and the message says how
+/// to grant it.
+#[tokio::test]
+async fn fetching_outside_the_granted_prefix_is_denied_with_the_remedy() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"#{ out: fetch("https://elsewhere.test/secrets").len }"#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()])
+            .with_fetch(vec!["https://www.cms.gov/".into()]),
+        alternates: Default::default(),
+        embedder: None,
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+    let error = envelope.error.unwrap();
+    assert_eq!(error.code, "capability_denied");
+    assert!(error.message.contains("Fetch"), "{}", error.message);
+    // Naming what *was* granted turns a guess into a comparison.
+    assert!(
+        error.message.contains("https://www.cms.gov/"),
+        "{}",
+        error.message
+    );
+}
+
+/// A script embeds text through the real host.
+///
+/// Uses a stub embedder rather than Ollama so the test is hermetic; the
+/// real backend is exercised separately in `tests/ollama.rs`. What this
+/// pins is the path: builtin -> Command::Embed -> backend -> vectors back
+/// into script scope, and that the batch form stays batched rather than
+/// becoming N round trips.
+#[derive(Default)]
+struct CountingEmbedder {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl InferBackend for CountingEmbedder {
+    async fn infer(
+        &self,
+        _req: InferRequest<'_>,
+        _on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
+    ) -> anyhow::Result<InferResult> {
+        anyhow::bail!("this backend only embeds")
+    }
+    fn model_name(&self) -> String {
+        "counting-embedder".into()
+    }
+    fn supports_embeddings(&self) -> bool {
+        true
+    }
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Deterministic and length-derived, so a test can tell vectors apart.
+        Ok(texts
+            .iter()
+            .map(|t| vec![t.len() as f32, 1.0, 2.0])
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn a_script_embeds_a_batch_in_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let embedder: Arc<dyn InferBackend> = Arc::new(CountingEmbedder {
+        calls: calls.clone(),
+    });
+
+    let script = r#"
+        let out = embed_many(["alpha", "bravo bravo", "charlie charlie charlie"]);
+        let dims = [];
+        for v in out.vectors { dims.push(v[0]); }
+        #{ count: out.vectors.len(), first_dims: dims }
+    "#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+        embedder: Some(embedder),
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    let result = envelope.result.expect("a completed job carries a result");
+    assert_eq!(result["count"], 3);
+    // Vectors come back in input order — the property that lets a caller
+    // pair each one with its text without guessing.
+    assert_eq!(result["first_dims"][0], 5.0);
+    assert_eq!(result["first_dims"][1], 11.0);
+    assert_eq!(result["first_dims"][2], 23.0);
+    // One batch, not three round trips. This is the whole reason the batch
+    // form is the primitive.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn embedding_without_a_declared_model_names_the_remedy() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"#{ n: embed("anything").vectors.len() }"#;
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+        embedder: None,
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+    let message = envelope.error.unwrap().message;
+    assert!(message.contains("embedding_model"), "{message}");
 }

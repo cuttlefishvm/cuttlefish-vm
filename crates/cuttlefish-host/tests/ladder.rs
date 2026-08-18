@@ -131,6 +131,7 @@ async fn run(
         input: serde_json::Value::Null,
         caps: Capabilities::new(vec![dir.to_path_buf()]),
         alternates,
+        embedder: None,
     };
     run_job(
         Arc::new(Engine::default()),
@@ -366,6 +367,7 @@ async fn an_escalation_carries_the_input_it_gave_up_on() {
         input: job_input.clone(),
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Alternates::new(),
+        embedder: None,
     };
     let envelope = run_job(
         Arc::new(Engine::default()),

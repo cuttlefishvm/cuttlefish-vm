@@ -547,6 +547,68 @@ impl RhaiBlock {
         }
         {
             let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+            // Fetching answers with the same record `open` does -- handle,
+            // len, kind -- so a downloaded resource is read exactly like a
+            // local file. Without this a corpus on the web meant writing a
+            // Batch first: `embed_many` is the real primitive and `embed`
+            // is a batch of one. A corpus is tens of thousands of chunks,
+            // and one round trip each is the difference between minutes and
+            // hours -- so the shape that scales is the easiest to reach for.
+            engine.register_fn(
+                "embed_many",
+                {
+                    let (call_index, pending, log) =
+                        (call_index.clone(), pending.clone(), log.clone());
+                    move |texts: rhai::Array| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                        let mut out = Vec::with_capacity(texts.len());
+                        for (i, value) in texts.iter().enumerate() {
+                            match value.clone().into_string() {
+                                Ok(t) => out.push(t),
+                                Err(actual) => {
+                                    return Err(format!(
+                                        "embed_many: item {i} is {actual}, not a string"
+                                    )
+                                    .into())
+                                }
+                            }
+                        }
+                        issue_or_replay(Command::Embed { texts: out }, &call_index, &pending, &log)
+                    }
+                },
+            );
+            engine.register_fn("embed", {
+                let (call_index, pending, log) =
+                    (call_index.clone(), pending.clone(), log.clone());
+                move |text: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::Embed {
+                            texts: vec![text.to_string()],
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                }
+            });
+            // download script outside cuttlefish, which then gets none of
+            // the capability checking, failure isolation or resume that
+            // being inside the pipeline provides.
+            engine.register_fn(
+                "fetch",
+                move |url: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    issue_or_replay(
+                        Command::Fetch {
+                            url: url.to_string(),
+                        },
+                        &call_index,
+                        &pending,
+                        &log,
+                    )
+                },
+            );
+        }
+        {
+            let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
             engine.register_fn(
                 "document_text",
                 move |handle: i64| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
@@ -758,6 +820,7 @@ impl Block for RhaiBlock {
             } => {
                 serde_json::json!({ "bytes_base64": bytes_base64, "next_offset": next_offset })
             }
+            Event::Embedded { vectors } => serde_json::json!({ "vectors": vectors }),
             Event::PageTexted { text } => serde_json::json!({ "text": text }),
             Event::PageImaged { handle, len } => {
                 serde_json::json!({ "handle": handle, "len": len })

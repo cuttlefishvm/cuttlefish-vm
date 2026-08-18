@@ -615,3 +615,54 @@ fn a_schema_path_outside_every_read_root_is_rejected() {
     assert!(msg.contains("elsewhere/v.json"), "{msg}");
     assert!(msg.contains("capabilities"), "{msg}");
 }
+
+#[test]
+fn a_fetch_grant_is_a_url_prefix_kept_exactly_as_written() {
+    // The whole predictability of the grant rests on this: the string in the
+    // spec is the string matched against. Normalising it here — adding a
+    // trailing slash, lowercasing, resolving the host — would mean an author
+    // cannot tell what they granted by reading their own capability line.
+    let src = SAMPLE.replace(
+        r#"[ Read "./docs" ]"#,
+        r#"[ Read "./docs", Fetch "https://www.cms.gov/medicare/" ]"#,
+    );
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(spec.read_roots, vec![PathBuf::from("./docs")]);
+    assert_eq!(spec.fetch_prefixes, vec!["https://www.cms.gov/medicare/"]);
+}
+
+#[test]
+fn a_fetch_grant_that_is_not_http_is_refused() {
+    // `file://` through the fetch path would route around `Read` entirely,
+    // which is the one thing a capability list exists to prevent.
+    for prefix in ["file:///etc", "ftp://x.org/", "/etc/passwd"] {
+        let src = SAMPLE.replace(
+            r#"[ Read "./docs" ]"#,
+            &format!(r#"[ Fetch "{prefix}" ]"#),
+        );
+        assert!(
+            parse_spec(&src).is_err(),
+            "`Fetch \"{prefix}\"` must not parse"
+        );
+    }
+}
+
+#[test]
+fn an_embedding_model_is_optional_and_separate_from_the_chat_model() {
+    // Separate because they are different models: a chat model cannot embed,
+    // and the failure when one is used for the other is a shaped-right,
+    // meaningless vector rather than an error.
+    assert!(parse_spec(SAMPLE).unwrap().embedding_model.is_none());
+
+    let src = SAMPLE.replace(
+        r#"  model = Path "./models/stub.gguf";"#,
+        "  model = Path \"./models/stub.gguf\";\n  \
+         embedding_model = Ollama \"nomic-embed-text\";",
+    );
+    let spec = parse_spec(&src).unwrap();
+    assert_eq!(spec.model, ModelRef::new("path", "./models/stub.gguf"));
+    assert_eq!(
+        spec.embedding_model,
+        Some(ModelRef::new("ollama", "nomic-embed-text"))
+    );
+}

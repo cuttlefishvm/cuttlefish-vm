@@ -44,6 +44,7 @@ pub mod caps;
 pub mod catalog;
 pub mod dag;
 pub mod documents;
+pub mod fetch;
 pub mod handles;
 pub mod hex;
 pub mod images;

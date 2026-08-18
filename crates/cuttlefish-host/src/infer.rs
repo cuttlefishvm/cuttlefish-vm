@@ -78,6 +78,31 @@ pub trait InferBackend: Send + Sync {
     fn supports_images(&self) -> bool {
         false
     }
+
+    /// Embed each of `texts`, returning one vector per input, in order.
+    ///
+    /// Batched rather than one call per text, and that is the whole point:
+    /// embedding a corpus means tens of thousands of chunks, and a round
+    /// trip each turns minutes into hours. Ollama's `/api/embed` accepts an
+    /// array natively, so the batch is real rather than a loop wearing a
+    /// batch's clothes.
+    ///
+    /// The default refuses. A backend that cannot embed must say so rather
+    /// than return empty vectors, which downstream would store as a valid
+    /// row and quietly poison every similarity search made against it.
+    async fn embed(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::bail!(
+            "this backend ({}) cannot produce embeddings. Declare an \
+             `embedding_model` your provider serves — with Ollama, a model built for it \
+             such as `nomic-embed-text`, not a chat model.",
+            self.model_name()
+        )
+    }
+
+    /// Whether [`InferBackend::embed`] will do anything.
+    fn supports_embeddings(&self) -> bool {
+        false
+    }
 }
 
 /// A deterministic fake that streams a fixed reply word by word.

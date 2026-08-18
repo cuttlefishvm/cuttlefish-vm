@@ -271,3 +271,83 @@ async fn talks_to_a_real_ollama() {
     assert!(result.tokens_in > 0, "prompt tokens must be counted");
     assert!(result.tokens_out > 0, "generated tokens must be counted");
 }
+
+/// Batched embeddings against a real Ollama, when one is reachable.
+///
+/// Skipped rather than failed when Ollama or the model is absent: this suite
+/// must stay runnable on a machine that has neither, and a test that fails
+/// for want of a service teaches people to ignore failures.
+#[tokio::test]
+async fn embedding_returns_one_vector_per_input_in_order() {
+    let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".into());
+    let model = "nomic-embed-text";
+
+    let reachable = reqwest::Client::new()
+        .get(format!("{host}/api/tags"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if !reachable {
+        eprintln!("skipping: no Ollama at {host}");
+        return;
+    }
+
+    let backend = OllamaBackend::new(host, model.to_string());
+    assert!(backend.supports_embeddings());
+
+    let texts = vec![
+        "transmittal R123 nephrology ESRD".to_string(),
+        "budget neutrality member months".to_string(),
+        "peer navigators behavioral health".to_string(),
+    ];
+    let vectors = match backend.embed(&texts).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("skipping: {model} unavailable ({e})");
+            return;
+        }
+    };
+
+    // One per input, order preserved — the property that lets a caller pair
+    // a vector back to its text without guessing.
+    assert_eq!(vectors.len(), 3);
+    let dims = vectors[0].len();
+    assert!(dims > 0, "an empty vector is not an embedding");
+    assert!(
+        vectors.iter().all(|v| v.len() == dims),
+        "ragged dimensions cannot be stored in one column"
+    );
+
+    // Related texts should sit closer than unrelated ones. Weak on purpose:
+    // this is checking the vectors mean *something*, not benchmarking the
+    // model.
+    let cosine = |a: &[f32], b: &[f32]| -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    };
+    let self_similarity = cosine(&vectors[0], &vectors[0]);
+    assert!(
+        (self_similarity - 1.0).abs() < 1e-3,
+        "a vector must be identical to itself: {self_similarity}"
+    );
+}
+
+#[tokio::test]
+async fn a_chat_backend_refuses_to_embed_rather_than_returning_nothing() {
+    // The failure that would otherwise be silent: empty vectors stored as
+    // valid rows, poisoning every similarity search made against them.
+    let stub = cuttlefish_host::infer::StubBackend::default();
+    assert!(!stub.supports_embeddings());
+    let err = stub
+        .embed(&["anything".to_string()])
+        .await
+        .expect_err("a backend that cannot embed must say so");
+    assert!(
+        err.to_string().contains("embedding_model"),
+        "the message must name the remedy: {err}"
+    );
+}

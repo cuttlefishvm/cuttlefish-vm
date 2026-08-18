@@ -43,6 +43,8 @@ pub struct AppState {
     /// `reroute` rung or a `Judge` naming its own model. Resolved at
     /// startup; see `cuttlefish_host::runner::Alternates`.
     pub alternates: Arc<cuttlefish_host::runner::Alternates>,
+    /// Serves `embed`, when the spec declared an `embedding_model`.
+    pub embedder: Option<Arc<dyn InferBackend>>,
     /// Job bookkeeping.
     pub jobs: JobStore,
     /// The one spec this daemon serves. A registry of many arrives later.
@@ -363,8 +365,10 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         nodes: (*st.checked_nodes).clone(),
         exclusive_to: (*st.exclusive_to).clone(),
         input: req.input,
-        caps: Capabilities::new(fanout_aware_roots(&st, &job_dir)),
+        caps: Capabilities::new(fanout_aware_roots(&st, &job_dir))
+            .with_fetch(st.spec.fetch_prefixes.clone()),
         alternates: (*st.alternates).clone(),
+        embedder: st.embedder.clone(),
     };
 
     // Every event goes through `publish`, so it lands in the replay log as well
@@ -554,8 +558,10 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
         nodes: (*st.checked_nodes).clone(),
         exclusive_to: (*st.exclusive_to).clone(),
         input,
-        caps: Capabilities::new(fanout_aware_roots(&st, &job_dir)),
+        caps: Capabilities::new(fanout_aware_roots(&st, &job_dir))
+            .with_fetch(st.spec.fetch_prefixes.clone()),
         alternates: (*st.alternates).clone(),
+        embedder: st.embedder.clone(),
     };
 
     // Atomic guard against a concurrent second /resume call racing to this
