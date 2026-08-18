@@ -84,9 +84,15 @@ sha2 = "0.11"
 # `parquet` pulls `arrow-array`/`arrow-schema` transitively, but they are named
 # explicitly because warehouse.rs builds schemas and arrays directly; relying on
 # a re-export would break on any parquet release that stops re-exporting.
-parquet = { version = "56", default-features = false, features = ["arrow", "snap"] }
-arrow-array = "56"
-arrow-schema = "56"
+#
+# Pinned to 58 to match the consumer that reads this output in the same toolchain rather than
+# only on disk. `hammer-knowledge` links DuckDB, whose `libduckdb-sys` requires arrow 58
+# unconditionally, so a 56 here meant any project holding both compiled two major versions of
+# arrow and could pass no arrow type between them. The interchange is still the file, and the
+# pin is what keeps a linked consumer possible as well.
+parquet = { version = "58.4", default-features = false, features = ["arrow", "snap"] }
+arrow-array = "58.4"
+arrow-schema = "58.4"
 
 # RFC 3339 timestamps for the catalog's index.json `created_at` field. Only the
 # `formatting` feature — `created_at` is written once and compared as a plain
