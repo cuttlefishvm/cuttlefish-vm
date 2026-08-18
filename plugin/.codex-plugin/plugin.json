@@ -1,0 +1,34 @@
+{
+  "name": "cuttlefish-agent-tools",
+  "version": "0.8.3",
+  "description": "Build, run, author, test, and manage Cuttlefish VM workloads from a coding agent.",
+  "author": {
+    "name": "cuttlefishvm"
+  },
+  "homepage": "https://cuttlefishvm.github.io/",
+  "repository": "https://github.com/cuttlefishvm/cuttlefish-vm",
+  "license": "MIT OR Apache-2.0",
+  "keywords": [
+    "cuttlefish",
+    "local-ai",
+    "wasm",
+    "agent-tooling"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Cuttlefish VM",
+    "shortDescription": "Run agent workloads on local models",
+    "longDescription": "Author, build, run, test, and manage sandboxed local-AI workloads using Cuttlefish VM.",
+    "developerName": "cuttlefishvm",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Author Cuttlefish specifications and blocks",
+      "Build Cuttlefish bundles",
+      "Run local AI jobs",
+      "Manage and test the block catalog"
+    ],
+    "defaultPrompt": [
+      "Help me build and run this workload locally with Cuttlefish."
+    ]
+  }
+}

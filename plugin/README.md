@@ -1,31 +1,61 @@
-# cuttlefish-agent-tools
+# Cuttlefish agent tools
 
-A Claude Code plugin: a `cuttlefish-catalog` skill (exact CLI syntax and
-output shapes for `cuttlefish catalog add/list/show/rm`) plus a
-`/cuttlefish-agent-tools:test-catalog` command that drives an agent through
-an independent, adversarial exercise of the catalog CLI.
+Portable coding-agent skills for authoring, building, running, testing, and
+managing Cuttlefish VM workloads. The plugin is packaged for Codex and
+Claude Code, while the skills themselves use the standard `SKILL.md` format
+and plain shell/CLI instructions.
 
-It also carries a `cuttlefish-build` skill (exact CLI syntax and output
-shapes for `cuttlefish build <spec> [-o out.cfbundle]`, the pipeline linker
-that resolves each stage — direct path or catalog `name@version` alike,
-checks the seams between blocks, and packages the result into a
-distributable `.cfbundle`) plus a `/cuttlefish-agent-tools:test-build`
-command that drives an agent through an independent, adversarial exercise
-of the build CLI.
+## What it provides
 
-These skills are plain bash/CLI instructions with no Claude-Code-specific
-tool references — usable by any coding agent that can run shell commands
-and read Markdown, not just Claude Code.
+Core workflow skills:
 
-## Install (from this repo)
+- `cuttlefish-cli` resolves current Cuttlefish binaries.
+- `cuttlefish-author` scaffolds and writes Rhai or Rust blocks.
+- `cuttlefish-build` links specifications into reproducible bundles.
+- `cuttlefish-catalog` manages local block and bundle versions.
+- `cuttlefish-run` drives project-scoped daemons and jobs.
 
+Black-box verification skills:
+
+- `cuttlefish-test-author`
+- `cuttlefish-test-build`
+- `cuttlefish-test-catalog`
+- `cuttlefish-test-run`
+
+The test skills isolate their state, exercise adversarial cases, and report
+expected versus actual behavior without modifying product code.
+
+## Install in Codex
+
+Add the repository marketplace:
+
+```console
+$ codex plugin marketplace add cuttlefishvm/cuttlefish-vm
+$ codex
 ```
-/plugin marketplace add ./
+
+Inside Codex, enter `/plugins`, select the `cuttlefish-vm` marketplace,
+install **Cuttlefish VM**, and start a new session.
+
+## Install in Claude Code
+
+From anywhere:
+
+```text
+/plugin marketplace add cuttlefishvm/cuttlefish-vm
 /plugin install cuttlefish-agent-tools@cuttlefish-vm
 /reload-plugins
 ```
 
-Then the `cuttlefish-catalog` and `cuttlefish-build` skills load
-automatically whenever they're relevant, and
-`/cuttlefish-agent-tools:test-catalog` and
-`/cuttlefish-agent-tools:test-build` are available to run on demand.
+From a local checkout, replace `cuttlefishvm/cuttlefish-vm` with `./`.
+Claude's existing `/cuttlefish-agent-tools:test-*` commands remain as thin
+wrappers around the portable test skills.
+
+## Use with other coding agents
+
+Agents supporting the [Agent Skills](https://agentskills.io/) format can
+load `plugin/skills/` directly or copy/symlink individual skill directories
+into their configured skills location. Optional delegation hints can be
+ignored when a runtime has no subagents. No Claude command, Codex hook, MCP
+server, or hosted service is required; the core procedures drive the local
+`cuttlefish` and `cuttlefishd` CLIs.
