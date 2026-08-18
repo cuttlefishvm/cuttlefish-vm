@@ -82,3 +82,4 @@ pub fn embedded_rhai_interpreter_bytes() -> &'static [u8] {
 /// says nothing about the real mismatch.
 pub mod render_worker;
 pub mod runner;
+pub mod warehouse;

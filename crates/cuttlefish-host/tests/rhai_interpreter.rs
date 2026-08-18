@@ -86,6 +86,7 @@ async fn a_rhai_scripted_block_computes_pure_output_through_the_real_host() {
         caps: Capabilities::new(Vec::new()),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -119,6 +120,7 @@ async fn a_rhai_script_can_round_trip_an_infer_call_through_the_real_host() {
         caps: Capabilities::new(Vec::new()),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -152,6 +154,7 @@ async fn a_rhai_script_can_parse_json_out_of_a_real_infer_reply() {
         caps: Capabilities::new(Vec::new()),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -202,6 +205,7 @@ async fn a_rhai_script_can_open_and_slice_a_real_file() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let ledger =
@@ -245,6 +249,7 @@ async fn a_rhai_script_s_open_is_denied_outside_its_granted_capabilities() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let ledger =
@@ -296,6 +301,7 @@ async fn a_rhai_script_extracts_a_section_by_regex_from_a_real_file() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let ledger =
@@ -381,6 +387,7 @@ async fn a_script_node_resolved_from_the_catalog_and_run_through_run_job_gets_it
         caps: Capabilities::new(Vec::new()),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -466,6 +473,7 @@ async fn a_rhai_script_identifies_and_lists_a_real_gzipped_tar() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -534,6 +542,7 @@ async fn a_script_can_catch_a_gunzip_that_exceeds_its_ceiling() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -603,6 +612,7 @@ async fn a_rhai_script_reads_image_metadata_and_finds_an_appended_payload() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -662,6 +672,7 @@ async fn a_rhai_script_resizes_an_image_through_the_real_host() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -718,6 +729,7 @@ async fn document_text_reads_the_whole_pdf_and_a_page_walk_extracts_once() {
             caps: Capabilities::new(vec![dir.to_path_buf()]),
             alternates: Default::default(),
             embedder: None,
+            warehouse: None,
         };
         let ledger = cuttlefish_host::ledger::Ledger::open(
             &dir.join(format!("ledger-{}.sqlite", script.len())),
@@ -850,6 +862,7 @@ async fn a_script_can_send_an_image_to_a_vision_model() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -894,6 +907,7 @@ async fn passing_something_that_is_not_a_handle_says_so() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -964,6 +978,7 @@ async fn a_script_can_fetch_a_url_and_read_it_like_a_file() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]).with_fetch(vec![base.clone()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -1001,6 +1016,7 @@ async fn fetching_outside_the_granted_prefix_is_denied_with_the_remedy() {
             .with_fetch(vec!["https://www.cms.gov/".into()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -1088,6 +1104,7 @@ async fn a_script_embeds_a_batch_in_one_call() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: Some(embedder),
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
@@ -1129,6 +1146,7 @@ async fn embedding_without_a_declared_model_names_the_remedy() {
         caps: Capabilities::new(vec![dir.path().to_path_buf()]),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
     let ledger =
         cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();

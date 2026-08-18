@@ -77,6 +77,12 @@ async fn main() -> anyhow::Result<()> {
             std::fs::canonicalize(&joined).unwrap_or(joined)
         })
         .collect();
+    // The warehouse root is spec-relative for the same reason, and *not*
+    // canonicalized: it names a directory that will not exist until the first
+    // job writes it, and `canonicalize` on a missing path returns the
+    // unresolved input anyway. Joining is the whole requirement.
+    spec.warehouse = spec.warehouse.take().map(|w| spec_dir.join(w));
+
     // Fan-out manifests are spec-relative for exactly the same reason, and
     // are read by the host rather than a block — so if this resolution were
     // skipped, a daemon started from another directory would read the wrong

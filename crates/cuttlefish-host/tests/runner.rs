@@ -118,6 +118,7 @@ fn spec(f: &Fixture, input: serde_json::Value) -> JobSpec {
         caps: f.caps.clone(),
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     }
 }
 
@@ -288,6 +289,7 @@ async fn a_module_that_is_not_wasm_fails_as_a_trap() {
             caps: f.caps.clone(),
             alternates: Default::default(),
             embedder: None,
+            warehouse: None,
         },
         tx,
         CancellationToken::new(),
@@ -529,6 +531,7 @@ async fn a_fan_in_node_receives_both_upstream_outputs() {
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -597,6 +600,7 @@ export_block!(NeverDone);
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -666,6 +670,7 @@ export_block!(DoneFirst);
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -767,6 +772,7 @@ export_block!(MustNotRun);
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -869,6 +875,7 @@ export_block!(MustNotRun);
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -974,6 +981,7 @@ export_block!(MustNotRun);
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);
@@ -1053,6 +1061,7 @@ export_block!(MustNotRun);
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (_ledger_dir, ledger) = test_ledger();
@@ -1173,6 +1182,7 @@ export_block!(MustNotRun);
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (_ledger_dir, ledger) = test_ledger();
@@ -1239,6 +1249,7 @@ async fn a_node_whose_output_violates_its_declared_signature_fails_loudly() {
         caps,
         alternates: Default::default(),
         embedder: None,
+        warehouse: None,
     };
 
     let (tx, _rx) = mpsc::channel(64);

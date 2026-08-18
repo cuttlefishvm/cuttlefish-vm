@@ -282,16 +282,18 @@ impl Ledger {
         node_name: &str,
         item_index: usize,
         output: &serde_json::Value,
+        input: Option<&serde_json::Value>,
     ) -> rusqlite::Result<()> {
         self.lock().execute(
             "INSERT OR REPLACE INTO checkpoints
-               (node_name, item_index, status, output_json, error_text, completed_at)
-             VALUES (?1, ?2, 'completed', ?3, NULL, ?4)",
+               (node_name, item_index, status, output_json, error_text, completed_at, input_json)
+             VALUES (?1, ?2, 'completed', ?3, NULL, ?4, ?5)",
             rusqlite::params![
                 node_name,
                 item_index as i64,
                 output.to_string(),
-                now_marker()
+                now_marker(),
+                input.map(|v| v.to_string())
             ],
         )?;
         Ok(())
@@ -306,8 +308,11 @@ impl Ledger {
     /// fan-out resume semantics: it separates "this chunk is bad" from "we
     /// were interrupted", without needing to ask which happened.
     /// `input` is stored so the item can be handed back later — see
-    /// [`Ledger::escalations`]. Only failures carry it: a successful item's
-    /// input is still in the manifest and nobody needs it returned.
+    /// [`Ledger::escalations`] — and so the warehouse can say where a row
+    /// came from. Successes carry it too, for the second reason: a warehouse
+    /// row has to be traceable on its own, and "the input is still in the
+    /// manifest" only helps somebody who has the manifest, the job directory,
+    /// and the knowledge that item 4,013 was line 4,014.
     pub fn write_item_failed(
         &self,
         node_name: &str,
@@ -398,6 +403,50 @@ impl Ledger {
                 // silently vanish from the projection.
                 if status == "completed" { None } else { error },
             ))
+        })?;
+        rows.collect()
+    }
+
+    /// Every concluded item of `node_name`, with everything the warehouse
+    /// needs to describe it.
+    ///
+    /// Distinct from [`Self::concluded_items`], which exists to project the
+    /// JSONL files and therefore deliberately discards the status once it has
+    /// decided output-or-error. The warehouse keeps the status verbatim: a
+    /// reader auditing bronze needs `escalated` and `failed` to stay
+    /// different, because one means "a human was asked" and the other means
+    /// "it simply did not work".
+    pub fn concluded_rows(&self, node_name: &str) -> rusqlite::Result<Vec<ConcludedRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT item_index, status, output_json, error_text, completed_at, input_json
+             FROM checkpoints
+             WHERE node_name = ?1 AND item_index >= 0 ORDER BY item_index",
+        )?;
+        let rows = stmt.query_map([node_name], |r| {
+            let status: String = r.get(1)?;
+            let output: Option<String> = r.get(2)?;
+            Ok(ConcludedRow {
+                item: r.get::<_, i64>(0)?,
+                output: if status == "completed" {
+                    output.map(|j| {
+                        serde_json::from_str(&j).expect("ledger never stores invalid JSON")
+                    })
+                } else {
+                    None
+                },
+                error: if status == "completed" {
+                    None
+                } else {
+                    r.get(3)?
+                },
+                status,
+                concluded_at: r.get(4)?,
+                // Absent on a ledger predating the column. Left absent rather
+                // than filled with a placeholder: an empty provenance column
+                // is honest, and `{}` would read as "the input was empty".
+                source_input: r.get(5)?,
+            })
         })?;
         rows.collect()
     }
@@ -642,4 +691,22 @@ pub fn jobs_root() -> Option<std::path::PathBuf> {
 /// don't affect correctness.
 fn now_marker() -> String {
     crate::catalog::now_rfc3339()
+}
+
+/// One concluded fan-out item, as the ledger recorded it.
+#[derive(Debug, Clone)]
+pub struct ConcludedRow {
+    /// The item's index in its manifest.
+    pub item: i64,
+    /// `completed`, `failed`, or `escalated`, exactly as stored.
+    pub status: String,
+    /// What the block returned, for a success.
+    pub output: Option<serde_json::Value>,
+    /// Why it did not, for anything else.
+    pub error: Option<String>,
+    /// When the item concluded, RFC 3339.
+    pub concluded_at: String,
+    /// The item's input as JSON text — its provenance. Absent on a ledger
+    /// written before the column existed.
+    pub source_input: Option<String>,
 }
