@@ -322,3 +322,103 @@ fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[tokio::test]
+async fn a_resumed_job_writes_a_whole_warehouse_not_a_partial_one() {
+    // The claim this checks: because the warehouse is written once at the end
+    // from the ledger, a run that was interrupted and then resumed produces a
+    // warehouse describing *every* item — the ones the first attempt already
+    // concluded included — rather than only what the resuming attempt itself
+    // ran. Writing per node as each concluded would fail this.
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.jsonl");
+    std::fs::write(
+        &manifest_path,
+        "{\"name\": \"alpha\"}\n{\"name\": \"bad\"}\n{\"name\": \"charlie\"}\n",
+    )
+    .unwrap();
+
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(std::fs::read(&manifest_path).unwrap());
+        cuttlefish_host::hex::encode(h.finalize())
+    };
+
+    let root = dir.path().join("warehouse");
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "fingerprint-1").unwrap();
+    ledger
+        .check_or_record_manifest("extract", &digest, 3)
+        .unwrap()
+        .unwrap();
+
+    // Exactly what an interrupted first attempt would have left: item 0
+    // concluded, items 1 and 2 never reached. The sentinel `length` could not
+    // be produced by the script, so a re-run would overwrite it.
+    ledger
+        .write_item_completed(
+            "extract",
+            0,
+            &serde_json::json!({"name": "alpha.txt", "length": 999, "ok": true}),
+            Some(&serde_json::json!({"name": "alpha", "from": "the interrupted attempt"})),
+        )
+        .unwrap();
+
+    let (tx, _rx) = mpsc::channel(1024);
+    let job = JobSpec {
+        nodes: vec![map_node(&manifest_path), reduce_node()],
+        exclusive_to: HashMap::new(),
+        input: serde_json::Value::Null,
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+        embedder: None,
+        warehouse: Some(WarehousePlan {
+            root: root.clone(),
+            spec_name: "index_corpus".into(),
+            model: "stub".into(),
+            embedding_model: None,
+        }),
+    };
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+
+    let bronze = read_table(&root.join("bronze/extract.parquet"));
+    let total: usize = bronze.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 3,
+        "the warehouse covers every item, not only those this attempt ran"
+    );
+
+    // The pre-seeded item's own recorded values survive, which is what shows
+    // the warehouse was built from the ledger rather than from this run.
+    let silver = read_table(&root.join("silver/extract.parquet"));
+    let s = &silver[0];
+    let lengths = s
+        .column_by_name("f_length")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let all: Vec<i64> = (0..s.num_rows()).map(|i| lengths.value(i)).collect();
+    assert!(
+        all.contains(&999),
+        "the already-concluded item's recorded output reaches the warehouse: {all:?}"
+    );
+
+    // And its provenance is the one recorded then, not one reconstructed now.
+    let b = &bronze[0];
+    let sources = strings(b, "source_input");
+    assert!(
+        (0..b.num_rows()).any(|i| sources.value(i).contains("the interrupted attempt")),
+        "lineage comes from the ledger, so it survives the interruption"
+    );
+}
