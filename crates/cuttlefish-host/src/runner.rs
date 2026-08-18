@@ -1883,13 +1883,25 @@ async fn run_stage(
 
             Command::Open { path } => {
                 let p = std::path::PathBuf::from(&path);
-                if !caps.allows_read(&p) {
+                if let Some(denial) = caps.read_denial(&p) {
                     usage.duration_ms = started.elapsed().as_millis() as u64;
-                    return Err(fail(
-                        error_codes::CAPABILITY_DENIED,
-                        format!("read not permitted: {path}"),
-                        usage.clone(),
-                    ));
+                    // A missing file is not a permissions problem, and saying
+                    // so costs an iteration every time somebody's manifest
+                    // names a file that moved.
+                    let (code, message) = match denial {
+                        crate::caps::ReadDenial::Missing => (
+                            error_codes::NOT_FOUND,
+                            format!(
+                                "no such file: {path} — it is inside a granted root, so this is \
+                                 the path being wrong rather than the grant"
+                            ),
+                        ),
+                        crate::caps::ReadDenial::NotGranted => (
+                            error_codes::CAPABILITY_DENIED,
+                            format!("read not permitted: {path}"),
+                        ),
+                    };
+                    return Err(fail(code, message, usage.clone()));
                 }
                 match handles.open(&p) {
                     Ok((handle, len, kind)) => {

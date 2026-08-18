@@ -755,6 +755,14 @@ pub mod error_codes {
     /// A command needed a capability this build does not have — asking for a
     /// page image without document rendering compiled in, say.
     pub const UNSUPPORTED: &str = "unsupported";
+    /// A path the job may read names nothing.
+    ///
+    /// Distinct from [`CAPABILITY_DENIED`] on purpose: one is a wrong path
+    /// and the other a wrong grant, and they are fixed in different files.
+    /// Only used where the job could have discovered the absence itself —
+    /// outside a grant, absence and refusal stay indistinguishable, because
+    /// telling them apart is an existence oracle.
+    pub const NOT_FOUND: &str = "not_found";
 }
 
 impl Default for MediaKind {

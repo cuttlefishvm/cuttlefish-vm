@@ -92,8 +92,73 @@ impl Capabilities {
         })
     }
 
+    /// Why a read was refused, when it was.
+    ///
+    /// [`Self::allows_read`] answers yes-or-no, which is the right shape for
+    /// the decision and the wrong shape for the message. Two very different
+    /// situations reach it as `false`: a path the spec never granted, and a
+    /// granted path that simply is not there. Reporting both as "read not
+    /// permitted" sends somebody to re-read their `capabilities` line when
+    /// what they actually have is a typo in a filename or a manifest listing
+    /// a file that was moved.
+    ///
+    /// Saying "does not exist" is only safe where the job could have found
+    /// out anyway. So it is said only when the nearest *existing* ancestor of
+    /// the path is itself inside a granted root — a directory the job may
+    /// already open and read. For anything else the answer stays the
+    /// undifferentiated refusal, because distinguishing "absent" from
+    /// "forbidden" outside the grant is exactly the probe a capability list
+    /// exists to prevent.
+    pub fn read_denial(&self, path: &Path) -> Option<ReadDenial> {
+        if self.allows_read(path) {
+            return None;
+        }
+
+        // Something is genuinely there — a symlink inside the grant pointing
+        // out of it, say. It was refused because of where it *resolves*, not
+        // because it is absent, and calling that "no such file" would send
+        // the reader looking for a typo in a path that is spelled correctly.
+        // `symlink_metadata` rather than `exists`, which follows the link and
+        // would report the escape as absent whenever the target is.
+        if path.symlink_metadata().is_ok() {
+            return Some(ReadDenial::NotGranted);
+        }
+
+        // The nearest ancestor that exists. `canonicalize` fails on the whole
+        // path when any component is missing, so walk up until it succeeds.
+        let mut ancestor = path.parent();
+        while let Some(dir) = ancestor {
+            if let Ok(real) = dir.canonicalize() {
+                let inside = self.read_roots.iter().any(|root| {
+                    root.canonicalize()
+                        .map(|root| real.starts_with(root))
+                        .unwrap_or(false)
+                });
+                return Some(if inside {
+                    ReadDenial::Missing
+                } else {
+                    ReadDenial::NotGranted
+                });
+            }
+            ancestor = dir.parent();
+        }
+        Some(ReadDenial::NotGranted)
+    }
+
     /// The granted read roots, as configured.
     pub fn read_roots(&self) -> &[PathBuf] {
         &self.read_roots
     }
+}
+
+/// Why [`Capabilities::allows_read`] said no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadDenial {
+    /// The path is not inside any granted root — or is somewhere the job may
+    /// not learn anything about, including whether it exists.
+    NotGranted,
+    /// The path would be readable, but there is nothing there. Only reported
+    /// where the job could have discovered that itself; see
+    /// [`Capabilities::read_denial`].
+    Missing,
 }

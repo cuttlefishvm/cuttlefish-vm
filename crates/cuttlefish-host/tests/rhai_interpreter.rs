@@ -1166,3 +1166,110 @@ async fn embedding_without_a_declared_model_names_the_remedy() {
     let message = envelope.error.unwrap().message;
     assert!(message.contains("embedding_model"), "{message}");
 }
+
+/// A granted path that names nothing fails as a missing file, not a denial.
+///
+/// The friction this removes was measured on a real corpus: one manifest
+/// entry naming a moved file failed with "read not permitted", which reads as
+/// a permissions problem and sends you to re-check the `capabilities` line
+/// that was never wrong.
+#[tokio::test]
+async fn a_missing_file_inside_a_grant_fails_as_missing_not_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("moved-away.txt");
+    let script = format!(
+        r#"#{{ len: open("{}").len }}"#,
+        absent.to_string_lossy().replace('\\', "\\\\")
+    );
+
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node(&script)],
+        exclusive_to: HashMap::new(),
+        input: serde_json::json!({}),
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+        embedder: None,
+        warehouse: None,
+    };
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+
+    assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+    let error = envelope.error.unwrap();
+    // The code matters as much as the words: a script or an agent branching
+    // on `capability_denied` would retry with a wider grant, which cannot
+    // help and hides the real cause.
+    assert_eq!(error.code, "not_found", "{}", error.message);
+    assert!(error.message.contains("no such file"), "{}", error.message);
+    assert!(
+        error.message.contains("rather than the grant"),
+        "the message has to say which of the two things is wrong: {}",
+        error.message
+    );
+}
+
+/// A path outside every grant still refuses without saying whether it exists.
+#[tokio::test]
+async fn a_path_outside_every_grant_is_denied_without_revealing_existence() {
+    let granted = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let real = elsewhere.path().join("real.txt");
+    std::fs::write(&real, b"secret").unwrap();
+
+    // Same job shape twice: once against a file that is there, once against
+    // one that is not. Both must fail identically — any difference is an
+    // existence oracle for paths the job was never granted.
+    let mut seen = Vec::new();
+    for target in [real, elsewhere.path().join("imaginary.txt")] {
+        let script = format!(
+            r#"#{{ len: open("{}").len }}"#,
+            target.to_string_lossy().replace('\\', "\\\\")
+        );
+        let (tx, _rx) = mpsc::channel(64);
+        let job = JobSpec {
+            nodes: vec![script_node(&script)],
+            exclusive_to: HashMap::new(),
+            input: serde_json::json!({}),
+            caps: Capabilities::new(vec![granted.path().to_path_buf()]),
+            alternates: Default::default(),
+            embedder: None,
+            warehouse: None,
+        };
+        let ledger = cuttlefish_host::ledger::Ledger::open(
+            &granted.path().join(format!("{}.sqlite", seen.len())),
+            "fp",
+        )
+        .unwrap();
+        let envelope = run_job(
+            Arc::new(Engine::default()),
+            Arc::new(StubBackend::default()),
+            job,
+            tx,
+            CancellationToken::new(),
+            &ledger,
+            &ModuleCache::new(),
+        )
+        .await;
+        assert_eq!(envelope.status, JobStatus::Failed, "{envelope:?}");
+        seen.push(envelope.error.unwrap().code);
+    }
+
+    assert_eq!(
+        seen[0], seen[1],
+        "an absent file and a real one outside the grant must be \
+         indistinguishable: {seen:?}"
+    );
+    assert_eq!(seen[0], "capability_denied");
+}
