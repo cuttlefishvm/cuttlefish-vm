@@ -4,12 +4,12 @@
     "name": "cuttlefishvm",
     "url": "https://github.com/cuttlefishvm/cuttlefish-vm"
   },
-  "description": "Agent tooling for driving the Cuttlefish block catalog",
+  "description": "Agent tooling for authoring, building, running, testing, and managing Cuttlefish VM workloads",
   "plugins": [
     {
       "name": "cuttlefish-agent-tools",
       "source": "./plugin",
-      "description": "Skill and adversarial test harness for the cuttlefish block catalog CLI"
+      "description": "Portable skills and adversarial test harnesses for Cuttlefish VM workflows"
     }
   ]
 }

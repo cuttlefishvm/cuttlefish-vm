@@ -1,12 +1,12 @@
 {
   "name": "cuttlefish-agent-tools",
-  "description": "Skill and adversarial test harness for the cuttlefish block catalog and build CLI",
-  "version": "0.8.2",
+  "description": "Build, run, author, test, and manage Cuttlefish VM workloads from a coding agent.",
+  "version": "0.8.3",
   "author": {
     "name": "cuttlefishvm"
   },
   "homepage": "https://cuttlefishvm.github.io/",
   "repository": "https://github.com/cuttlefishvm/cuttlefish-vm",
   "license": "MIT OR Apache-2.0",
-  "keywords": ["cuttlefish", "catalog", "wasm", "agent-tooling"]
+  "keywords": ["cuttlefish", "local-ai", "wasm", "agent-tooling"]
 }

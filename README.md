@@ -267,34 +267,52 @@ inside the granted directory. That is the capability check working, not a bug â€
 
 ## Agent tools
 
-This repo carries its own Claude Code plugin marketplace
-(`.claude-plugin/marketplace.json`), so an agent working in a checkout of
-this repo can install a `cuttlefish-catalog` skill (exact CLI syntax for
-`cuttlefish catalog add/list/show/rm`) and a
-`/cuttlefish-agent-tools:test-catalog` command that drives an independent,
-adversarial exercise of the catalog CLI:
+The `cuttlefish-agent-tools` plugin teaches coding agents how to author
+blocks, build bundles, run jobs, manage the catalog, and independently test
+each workflow. Its skills are standard `SKILL.md` files under
+[`plugin/skills`](./plugin/skills), and their core procedures use plain
+shell commands and the Cuttlefish CLI. Optional delegation hints can be
+ignored by agents that do not provide subagents.
 
-```
-/plugin marketplace add ./
-/plugin install cuttlefish-agent-tools@cuttlefish-vm
-/reload-plugins
+### Codex
+
+Add this repository as a marketplace:
+
+```console
+$ codex plugin marketplace add cuttlefishvm/cuttlefish-vm
+$ codex
 ```
 
-The same thing works from anywhere without a local checkout, using the
-GitHub shorthand instead of a local path:
+Inside Codex, open the plugin browser with `/plugins` (plural), choose the
+`cuttlefish-vm` marketplace, install **Cuttlefish VM**, and start a new
+session.
+
+### Claude Code
+
+From anywhere, add the GitHub marketplace and install the plugin:
 
 ```
 /plugin marketplace add cuttlefishvm/cuttlefish-vm
 /plugin install cuttlefish-agent-tools@cuttlefish-vm
+/reload-plugins
 ```
 
-See [`plugin/README.md`](./plugin/README.md) for what the plugin provides.
+For local plugin development, run the same commands from this repository
+with `./` in place of `cuttlefishvm/cuttlefish-vm`.
 
-The skills themselves are plain bash/CLI instructions with no
-Claude-Code-specific tool references, so they work with any coding agent
-that can run shell commands and read Markdown â€” the install commands
-above are Claude Code's own syntax for adding the marketplace, not the
-only supported way to use what's inside it.
+### Other coding agents
+
+Any agent that supports the [Agent Skills](https://agentskills.io/)
+`SKILL.md` format can load the directories in `plugin/skills` directly or
+install them in its configured skills directory. The four adversarial test
+flows are skills too, so they do not depend on Claude-style slash commands:
+
+- `cuttlefish-test-author`
+- `cuttlefish-test-build`
+- `cuttlefish-test-catalog`
+- `cuttlefish-test-run`
+
+See [`plugin/README.md`](./plugin/README.md) for what the plugin provides.
 
 ## Contributing
 
