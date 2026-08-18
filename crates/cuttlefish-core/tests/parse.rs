@@ -428,9 +428,18 @@ fn a_manifest_outside_every_read_root_is_rejected() {
 #[test]
 fn an_absolute_grant_covers_a_relative_manifest_once_both_are_resolved() {
     let dir = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // A backslash is a legal filename character on Unix, so this keeps the
+    // Windows string-literal boundary covered on every CI platform.
+    let root = dir.path().join(r"contains\C");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
     std::fs::create_dir_all(root.join("corpus")).unwrap();
     std::fs::write(root.join("corpus/m.jsonl"), "{}\n").unwrap();
+    let root_literal = root
+        .display()
+        .to_string()
+        .replace('\\', r"\\")
+        .replace('"', r#"\""#);
 
     let mut spec = parse_spec(&format!(
         r#"spec s = {{
@@ -438,7 +447,7 @@ fn an_absolute_grant_covers_a_relative_manifest_once_both_are_resolved() {
   capabilities = [ Read "{}" ];
   nodes = {{ a = {{ block = "a@1"; over = "./corpus/m.jsonl"; }}; }};
 }}"#,
-        root.display()
+        root_literal
     ))
     .expect("a spec of this shape must parse");
 
