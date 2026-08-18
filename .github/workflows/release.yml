@@ -142,6 +142,19 @@ jobs:
               --title "$GITHUB_REF_NAME" --generate-notes --draft
           fi
 
+      # The installer ships as an asset so nobody has to author it before
+      # they can use it. Uploaded here, before the binaries, so the
+      # checksums job downstream hashes it alongside them — an installer
+      # nobody can verify is a poor thing to hand people.
+      - uses: actions/checkout@v7
+      - name: Attach the installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" scripts/install.sh \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
   # Prebuilt `cuttlefish` (CLI) and `cuttlefishd` (daemon) binaries, so using
   # this project doesn't require a Rust toolchain. Built without the
   # `llamacpp`/`pdf-render` features: both pull in a native C/C++ toolchain

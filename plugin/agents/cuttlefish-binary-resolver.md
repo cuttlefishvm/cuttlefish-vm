@@ -71,70 +71,25 @@ fixed long ago. One API call settles which tag is current.
 
 ### 4. Otherwise: download the latest release
 
-Write this to `/tmp/cuttlefish-resolve-binary.sh` with the `Write` tool,
-then run it with `bash /tmp/cuttlefish-resolve-binary.sh` — a named
-script run from a stable path, not an inline heredoc, so the command is
-the same recognizable shape every time instead of embedding different
-literal content on every invocation:
-
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-curl -fsSL https://api.github.com/repos/cuttlefishvm/cuttlefish-vm/releases/latest \
-  -o /tmp/cuttlefish-release.json
-
-TAG=$(grep -m1 '"tag_name"' /tmp/cuttlefish-release.json | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
-VERSION="${TAG#v}"
-CACHE_DIR="$HOME/.cache/cuttlefish/bin/$TAG"
-
-if [ -e "$CACHE_DIR/cuttlefish" ]; then
-  echo "TAG=$TAG"
-  echo "BIN_DIR=$CACHE_DIR"
-  exit 0
-fi
-
-case "$(uname -s)" in
-  Linux)
-    case "$(uname -m)" in
-      aarch64|arm64) TARGET=aarch64-unknown-linux-gnu ;;
-      *) TARGET=x86_64-unknown-linux-gnu ;;
-    esac
-    EXT=tar.gz
-    ;;
-  Darwin)
-    case "$(uname -m)" in
-      arm64|aarch64) TARGET=aarch64-apple-darwin ;;
-      *) TARGET=x86_64-apple-darwin ;;
-    esac
-    EXT=tar.gz
-    ;;
-  *)
-    echo "unsupported platform for this script: $(uname -s)/$(uname -m) — resolve Windows by hand" >&2
-    exit 1
-    ;;
-esac
-
-ASSET="cuttlefish-${VERSION}-${TARGET}.${EXT}"
-ASSET_URL=$(grep -o "\"browser_download_url\": *\"[^\"]*/${ASSET}\"" /tmp/cuttlefish-release.json | sed -E 's/.*"(https[^"]+)"/\1/')
-SUMS_URL=$(grep -o '"browser_download_url": *"[^"]*/SHA256SUMS"' /tmp/cuttlefish-release.json | sed -E 's/.*"(https[^"]+)"/\1/')
-
-if [ -z "$ASSET_URL" ] || [ -z "$SUMS_URL" ]; then
-  echo "expected assets not found in release $TAG: need $ASSET and SHA256SUMS" >&2
-  exit 1
-fi
-
-mkdir -p /tmp/cuttlefish-dl && cd /tmp/cuttlefish-dl
-curl -fsSL "$ASSET_URL" -o "$ASSET"
-curl -fsSL "$SUMS_URL" -o SHA256SUMS
-grep " ${ASSET}\$" SHA256SUMS | shasum -a 256 -c -
-
-mkdir -p "$CACHE_DIR"
-tar xzf "$ASSET" -C "$CACHE_DIR" --strip-components=1
-
-echo "TAG=$TAG"
-echo "BIN_DIR=$CACHE_DIR"
+curl -fsSL https://github.com/cuttlefishvm/cuttlefish-vm/releases/latest/download/install.sh \
+  -o /tmp/cf-install.sh
+bash /tmp/cf-install.sh
 ```
+
+It prints `TAG=` and `BIN_DIR=`; put `BIN_DIR` on `PATH`. It resolves the
+latest tag, verifies the archive against the release's `SHA256SUMS`, and
+caches under `~/.cache/cuttlefish/bin/<tag>/`, so a second run exits
+immediately.
+
+**Do not write this script yourself.** It ships as a release asset
+precisely so nobody has to: an authored file needs approval, gets retyped
+slightly differently each time, and is the friction that had agents stop at
+"cuttlefish: command not found".
+
+`CUTTLEFISH_TAG=v0.0.8` pins an older release when reproducing a past run.
+Windows has no installer — take the `x86_64-pc-windows-msvc` zip from the
+release page.
 
 A checksum mismatch (`set -e` makes the `shasum -c` failure fatal) is a
 hard stop — never fall back to running an unverified binary. Report the
