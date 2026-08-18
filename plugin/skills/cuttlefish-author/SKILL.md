@@ -304,6 +304,77 @@ Walking pages is still fine when a document genuinely has them — the
 extraction is cached per handle, so a page walk costs one extraction, not
 one per page.
 
+**A corpus on the web is still a corpus.** `fetch(url)` downloads it and
+answers with the same record `open` does — `{handle, len, kind}` — so
+everything downstream works unchanged:
+
+```
+//! signature: {url: text} -> {rows: json}
+let page = fetch(input.url);
+let body = slice(page.handle, 0, page.len);
+#{ rows: parse_json(body.text).items }
+```
+
+It needs a grant, exactly as reading a file does:
+
+```
+capabilities = [ Read "./corpus", Fetch "https://www.cms.gov/medicare/" ];
+```
+
+The grant is a **prefix on the URL as written**, so you can predict it from
+your own capability line: that example covers
+`https://www.cms.gov/medicare/transmittals?page=2` and does *not* cover
+`https://www.cms.gov/medicaid/...`, a different host, or the same path over
+`http://`. A URL containing `..` is refused outright.
+
+Three things worth knowing:
+
+- **A URL already fetched by this job is not fetched again.** The script is
+  replayed for each host-call answer and a fan-out item re-runs after a
+  resume, so without that one logical read would become many requests
+  against somebody else's server.
+- **Fetch, then fan out — don't fetch inside the loop** unless each item
+  genuinely has its own URL. Downloading a listing once and fanning out over
+  its rows is one request; fanning out first and fetching per item is N.
+- **Responses are capped** and the download is stopped mid-flight if it runs
+  past the ceiling, rather than discovered once the disk is full.
+
+Don't write a download script outside the pipeline. Work done out there
+gets none of what being inside provides: no capability check, no per-item
+failure isolation, no resume, and nothing in the ledger.
+
+**`embed_many(texts)` turns text into vectors** for a retrieval index, a
+similarity join, or clustering. It answers `{vectors: [[f32]]}` — one vector
+per input, **in input order**, so you can pair each with its text by position
+without matching on anything.
+
+```
+//! signature: {chunks: json} -> {rows: json}
+let out = embed_many(input.chunks);
+let rows = [];
+for i in 0..input.chunks.len() {
+    rows.push(#{ text: input.chunks[i], vector: out.vectors[i] });
+}
+#{ rows: rows }
+```
+
+It needs a model that serves embeddings, declared alongside the chat model:
+
+```
+model = Ollama "qwen2.5:7b";
+embedding_model = Ollama "nomic-embed-text";
+```
+
+- **Batch. `embed_many` is the primitive; `embed(text)` is a batch of one.**
+  A corpus is tens of thousands of chunks, and one round trip each is the
+  difference between minutes and hours.
+- **A chat model is not an embedding model.** Declaring one fails with a
+  message naming `embedding_model` and the kind of model to put there, rather
+  than returning something shaped right and meaningless.
+- **Chunk before you embed.** Every model has an input ceiling and quietly
+  truncates past it, so a whole 227-page filing embedded as one string is a
+  vector for its first few pages wearing the whole document's name.
+
 **A scanned PDF has no text to extract** — `open` reports
 `has_text_layer: false` and `document_text` returns nothing. Read it with a
 vision model instead: render the page, then send the handle.

@@ -176,3 +176,34 @@ fn a_relative_path_is_resolved_against_the_working_directory_not_the_root() {
         "the same relative spelling must not be allowed by an unrelated grant"
     );
 }
+
+#[test]
+fn a_fetch_grant_covers_its_prefix_and_nothing_else() {
+    let caps = Capabilities::new(vec![]).with_fetch(vec!["https://www.cms.gov/medicare/".into()]);
+
+    assert!(caps.allows_fetch("https://www.cms.gov/medicare/transmittals?page=2"));
+    // A sibling path under the same host is not granted: the prefix is the
+    // rule, so an author can predict it from their own capability line.
+    assert!(!caps.allows_fetch("https://www.cms.gov/medicaid/other"));
+    // The scheme is part of the prefix — http is not https.
+    assert!(!caps.allows_fetch("http://www.cms.gov/medicare/x"));
+    // Another host entirely, however similar.
+    assert!(!caps.allows_fetch("https://www.cms.gov.evil.test/medicare/x"));
+}
+
+#[test]
+fn a_url_cannot_climb_out_of_its_granted_prefix() {
+    // Without this, a granted subtree reaches anything on the host, which
+    // makes the capability line a description of nothing.
+    let caps = Capabilities::new(vec![]).with_fetch(vec!["https://x.test/docs/".into()]);
+    assert!(caps.allows_fetch("https://x.test/docs/a.pdf"));
+    assert!(!caps.allows_fetch("https://x.test/docs/../secrets/a.pdf"));
+}
+
+#[test]
+fn no_fetch_grant_means_no_fetching() {
+    // The default. A spec that says nothing about the network gets none.
+    let caps = Capabilities::new(vec!["/tmp".into()]);
+    assert!(!caps.allows_fetch("https://anything.test/"));
+    assert!(caps.fetch_prefixes().is_empty());
+}

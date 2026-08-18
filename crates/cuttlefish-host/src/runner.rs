@@ -106,6 +106,11 @@ pub struct JobSpec {
     pub input: serde_json::Value,
     /// What this job is permitted to reach.
     pub caps: Capabilities,
+    /// The backend serving `embed`, if the spec declared an
+    /// `embedding_model`. Resolved at startup like every other model, so a
+    /// spec naming one this build cannot serve fails as the daemon comes up
+    /// rather than partway through a corpus.
+    pub embedder: Option<Arc<dyn InferBackend>>,
     /// Backends for models beyond the job's own — see [`Alternates`].
     /// Empty for a spec with no `reroute` rung and no model-bearing `Judge`,
     /// which is every spec that existed before acceptance contracts.
@@ -551,6 +556,7 @@ pub async fn run_job(
                     &checks[index],
                     node,
                     &job.caps,
+                    job.embedder.as_ref(),
                     &mut handles,
                     &events,
                     &cancel,
@@ -594,8 +600,11 @@ pub async fn run_job(
             // its own doc comment) so this only ever catches genuine shape
             // mismatches, not false positives on types this protocol has no
             // fixed JSON encoding for.
+            let job_dir = ledger.job_dir();
             let ladder = Ladder {
                 engine: &engine,
+                embedder: job.embedder.as_ref(),
+                job_dir,
                 cache,
                 default_backend: &backend,
                 alternates: &job.alternates,
@@ -824,6 +833,7 @@ async fn run_fanout_node(
     checks: &crate::accept::CompiledChecks,
     node: &crate::dag::CheckedNode,
     caps: &Capabilities,
+    embedder: Option<&Arc<dyn InferBackend>>,
     handles: &mut Handles,
     events: &mpsc::Sender<JobEvent>,
     cancel: &CancellationToken,
@@ -1020,8 +1030,11 @@ async fn run_fanout_node(
         // The same ladder the ordinary-node path uses, per item. `expected`
         // is the *per-item* output, and `repeat_until` is `None` because
         // combining it with `over` is forbidden at parse time.
+        let job_dir = ledger.job_dir();
         let ladder = Ladder {
             engine,
+            embedder,
+            job_dir,
             cache,
             default_backend: backend,
             alternates,
@@ -1205,6 +1218,11 @@ enum LadderError {
 /// what makes "identically" checkable by eye.
 struct Ladder<'a> {
     engine: &'a Engine,
+    /// Serves `embed`, when the spec declared an embedding model.
+    embedder: Option<&'a Arc<dyn InferBackend>>,
+    /// Where a fetched URL is written. The job's own directory, so a
+    /// download shares the job's lifetime and sits beside its results.
+    job_dir: &'a std::path::Path,
     cache: &'a crate::module_cache::ModuleCache,
     /// The job's own backend: where the first attempt goes, and — always —
     /// where judges are asked. A judge run on the rerouted model would be
@@ -1370,6 +1388,8 @@ impl Ladder<'_> {
                 current.clone(),
                 script,
                 self.caps,
+                self.embedder,
+                self.job_dir,
                 handles,
                 self.events,
                 self.cancel,
@@ -1455,6 +1475,8 @@ async fn run_stage(
     input: serde_json::Value,
     script: Option<&str>,
     caps: &Capabilities,
+    embedder: Option<&Arc<dyn InferBackend>>,
+    job_dir: &std::path::Path,
     handles: &mut Handles,
     events: &mpsc::Sender<JobEvent>,
     cancel: &CancellationToken,
@@ -1542,6 +1564,68 @@ async fn run_stage(
             // The capability check lives here, at Open, and nowhere else. Slice
             // takes a handle rather than a path, and handles are job-scoped, so
             // there is no second place a path can enter the system.
+            Command::Embed { texts } => {
+                let Some(backend) = embedder else {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return Err(fail(
+                        error_codes::UNSUPPORTED,
+                        "this spec declares no `embedding_model`, so `embed` has nothing to \
+                         call. Add one, e.g. `embedding_model = Ollama \"nomic-embed-text\";` \
+                         — it is deliberately separate from `model`, since a chat model \
+                         cannot produce embeddings."
+                            .to_string(),
+                        usage.clone(),
+                    ));
+                };
+                match backend.embed(&texts).await {
+                    Ok(vectors) => Event::Embedded { vectors },
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return Err(fail(error_codes::UNSUPPORTED, e.to_string(), usage.clone()));
+                    }
+                }
+            }
+
+            Command::Fetch { url } => {
+                if !caps.allows_fetch(&url) {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    let granted = if caps.fetch_prefixes().is_empty() {
+                        "this spec grants no `Fetch` capability at all".to_string()
+                    } else {
+                        format!("granted prefixes: {}", caps.fetch_prefixes().join(", "))
+                    };
+                    return Err(fail(
+                        error_codes::CAPABILITY_DENIED,
+                        format!(
+                            "fetch not permitted: {url}\nAdd `Fetch \"<prefix>\"` to the \
+                             spec's `capabilities`. {granted}"
+                        ),
+                        usage.clone(),
+                    ));
+                }
+                // Downloaded to the job's own directory and then opened like
+                // any other file, so a fetched resource *is* a handle:
+                // slice, identify, document_text and infer-with-images all
+                // work on it with no further changes anywhere.
+                match crate::fetch::fetch_to_file(&url, job_dir).await {
+                    Ok(path) => match handles.open(&path) {
+                        Ok((handle, len, kind)) => Event::Opened { handle, len, kind },
+                        Err(e) => {
+                            usage.duration_ms = started.elapsed().as_millis() as u64;
+                            return Err(fail(
+                                error_codes::UNSUPPORTED,
+                                format!("opening the fetched copy of {url}: {e}"),
+                                usage.clone(),
+                            ));
+                        }
+                    },
+                    Err(e) => {
+                        usage.duration_ms = started.elapsed().as_millis() as u64;
+                        return Err(fail(error_codes::UNSUPPORTED, e.to_string(), usage.clone()));
+                    }
+                }
+            }
+
             Command::Open { path } => {
                 let p = std::path::PathBuf::from(&path);
                 if !caps.allows_read(&p) {

@@ -115,6 +115,21 @@ pub struct Spec {
     pub data_policy: DataPolicy,
     /// Directories this job may read beneath. Empty means none.
     pub read_roots: Vec<PathBuf>,
+    /// URL prefixes this job may fetch, from `Fetch "https://host/path"`.
+    ///
+    /// An allowlist by prefix, exactly as `read_roots` is for the
+    /// filesystem: a corpus that lives on the web is still a corpus, and the
+    /// capability list has to describe reaching it or it stops being a
+    /// truthful account of what the job touches. Empty means the job cannot
+    /// fetch anything, which is the default.
+    pub fetch_prefixes: Vec<String>,
+    /// The model serving `embed`, if the spec declares one.
+    ///
+    /// Separate from `model` on purpose: an embedding model and a chat model
+    /// are different things, and reusing one field would let a spec ask a
+    /// chat model for vectors — which either fails or returns something
+    /// shaped like an embedding that is not one.
+    pub embedding_model: Option<ModelRef>,
     /// The proc-blocks implementing the job, as a graph of nodes.
     ///
     /// Each node's declared input is typechecked against the nodes feeding
@@ -139,7 +154,7 @@ pub enum SpecError {
     #[error("malformed spec: {0}")]
     Malformed(String),
     /// A capability kind that exists in the design but not in this build.
-    #[error("unsupported capability `{0}` (this build supports only `Read`)")]
+    #[error("unsupported capability `{0}` (supported: `Read`, `Fetch`)")]
     UnsupportedCapability(String),
 }
 
@@ -325,6 +340,8 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Equals)?;
         self.expect(&Tok::OpenBrace)?;
 
+        let mut fetch_prefixes: Vec<String> = Vec::new();
+        let mut embedding_model: Option<ModelRef> = None;
         let (mut description, mut model, mut data_policy, mut read_roots, mut nodes, mut branches) =
             (None, None, None, None, None, None);
 
@@ -357,7 +374,12 @@ impl<'a> Parser<'a> {
                     self.at = new_at;
                     branches = Some(b);
                 }
-                "capabilities" => read_roots = Some(self.capabilities()?),
+                "embedding_model" => embedding_model = Some(self.model()?),
+                "capabilities" => {
+                    let (roots, fetch) = self.capabilities()?;
+                    read_roots = Some(roots);
+                    fetch_prefixes = fetch;
+                }
                 "model" => model = Some(self.model()?),
                 "data_policy" => {
                     data_policy = Some(match self.ident()?.as_str() {
@@ -399,6 +421,8 @@ impl<'a> Parser<'a> {
             model: model.ok_or(SpecError::MissingField("model"))?,
             data_policy: data_policy.ok_or(SpecError::MissingField("data_policy"))?,
             read_roots,
+            fetch_prefixes,
+            embedding_model,
             nodes,
             branches: branches.unwrap_or_default(),
         })
@@ -415,16 +439,35 @@ impl<'a> Parser<'a> {
         Ok(ModelRef::new(provider, self.string("model")?))
     }
 
-    /// `[ Read "a", Read "b" ]`
-    fn capabilities(&mut self) -> Result<Vec<PathBuf>, SpecError> {
-        let mut roots = Vec::new();
+    /// `[ Read "a", Fetch "https://example.org/" ]`
+    ///
+    /// Returns the read roots and the fetch prefixes separately: they grant
+    /// different things and are checked by different code, and collapsing
+    /// them into one list would make "what may this job reach" require
+    /// reading the strings to find out.
+    fn capabilities(&mut self) -> Result<(Vec<PathBuf>, Vec<String>), SpecError> {
+        let (mut roots, mut fetch) = (Vec::new(), Vec::new());
         self.expect(&Tok::OpenBracket)?;
         while self.peek() != Some(&Tok::CloseBracket) {
             let kind = self.ident()?;
-            if kind != "Read" {
-                return Err(SpecError::UnsupportedCapability(kind));
+            match kind.as_str() {
+                "Read" => roots.push(PathBuf::from(self.string("capabilities")?)),
+                "Fetch" => {
+                    let prefix = self.string("capabilities")?;
+                    // A prefix that is not a URL cannot match anything, so it
+                    // is an authoring mistake worth catching now rather than
+                    // as a puzzling denial at runtime.
+                    if !prefix.starts_with("http://") && !prefix.starts_with("https://") {
+                        return Err(SpecError::Malformed(format!(
+                            "`Fetch {prefix:?}` is not a URL prefix — write it as \
+                             `Fetch \"https://host/path\"`. A fetch grant covers every URL \
+                             beginning with the string given."
+                        )));
+                    }
+                    fetch.push(prefix);
+                }
+                other => return Err(SpecError::UnsupportedCapability(other.to_string())),
             }
-            roots.push(PathBuf::from(self.string("capabilities")?));
             if self.peek() == Some(&Tok::Comma) {
                 self.at += 1;
             } else {
@@ -432,6 +475,6 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::CloseBracket)?;
-        Ok(roots)
+        Ok((roots, fetch))
     }
 }

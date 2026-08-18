@@ -139,6 +139,18 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("checking the `accept` list of node `{name}`"))?;
     }
 
+    // Resolved here for the same reason the job's own model is: a spec
+    // naming an embedding model this build cannot serve should stop the
+    // daemon coming up, not surface partway through a corpus.
+    let embedder = match &spec.embedding_model {
+        Some(model) => Some(
+            registry
+                .resolve(model)
+                .with_context(|| format!("resolving `embedding_model` {model}"))?,
+        ),
+        None => None,
+    };
+
     if !alternates.is_empty() {
         eprintln!(
             "cuttlefishd resolved {} alternate model(s) for recovery/acceptance",
@@ -226,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
         module_cache,
         backend,
         alternates: Arc::new(alternates),
+        embedder,
         jobs,
         spec: Arc::new(spec),
         checked_nodes: Arc::new({

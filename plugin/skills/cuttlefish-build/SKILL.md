@@ -61,9 +61,18 @@ spec summarize_docs = {
   hand-probe models one at a time to rediscover this.
 - `data_policy` — `Local_only` or `Any`. Discovery metadata for the calling
   agent (pass paths vs. contents); not itself an enforcement mechanism.
-- `capabilities = [ Read "path", ... ]` — the only supported capability kind
-  is `Read`; every path becomes a root a block may read beneath. This is the
-  actual enforcement boundary, checked at build time and again at runtime.
+- `capabilities = [ Read "path", Fetch "https://host/path", ... ]` — the
+  enforcement boundary, checked at startup and again at runtime.
+  - **`Read`** grants a filesystem root a block may read beneath.
+  - **`Fetch`** grants a URL *prefix*, matched against the URL as written,
+    so `Fetch "https://x.org/docs/"` covers that subtree and not
+    `https://x.org/other`, a different host, or the same path over `http://`.
+    A URL containing `..` is refused.
+
+  A job with no `Fetch` grant cannot reach the network at all, which is the
+  default. Fan-out manifests and `accept` schemas must sit inside a `Read`
+  root: the host reads those itself, so leaving them ungranted would make
+  the capability list an untruthful account of what the job touches.
 - `block = "..."` — sugar for a one-node graph. A path relative to the
   spec's own directory (or one ending `.wasm`/`.cfbundle`) reads straight
   from disk; anything else is a catalog `name@version` lookup (see

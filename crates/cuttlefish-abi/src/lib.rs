@@ -432,6 +432,35 @@ pub enum Command {
         /// Zero-based page number.
         page: u32,
     },
+    /// Embed one or more texts, returning a vector each.
+    ///
+    /// Batched by construction: the guest hands over every text it wants
+    /// embedded in one command. Embedding a corpus means tens of thousands
+    /// of chunks, and a round trip per chunk is the difference between
+    /// minutes and hours — so the batch is the primitive and a single text
+    /// is just a batch of one.
+    ///
+    /// Served by the spec's `embedding_model`, which is deliberately not the
+    /// job's chat model: they are different models, and asking a chat model
+    /// to embed either fails or returns something that is not an embedding.
+    Embed {
+        /// The texts to embed, in order. Vectors come back in the same order.
+        texts: Vec<String>,
+    },
+    /// Download a URL and hand back a handle to it.
+    ///
+    /// Answers with [`Event::Opened`], the same event [`Command::Open`]
+    /// produces, so everything downstream is unchanged: a fetched resource
+    /// can be sliced, identified, extracted from, or handed to a vision
+    /// model exactly as a local file can. One new command, no new surface.
+    ///
+    /// Requires a matching `Fetch` prefix in the spec's `capabilities`. A
+    /// corpus on the web is still a corpus, and the capability list has to
+    /// describe reaching it.
+    Fetch {
+        /// The URL to retrieve. Must begin with a granted prefix.
+        url: String,
+    },
     /// Every character of text in a document, in one call.
     ///
     /// What most callers reading a PDF actually want, and the direct way to
@@ -538,6 +567,11 @@ pub enum Event {
         /// Where the returned bytes ended. Unlike [`Event::Sliced`] there is no
         /// truncation, so this is always `offset + len` clamped to the file.
         next_offset: u64,
+    },
+    /// One vector per text handed to [`Command::Embed`], in the same order.
+    Embedded {
+        /// The vectors, each the model's full dimensionality.
+        vectors: Vec<Vec<f32>>,
     },
     /// Text extracted from a document — one page, or the whole thing.
     ///

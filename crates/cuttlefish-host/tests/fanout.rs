@@ -126,6 +126,7 @@ async fn run_on(nodes: Vec<CheckedNode>, dir: &Path, ledger: &Ledger) -> cuttlef
         input: serde_json::Value::Null,
         caps: Capabilities::new(vec![dir.to_path_buf()]),
         alternates: Default::default(),
+        embedder: None,
     };
     run_job(
         Arc::new(Engine::default()),
