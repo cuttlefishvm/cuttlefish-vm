@@ -437,6 +437,29 @@ pub enum Command {
         /// Zero-based page number.
         page: u32,
     },
+    /// Extract one page as text, reporting failure as a *value*.
+    ///
+    /// Same work as [`Command::PageText`], different contract: where that one
+    /// fails the whole block, this answers [`Event::PageTextAttempted`] with
+    /// whether it worked. One unreadable page in a 300-page filing then costs
+    /// that page rather than the document.
+    ///
+    /// This is not a `try`/`catch` around a host call, which would break
+    /// replay by letting the guest swallow the suspend signal. The host still
+    /// issues exactly one answer for exactly one command, in the same order,
+    /// every time — only the *value* differs. Determinism forbids catching
+    /// the suspension, not receiving a negative result.
+    ///
+    /// A handle that names nothing still fails hard. That is a block asking
+    /// for something it never opened — a bug in the script rather than a
+    /// property of the corpus — and returning `ok: false` for it would let a
+    /// typo read as "every page of every document is unreadable".
+    PageTextOpt {
+        /// Handle from a previous [`Command::Open`].
+        handle: Handle,
+        /// Zero-based page number.
+        page: u32,
+    },
     /// Render one page of a document to an image.
     ///
     /// Yields a *new* handle referring to the rendered image, which can then be
@@ -599,6 +622,19 @@ pub enum Event {
     PageTexted {
         /// The page's text.
         text: String,
+    },
+    /// The outcome of a [`Command::PageTextOpt`].
+    ///
+    /// Exactly one of `text` and `error` is set. A separate event from
+    /// [`Event::PageTexted`] because the payloads genuinely differ: this one
+    /// can carry a reason, and folding them together would mean every caller
+    /// of the ordinary command handling an error arm that cannot occur.
+    PageTextAttempted {
+        /// The page's text, when it could be extracted.
+        text: Option<String>,
+        /// Why it could not, otherwise — verbatim, so a caller can record it
+        /// per item rather than reporting "extraction failed".
+        error: Option<String>,
     },
     /// A document page was rendered to an image.
     PageImaged {

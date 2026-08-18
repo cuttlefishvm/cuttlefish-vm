@@ -2018,6 +2018,42 @@ async fn run_stage(
                 }
             }
 
+            Command::PageTextOpt { handle, page } => {
+                // A handle naming nothing is still fatal — see
+                // `Command::PageTextOpt`. Only failures that are properties of
+                // the *document* degrade to a value.
+                let Some(path) = doc_paths.get(&handle).cloned() else {
+                    usage.duration_ms = started.elapsed().as_millis() as u64;
+                    return Err(fail(
+                        error_codes::CAPABILITY_DENIED,
+                        format!("no such handle: {handle}"),
+                        usage.clone(),
+                    ));
+                };
+                // Both the whole-document extraction and the per-page lookup
+                // can fail, and both are the corpus being what it is rather
+                // than the script being wrong, so both become `error`.
+                match doc_text(&mut doc_texts, handle, &path) {
+                    Err(e) => Event::PageTextAttempted {
+                        text: None,
+                        error: Some(e.to_string()),
+                    },
+                    Ok(text) => {
+                        let page_tree_count = doc_page_count(&mut doc_pages, handle, &path);
+                        match crate::documents::page_text_from(&text, page, page_tree_count) {
+                            Ok(text) => Event::PageTextAttempted {
+                                text: Some(text),
+                                error: None,
+                            },
+                            Err(e) => Event::PageTextAttempted {
+                                text: None,
+                                error: Some(e.to_string()),
+                            },
+                        }
+                    }
+                }
+            }
+
             Command::DocumentText { handle } => {
                 let Some(path) = doc_paths.get(&handle).cloned() else {
                     usage.duration_ms = started.elapsed().as_millis() as u64;

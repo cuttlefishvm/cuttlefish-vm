@@ -309,6 +309,36 @@ Walking pages is still fine when a document genuinely has them — the
 extraction is cached per handle, so a page walk costs one extraction, not
 one per page.
 
+**`page_text_opt(handle, page)` reads a page without betting the item on
+it.** There is no `try`/`catch` around a host call — catching one would break
+replay — so an ordinary `page_text` that cannot read a page fails the whole
+block. On a 300-page filing that loses the document over 1/300th of it. The
+`_opt` form answers `#{ok, text, error}` instead:
+
+```
+let f = open(input.path);
+let pages = [];
+let skipped = [];
+for p in 0..f.kind.pages {
+    let got = page_text_opt(f.handle, p);
+    if got.ok { pages.push(got.text); } else { skipped.push(#{ page: p, why: got.error }); }
+}
+#{ text: pages, skipped: skipped }
+```
+
+Keep the reasons rather than counting them. `skipped` lands in the item's
+output, so a fan-out over 8,000 documents ends with a record of exactly which
+pages were unreadable and why — which is the difference between "97% worked"
+and knowing what to do about the other 3%.
+
+Two things it deliberately does **not** soften:
+
+- **A handle that names nothing still fails hard.** That is the script asking
+  for something it never opened, and `ok: false` would let one typo read as
+  "every page of every document is unreadable".
+- **`page_text` is unchanged.** A block that never asked to degrade keeps
+  learning that its page walk is wrong.
+
 **A corpus on the web is still a corpus.** `fetch(url)` downloads it and
 answers with the same record `open` does — `{handle, len, kind}` — so
 everything downstream works unchanged:
