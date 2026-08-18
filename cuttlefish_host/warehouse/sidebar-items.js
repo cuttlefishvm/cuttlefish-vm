@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Layer","WarehouseError"],"fn":["bronze_batch","bronze_schema","entry_for","now_rfc3339","silver_batch","silver_schema","write_manifest","write_parquet"],"struct":["Lineage","Manifest","Row","TableEntry"]};

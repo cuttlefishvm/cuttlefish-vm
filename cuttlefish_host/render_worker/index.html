@@ -1,0 +1,35 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Rendering PDF pages out-of-process, so a renderer crash cannot take the daemon with it."><title>cuttlefish_host::render_worker - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="cuttlefish_host" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module render_worker</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../cuttlefish_host/index.html">cuttlefish_<wbr>host</a><span class="version">0.9.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module render_<wbr>worker</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#why-this-exists" title="Why this exists">Why this exists</a></li><li><a href="#how-the-child-is-chosen" title="How the child is chosen">How the child is chosen</a></li></ul><h3><a href="#constants">Module Items</a></h3><ul class="block"><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate cuttlefish_<wbr>host</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">cuttlefish_host</a></div><h1>Module <span>render_<wbr>worker</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/cuttlefish_host/render_worker.rs.html#1-173">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Rendering PDF pages out-of-process, so a renderer crash cannot take the
+daemon with it.</p>
+<p>Compiled unconditionally, unlike the rendering it performs. A binary that
+<em>might</em> be spawned as a worker has to recognise the worker argument even
+when it cannot render, or it falls through to its own argument parsing
+and answers a render request with usage text — which then surfaces as a
+per-item job failure reading <code>Error: usage: cuttlefishd &lt;spec&gt; ...</code> and
+says nothing about the real mismatch.
+Rendering PDF pages in a subprocess, so a crash cannot take the daemon down.</p>
+<h2 id="why-this-exists"><a class="doc-anchor" href="#why-this-exists">§</a>Why this exists</h2>
+<p>pdfium is a large C++ library, and it segfaults on input that other parsers
+accept — this project has a PDF that <code>lopdf</code> reads without complaint and
+pdfium dies on. That is not a bug to be fixed here; it is what handing
+untrusted bytes to a C++ parser is like.</p>
+<p>In-process, a segfault kills the daemon. Not the job — the <em>daemon</em>, and with
+it every other job running alongside, plus their results. The whole system is
+otherwise built so that a failing job fails alone: capabilities are checked
+per job, contexts are per job, a wasm trap ends one job. A renderer that can
+take down the process is the one thing that breaks that property.</p>
+<p>So rendering happens in a child process. A crash there becomes a signal on a
+wait status, which is a normal error the offending job reports and everything
+else survives.</p>
+<h2 id="how-the-child-is-chosen"><a class="doc-anchor" href="#how-the-child-is-chosen">§</a>How the child is chosen</h2>
+<p>Normally the child is <em>this same executable</em>, re-invoked with a hidden
+argument, which guarantees it is exactly the build the parent is running — a
+separately shipped binary can drift out of sync in ways that appear only at
+runtime.</p>
+<p>That does not work for tests: a libtest binary cannot re-exec itself, because
+libtest would read the worker’s arguments as test filters. So
+<code>WORKER_EXE_ENV</code> can name an executable instead, and
+the crate ships a <code>cuttlefish-render-worker</code> binary for that purpose.</p>
+<p>The cost is one process spawn per rendered page. Against the render itself
+and the vision-model inference that follows it, that is not measurable.</p>
+</div></details><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.WORKER_ARG.html" title="constant cuttlefish_host::render_worker::WORKER_ARG">WORKER_<wbr>ARG</a></dt><dd>The argument that turns this executable into a render worker.</dd><dt><a class="constant" href="constant.WORKER_EXE_ENV.html" title="constant cuttlefish_host::render_worker::WORKER_EXE_ENV">WORKER_<wbr>EXE_<wbr>ENV</a></dt><dd>Names an executable to use as the render worker instead of re-execing this
+one.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.render_page.html" title="fn cuttlefish_host::render_worker::render_page">render_<wbr>page</a></dt><dd>Render a page in a child process, returning PNG bytes.</dd><dt><a class="fn" href="fn.run_if_worker.html" title="fn cuttlefish_host::render_worker::run_if_worker">run_<wbr>if_<wbr>worker</a></dt><dd>If this process was spawned as a render worker, do that work and exit.</dd></dl></section></div></main></body></html>

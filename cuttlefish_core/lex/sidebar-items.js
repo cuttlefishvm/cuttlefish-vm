@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["LexError","Tok"],"fn":["lex"],"struct":["Span","Token"]};

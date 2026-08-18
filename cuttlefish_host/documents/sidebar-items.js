@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["document_text","inspect","page_count","page_text_from","render_page","text_segments"],"struct":["DocumentInfo"]};

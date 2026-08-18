@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["embedded_rhai_interpreter_bytes"],"mod":["accept","backend","bundle","caps","catalog","dag","documents","fetch","handles","hex","images","infer","ledger","module_cache","ollama","pipeline","render_worker","runner","warehouse"]};

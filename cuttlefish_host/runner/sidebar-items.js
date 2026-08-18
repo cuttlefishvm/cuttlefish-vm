@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Abi","JobEvent"],"fn":["alternate_models_of","read_signature","run_job"],"struct":["JobSpec","WarehouseNode","WarehousePlan"],"type":["Alternates"]};

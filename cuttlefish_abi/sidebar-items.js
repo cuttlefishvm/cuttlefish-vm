@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Command","Event","ImageOperation","JobStatus","MediaKind","TokenAction","Ty"],"mod":["error_codes"],"struct":["Envelope","JobError","Signature","Usage"],"type":["Handle"]};

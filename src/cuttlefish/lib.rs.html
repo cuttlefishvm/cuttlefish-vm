@@ -1,0 +1,83 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `crates/cuttlefish/src/lib.rs`."><title>lib.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="cuttlefish" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../../static.files/src-script-813739b1.js"></script><script defer src="../../src-files.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">cuttlefish/</div>lib.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-2"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="doccomment">//! Native tooling for AI agents: a local runtime for jobs an agent hands off.
+<a href=#2 id=2 data-nosnippet>2</a>//!
+<a href=#3 id=3 data-nosnippet>3</a>//! A coding agent delegates a job — summarize this, classify that, extract
+<a href=#4 id=4 data-nosnippet>4</a>//! these fields — and Cuttlefish runs it on this machine against a local
+<a href=#5 id=5 data-nosnippet>5</a>//! model, returning a structured result. Two things make that worth doing:
+<a href=#6 id=6 data-nosnippet>6</a>//!
+<a href=#7 id=7 data-nosnippet>7</a>//! - **Data stays local.** For jobs marked local-only, the calling agent
+<a href=#8 id=8 data-nosnippet>8</a>//!   passes *paths*, not contents. Cuttlefish opens the files itself, so
+<a href=#9 id=9 data-nosnippet>9</a>//!   proprietary source and personal data never enter a frontier model's
+<a href=#10 id=10 data-nosnippet>10</a>//!   context at all. The guarantee is not "we also ran something locally" — it
+<a href=#11 id=11 data-nosnippet>11</a>//!   is that the remote model never received the bytes.
+<a href=#12 id=12 data-nosnippet>12</a>//! - **Frontier prices stop applying to grunt work.** Bulk, repetitive, and
+<a href=#13 id=13 data-nosnippet>13</a>//!   mechanical subtasks do not need a trillion-parameter model, and offloading
+<a href=#14 id=14 data-nosnippet>14</a>//!   them keeps tokens and context for the work that does.
+<a href=#15 id=15 data-nosnippet>15</a>//!
+<a href=#16 id=16 data-nosnippet>16</a>//! The limitation is worth stating plainly rather than discovering later: you
+<a href=#17 id=17 data-nosnippet>17</a>//! cannot run a frontier-class model on a laptop. Cuttlefish targets the large
+<a href=#18 id=18 data-nosnippet>18</a>//! subset of agent work that does not need frontier reasoning. It is not a
+<a href=#19 id=19 data-nosnippet>19</a>//! replacement for one.
+<a href=#20 id=20 data-nosnippet>20</a>//!
+<a href=#21 id=21 data-nosnippet>21</a>//! # How a job runs
+<a href=#22 id=22 data-nosnippet>22</a>//!
+<a href=#23 id=23 data-nosnippet>23</a>//! A job is described by a `.cuttlefish` spec — which model, what the job may
+<a href=#24 id=24 data-nosnippet>24</a>//! touch, and which processing block implements it. The block is compiled to
+<a href=#25 id=25 data-nosnippet>25</a>//! WebAssembly and runs sandboxed inside the daemon, which serves inference
+<a href=#26 id=26 data-nosnippet>26</a>//! from a local model and streams results back to the caller.
+<a href=#27 id=27 data-nosnippet>27</a>//!
+<a href=#28 id=28 data-nosnippet>28</a>//! Three decisions shape the rest of the system, and each exists to avoid a
+<a href=#29 id=29 data-nosnippet>29</a>//! specific failure rather than to express a preference:
+<a href=#30 id=30 data-nosnippet>30</a>//!
+<a href=#31 id=31 data-nosnippet>31</a>//! **The host drives the guest.** A block is a state machine: it returns
+<a href=#32 id=32 data-nosnippet>32</a>//! *commands* (`Infer`, `Open`, `Slice`, `Done`) and the host executes them,
+<a href=#33 id=33 data-nosnippet>33</a>//! then steps the block again. The obvious alternative — let the guest call
+<a href=#34 id=34 data-nosnippet>34</a>//! into the host and block until it answers — cannot work, because a
+<a href=#35 id=35 data-nosnippet>35</a>//! single-threaded wasm guest offers no execution context for the host to call
+<a href=#36 id=36 data-nosnippet>36</a>//! back into, and inference must run on a different thread from the (`!Sync`)
+<a href=#37 id=37 data-nosnippet>37</a>//! wasm store. Inverting control also makes cancellation trivial: the host
+<a href=#38 id=38 data-nosnippet>38</a>//! simply stops stepping, so no guest cooperation is required.
+<a href=#39 id=39 data-nosnippet>39</a>//!
+<a href=#40 id=40 data-nosnippet>40</a>//! **Bulk data never enters guest memory.** A block receives a handle and a
+<a href=#41 id=41 data-nosnippet>41</a>//! length, then pulls bounded windows. Guest memory tracks the window size, not
+<a href=#42 id=42 data-nosnippet>42</a>//! the input size, so a block written against a README behaves identically
+<a href=#43 id=43 data-nosnippet>43</a>//! against a corpus — and the 4 GiB ceiling of 32-bit wasm binds on nothing we
+<a href=#44 id=44 data-nosnippet>44</a>//! actually do.
+<a href=#45 id=45 data-nosnippet>45</a>//!
+<a href=#46 id=46 data-nosnippet>46</a>//! **Capabilities are deny-by-default and checked twice.** A block reaches
+<a href=#47 id=47 data-nosnippet>47</a>//! nothing unless its spec grants it. The grant is verified when the spec is
+<a href=#48 id=48 data-nosnippet>48</a>//! compiled and again by the sandbox at runtime. The compile-time check is a
+<a href=#49 id=49 data-nosnippet>49</a>//! convenience that produces good error messages; the runtime check is the
+<a href=#50 id=50 data-nosnippet>50</a>//! security boundary.
+<a href=#51 id=51 data-nosnippet>51</a>//!
+<a href=#52 id=52 data-nosnippet>52</a>//! # This crate
+<a href=#53 id=53 data-nosnippet>53</a>//!
+<a href=#54 id=54 data-nosnippet>54</a>//! This is the facade. It ships the `cuttlefish` command-line client and
+<a href=#55 id=55 data-nosnippet>55</a>//! re-exports the workspace's pieces, so that one page documents the whole
+<a href=#56 id=56 data-nosnippet>56</a>//! system. The implementation lives in sibling crates:
+<a href=#57 id=57 data-nosnippet>57</a>//!
+<a href=#58 id=58 data-nosnippet>58</a>//! - [`abi`] — the contract between host and guest.
+<a href=#59 id=59 data-nosnippet>59</a>//! - [`core`] — parsing `Cuttlefish.spec` files.
+<a href=#60 id=60 data-nosnippet>60</a>//!
+<a href=#61 id=61 data-nosnippet>61</a>//! # Project conventions
+<a href=#62 id=62 data-nosnippet>62</a>//!
+<a href=#63 id=63 data-nosnippet>63</a>//! Documentation lives in the code rather than in a separate design document,
+<a href=#64 id=64 data-nosnippet>64</a>//! so that explanations sit beside what they explain and go stale loudly
+<a href=#65 id=65 data-nosnippet>65</a>//! instead of quietly. Comments state *why* code looks the way it does, never
+<a href=#66 id=66 data-nosnippet>66</a>//! what it does. See `AGENTS.md` in the repository for the full contract.
+<a href=#67 id=67 data-nosnippet>67</a>//!
+<a href=#68 id=68 data-nosnippet>68</a>//! [cuttlefish]: https://cuttlefishvm.github.io/
+<a href=#69 id=69 data-nosnippet>69</a>
+<a href=#70 id=70 data-nosnippet>70</a></span><span class="attr">#![doc(html_logo_url = <span class="string">"https://cuttlefishvm.github.io/assets/images/logo.png"</span>)]
+<a href=#71 id=71 data-nosnippet>71</a>#![forbid(unsafe_code)]
+<a href=#72 id=72 data-nosnippet>72</a>#![warn(missing_docs)]
+<a href=#73 id=73 data-nosnippet>73</a>
+<a href=#74 id=74 data-nosnippet>74</a></span><span class="comment">// No `#![cfg_attr(docsrs, feature(doc_auto_cfg))]`: that feature was removed in
+<a href=#75 id=75 data-nosnippet>75</a>// Rust 1.92 (merged into `doc_cfg`) and now hard-errors under `--cfg docsrs`.
+<a href=#76 id=76 data-nosnippet>76</a>// The crate has no cargo features to annotate anyway. If features are added
+<a href=#77 id=77 data-nosnippet>77</a>// later and their docs need "available on feature X" labels, reach for the
+<a href=#78 id=78 data-nosnippet>78</a>// then-current `doc_cfg` spelling and verify it against the pinned toolchain
+<a href=#79 id=79 data-nosnippet>79</a>// before committing — this exact line already broke CI once.
+<a href=#80 id=80 data-nosnippet>80</a>
+<a href=#81 id=81 data-nosnippet>81</a></span><span class="kw">pub use </span>cuttlefish_abi <span class="kw">as </span>abi;
+<a href=#82 id=82 data-nosnippet>82</a><span class="kw">pub use </span>cuttlefish_core <span class="kw">as </span>core;
+</code></pre></div></section></main></body></html>

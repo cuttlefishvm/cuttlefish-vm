@@ -1,0 +1,56 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Guest-side library for writing cuttlefish proc-blocks."><title>cuttlefish_sdk - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="cuttlefish_sdk" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate cuttlefish_sdk</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../cuttlefish_sdk/index.html">cuttlefish_<wbr>sdk</a><span class="version">0.9.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#writing-a-block" title="Writing a block">Writing a block</a></li><li><a href="#memory-ownership-across-the-boundary" title="Memory ownership across the boundary">Memory ownership across the boundary</a></li></ul><h3><a href="#macros">Crate Items</a></h3><ul class="block"><li><a href="#macros" title="Macros">Macros</a></li><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#traits" title="Traits">Traits</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>cuttlefish_<wbr>sdk</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/cuttlefish_sdk/lib.rs.html#1-227">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Guest-side library for writing cuttlefish proc-blocks.</p>
+<p>A block is a state machine that the host drives. It never calls the host and
+waits; it <em>returns</em> a <a href="enum.Command.html" title="enum cuttlefish_sdk::Command"><code>Command</code></a> saying what it wants, and the host — having
+done that thing — steps it again with an <a href="enum.Event.html" title="enum cuttlefish_sdk::Event"><code>Event</code></a>. See <a href="../cuttlefish_abi/index.html" title="mod cuttlefish_abi"><code>cuttlefish_abi</code></a>
+for why control is inverted, and what that buys: chiefly that cancellation
+needs no cooperation from the guest, because the host simply stops stepping.</p>
+<p>This crate exists so block authors do not hand-write that inversion.
+Implement <a href="trait.Block.html" title="trait cuttlefish_sdk::Block"><code>Block</code></a>, call <a href="macro.export_block.html" title="macro cuttlefish_sdk::export_block"><code>export_block!</code></a>, and the macro emits the raw wasm
+exports the host expects.</p>
+<h2 id="writing-a-block"><a class="doc-anchor" href="#writing-a-block">§</a>Writing a block</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>cuttlefish_sdk::{Block, Command, Event};
+
+<span class="attr">#[derive(Default)]
+</span><span class="kw">struct </span>Shout;
+
+<span class="kw">impl </span>Block <span class="kw">for </span>Shout {
+    <span class="kw">fn </span>start(<span class="kw-2">&amp;mut </span><span class="self">self</span>, input: serde_json::Value) -&gt; Command {
+        <span class="kw">match </span>input.get(<span class="string">"path"</span>).and_then(|v| v.as_str()) {
+            <span class="prelude-val">Some</span>(path) =&gt; Command::Open { path: path.to_string() },
+            <span class="prelude-val">None </span>=&gt; Command::Fail {
+                code: <span class="string">"schema_validation_failed"</span>.into(),
+                message: <span class="string">"input needs a string `path`"</span>.into(),
+            },
+        }
+    }
+
+    <span class="kw">fn </span>step(<span class="kw-2">&amp;mut </span><span class="self">self</span>, event: Event) -&gt; Command {
+        <span class="kw">match </span>event {
+            Event::Opened { handle, len, .. } =&gt; Command::Slice { handle, offset: <span class="number">0</span>, len },
+            Event::Sliced { text, .. } =&gt; Command::Done {
+                result: <span class="macro">serde_json::json!</span>({ <span class="string">"shouted"</span>: text.to_uppercase() }),
+            },
+            other =&gt; Command::Fail {
+                code: <span class="string">"unexpected_event"</span>.into(),
+                message: <span class="macro">format!</span>(<span class="string">"{other:?}"</span>),
+            },
+        }
+    }
+}
+
+<span class="comment">// A real block adds this to emit the wasm exports:
+//     cuttlefish_sdk::export_block!(Shout);</span></code></pre></div>
+<p>Because a block is an ordinary Rust type, it can be unit-tested natively with
+no wasm involved: construct it, call <code>start</code>, then feed it the events its
+commands would produce. Only the boundary itself needs a wasm harness.</p>
+<h2 id="memory-ownership-across-the-boundary"><a class="doc-anchor" href="#memory-ownership-across-the-boundary">§</a>Memory ownership across the boundary</h2>
+<p>Values handed to the host are leaked on purpose. The host reads them
+immediately after the call returns, and the entire instance is destroyed when
+the job ends, so there is nothing to reclaim and no cross-language allocator
+coordination to get wrong.</p>
+<p>Do not “fix” this by freeing. The host would then read freed memory, and on
+wasm that is a silent wrong answer rather than a segfault — the linear memory
+is still perfectly valid to read, it just no longer holds what anyone thinks.</p>
+</div></details><h2 id="macros" class="section-header">Macros<a href="#macros" class="anchor">§</a></h2><dl class="item-table"><dt><a class="macro" href="macro.export_block.html" title="macro cuttlefish_sdk::export_block">export_<wbr>block</a></dt><dd>Emit the wasm exports for a <a href="trait.Block.html" title="trait cuttlefish_sdk::Block"><code>Block</code></a> implementation.</dd></dl><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.Desc.html" title="struct cuttlefish_sdk::Desc">Desc</a></dt><dd>How a guest hands a (pointer, length) pair back to the host.</dd><dt><a class="struct" href="struct.Signature.html" title="struct cuttlefish_sdk::Signature">Signature</a></dt><dd>What a block accepts and produces.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.Command.html" title="enum cuttlefish_sdk::Command">Command</a></dt><dd>What a guest asks the host to do, returned from its <code>init</code>/<code>step</code> exports.</dd><dt><a class="enum" href="enum.Event.html" title="enum cuttlefish_sdk::Event">Event</a></dt><dd>What the host feeds back into the guest’s <code>step</code> export after carrying out a
+<a href="enum.Command.html" title="enum cuttlefish_sdk::Command"><code>Command</code></a>.</dd><dt><a class="enum" href="enum.ImageOperation.html" title="enum cuttlefish_sdk::ImageOperation">Image<wbr>Operation</a></dt><dd>One transformation <a href="enum.Command.html#variant.ImageOp" title="variant cuttlefish_sdk::Command::ImageOp"><code>Command::ImageOp</code></a> can apply.</dd><dt><a class="enum" href="enum.MediaKind.html" title="enum cuttlefish_sdk::MediaKind">Media<wbr>Kind</a></dt><dd>What kind of thing a handle refers to, reported by <a href="enum.Event.html#variant.Opened" title="variant cuttlefish_sdk::Event::Opened"><code>Event::Opened</code></a>.</dd><dt><a class="enum" href="enum.TokenAction.html" title="enum cuttlefish_sdk::TokenAction">Token<wbr>Action</a></dt><dd>A guest’s verdict on each streamed token, returned from its <code>on_token</code>
+export.</dd><dt><a class="enum" href="enum.Ty.html" title="enum cuttlefish_sdk::Ty">Ty</a></dt><dd>The shape of a value flowing through a pipeline.</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.Block.html" title="trait cuttlefish_sdk::Block">Block</a></dt><dd>What a proc-block author implements.</dd></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.Handle.html" title="type cuttlefish_sdk::Handle">Handle</a></dt><dd>A job-scoped reference to something the host holds open for a guest.</dd></dl></section></div></main></body></html>

@@ -1,0 +1,63 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The shared interpreter every `cuttlefish-author` Script-kind block runs through — one compiled wasm module, embedded in the `cuttlefish`/ `cuttlefishd` binaries (see `crates/cuttlefish-host/src/lib.rs`), reused for every cataloged `.rhai` script rather than compiling one wasm module per script."><title>cf_block_rhai_interpreter - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="cf_block_rhai_interpreter" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate cf_block_rhai_interpreter</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../cf_block_rhai_interpreter/index.html">cf_<wbr>block_<wbr>rhai_<wbr>interpreter</a><span class="version">0.9.0</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#bridging-a-synchronous-scripting-language-into-a-host-driven-protocol" title="Bridging a synchronous scripting language into a host-driven protocol">Bridging a synchronous scripting language into a host-driven protocol</a></li></ul><h3><a href="#modules">Crate Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>cf_<wbr>block_<wbr>rhai_<wbr>interpreter</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/cf_block_rhai_interpreter/lib.rs.html#1-1152">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The shared interpreter every <code>cuttlefish-author</code> Script-kind block runs
+through — one compiled wasm module, embedded in the <code>cuttlefish</code>/
+<code>cuttlefishd</code> binaries (see <code>crates/cuttlefish-host/src/lib.rs</code>), reused
+for every cataloged <code>.rhai</code> script rather than compiling one wasm module
+per script.</p>
+<p>Job input always carries <code>{"__cuttlefish_script": "&lt;script text&gt;", "input": &lt;the real job input&gt;}</code> — <code>run_stage</code> (in <code>cuttlefish-host</code>)
+constructs this shape for a <code>Script</code>-kind node before calling <code>start()</code>;
+a script never arrives any other way, and the real job submitter never
+supplies source, only input.</p>
+<h2 id="bridging-a-synchronous-scripting-language-into-a-host-driven-protocol"><a class="doc-anchor" href="#bridging-a-synchronous-scripting-language-into-a-host-driven-protocol">§</a>Bridging a synchronous scripting language into a host-driven protocol</h2>
+<p>Rhai has no native suspend/resume primitive (no coroutine/generator, and
+its debugger hook is a synchronous in-stack callback, not something that
+can hand control back to the <em>caller</em> of <code>Engine::eval()</code> and be resumed
+later from a different top-level call).</p>
+<p>So this block uses a <strong>replay-based coroutine</strong> instead: <code>run()</code> below
+re-executes the <em>entire</em> script from scratch on every <code>start</code>/<code>step</code>
+call. A native <code>infer(prompt, max_tokens)</code> function is registered into
+the engine; it consults <code>self.log</code> (answers to host commands already
+issued, in call order) and returns the memoized answer instantly for a
+call index already in the log. The first call index NOT yet in the log
+is the one we need answered – the closure stashes what command that
+needs (<code>pending</code>) and returns <code>Err(..)</code>, which aborts <code>Engine::eval()</code>
+immediately and propagates out as an error. <code>run()</code> checks <code>pending</code>
+first, and only falls back to treating the eval’s <code>Ok</code>/<code>Err</code> as the
+script’s real result if nothing is pending.</p>
+<p>This is exactly the “replay” pattern used by workflow-replay systems.
+It costs O(n) re-execution per step (O(n^2) total for n host calls) and,
+critically, only works if replaying the script up to the same point
+always retraces the <em>same sequence</em> of <code>infer()</code>/etc. calls – i.e. the
+script’s control flow before an unanswered call must be a pure function
+of <code>input</code> and the already-memoized answers. We disabled rhai’s
+<code>timestamp()</code> builtin and gave <code>getrandom</code> a fixed fill (see below and
+<code>../../.cargo/config.toml</code>) specifically so nothing non-replayable can
+sneak into a script’s control flow through rhai’s own stdlib.</p>
+<p><strong>Known unsoundness, not fixed here</strong>: a script that wraps any host
+round-trip call (<code>infer</code>, <code>open</code>, <code>slice</code>, <code>slice_bytes</code>, <code>page_text</code>,
+<code>page_image</code>) in <code>try { ... } catch { ... }</code> would intercept our
+“suspend” error as an ordinary script-level error instead of letting it
+propagate out of <code>eval()</code>. Rhai gives native functions no way to raise
+an error a script genuinely cannot catch. A real implementation would
+need either to ban <code>try</code>/<code>catch</code> around host calls (Rhai has no scope
+for that short of a custom AST walk before running the script) or
+accept that a catch-wrapped host call breaks the model. Flagging this
+rather than solving it – it’s a real gap, documented in the
+<code>cuttlefish-author</code> skill so an agent authoring a script knows not to
+do this. (<code>parse_json</code>/<code>regex_test</code>/<code>regex_find</code>/<code>regex_replace_all</code> are
+the exceptions: ordinary synchronous functions, not host round-trips,
+so they’re genuinely safe to wrap in <code>try</code>/<code>catch</code>.)</p>
+<p><strong>Every <code>Command</code> a Rust block can issue, a script can too</strong>: <code>infer</code>,
+<code>open</code>, <code>slice</code>, <code>slice_bytes</code>, <code>page_text</code>, <code>page_image</code> are all
+registered here, sharing one suspend-or-replay decision
+(<code>issue_or_replay</code>) parameterized only by which <code>Command</code> each call
+builds – capability enforcement (what a script may <code>open</code>) happens
+host-side in the same generic <code>Command</code> dispatch loop a Rust block’s
+commands go through, so it applies here unchanged. <code>regex_test</code>/
+<code>regex_find</code>/<code>regex_replace_all</code> round out real text extraction on top
+of that: a script can <code>open</code>/<code>slice</code> a file and then find/pull a
+section out of it (a heading that varies in whitespace or punctuation
+across documents, say) without a Rust toolchain – this interpreter
+ships prebuilt, so nothing here costs an end user what a Rust
+proc-block doing the same extraction would (a wasm32 target).</p>
+</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="archive/index.html" title="mod cf_block_rhai_interpreter::archive">archive</a></dt><dd>Archive listing and bounded extraction: tar, zip, gzip.</dd><dt><a class="mod" href="binary/index.html" title="mod cf_block_rhai_interpreter::binary">binary</a></dt><dd>Binary inspection for scripts: identify, measure, and parse bytes.</dd><dt><a class="mod" href="image_meta/index.html" title="mod cf_block_rhai_interpreter::image_meta">image_<wbr>meta</a></dt><dd>Image metadata, parsed in the guest without decoding a single pixel.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.cf_alloc.html" title="fn cf_block_rhai_interpreter::cf_alloc">cf_<wbr>alloc</a></dt><dt><a class="fn" href="fn.cf_init.html" title="fn cf_block_rhai_interpreter::cf_init">cf_init</a></dt><dt><a class="fn" href="fn.cf_on_token.html" title="fn cf_block_rhai_interpreter::cf_on_token">cf_<wbr>on_<wbr>token</a></dt><dt><a class="fn" href="fn.cf_signature.html" title="fn cf_block_rhai_interpreter::cf_signature">cf_<wbr>signature</a></dt><dd>Report this block’s type signature. Read at build time, before any
+job runs, to check that a pipeline’s seams line up.</dd><dt><a class="fn" href="fn.cf_step.html" title="fn cf_block_rhai_interpreter::cf_step">cf_step</a></dt></dl></section></div></main></body></html>
