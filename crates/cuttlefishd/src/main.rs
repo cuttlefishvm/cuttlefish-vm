@@ -143,9 +143,11 @@ async fn main() -> anyhow::Result<()> {
     // naming an embedding model this build cannot serve should stop the
     // daemon coming up, not surface partway through a corpus.
     let embedder = match &spec.embedding_model {
-        Some(model) => Some(registry.resolve(model).with_context(|| {
-            format!("resolving `embedding_model` {model}")
-        })?),
+        Some(model) => Some(
+            registry
+                .resolve(model)
+                .with_context(|| format!("resolving `embedding_model` {model}"))?,
+        ),
         None => None,
     };
 

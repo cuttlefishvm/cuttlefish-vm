@@ -554,31 +554,26 @@ impl RhaiBlock {
             // is a batch of one. A corpus is tens of thousands of chunks,
             // and one round trip each is the difference between minutes and
             // hours -- so the shape that scales is the easiest to reach for.
-            engine.register_fn(
-                "embed_many",
-                {
-                    let (call_index, pending, log) =
-                        (call_index.clone(), pending.clone(), log.clone());
-                    move |texts: rhai::Array| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
-                        let mut out = Vec::with_capacity(texts.len());
-                        for (i, value) in texts.iter().enumerate() {
-                            match value.clone().into_string() {
-                                Ok(t) => out.push(t),
-                                Err(actual) => {
-                                    return Err(format!(
-                                        "embed_many: item {i} is {actual}, not a string"
-                                    )
-                                    .into())
-                                }
+            engine.register_fn("embed_many", {
+                let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
+                move |texts: rhai::Array| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
+                    let mut out = Vec::with_capacity(texts.len());
+                    for (i, value) in texts.iter().enumerate() {
+                        match value.clone().into_string() {
+                            Ok(t) => out.push(t),
+                            Err(actual) => {
+                                return Err(format!(
+                                    "embed_many: item {i} is {actual}, not a string"
+                                )
+                                .into())
                             }
                         }
-                        issue_or_replay(Command::Embed { texts: out }, &call_index, &pending, &log)
                     }
-                },
-            );
+                    issue_or_replay(Command::Embed { texts: out }, &call_index, &pending, &log)
+                }
+            });
             engine.register_fn("embed", {
-                let (call_index, pending, log) =
-                    (call_index.clone(), pending.clone(), log.clone());
+                let (call_index, pending, log) = (call_index.clone(), pending.clone(), log.clone());
                 move |text: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
                     issue_or_replay(
                         Command::Embed {

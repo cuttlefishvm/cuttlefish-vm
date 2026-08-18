@@ -636,10 +636,7 @@ fn a_fetch_grant_that_is_not_http_is_refused() {
     // `file://` through the fetch path would route around `Read` entirely,
     // which is the one thing a capability list exists to prevent.
     for prefix in ["file:///etc", "ftp://x.org/", "/etc/passwd"] {
-        let src = SAMPLE.replace(
-            r#"[ Read "./docs" ]"#,
-            &format!(r#"[ Fetch "{prefix}" ]"#),
-        );
+        let src = SAMPLE.replace(r#"[ Read "./docs" ]"#, &format!(r#"[ Fetch "{prefix}" ]"#));
         assert!(
             parse_spec(&src).is_err(),
             "`Fetch \"{prefix}\"` must not parse"

@@ -1056,8 +1056,7 @@ impl InferBackend for CountingEmbedder {
         true
     }
     async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // Deterministic and length-derived, so a test can tell vectors apart.
         Ok(texts
             .iter()
