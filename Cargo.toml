@@ -85,7 +85,7 @@ sha2 = "0.11"
 # explicitly because warehouse.rs builds schemas and arrays directly; relying on
 # a re-export would break on any parquet release that stops re-exporting.
 parquet = { version = "56", default-features = false, features = ["arrow", "snap"] }
-arrow-array = "56"
+arrow-array = "59"
 arrow-schema = "56"
 
 # RFC 3339 timestamps for the catalog's index.json `created_at` field. Only the
