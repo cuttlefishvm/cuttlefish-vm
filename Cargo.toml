@@ -86,7 +86,7 @@ sha2 = "0.11"
 # a re-export would break on any parquet release that stops re-exporting.
 parquet = { version = "56", default-features = false, features = ["arrow", "snap"] }
 arrow-array = "56"
-arrow-schema = "56"
+arrow-schema = "59"
 
 # RFC 3339 timestamps for the catalog's index.json `created_at` field. Only the
 # `formatting` feature — `created_at` is written once and compared as a plain
