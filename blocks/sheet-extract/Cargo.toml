@@ -17,4 +17,4 @@ base64 = "0.23"
 # not exist on wasm32-unknown-unknown. Verified to build for that target
 # before this block was written -- it is the whole reason a spreadsheet
 # reader can live in the guest rather than behind a host feature flag.
-calamine = { version = "0.34", default-features = false, features = ["dates"] }
+calamine = { version = "0.36", default-features = false, features = ["dates"] }
