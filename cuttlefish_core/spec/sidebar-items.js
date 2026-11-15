@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DataPolicy","SpecError"],"fn":["parse_spec"],"struct":["ModelRef","Spec"]};

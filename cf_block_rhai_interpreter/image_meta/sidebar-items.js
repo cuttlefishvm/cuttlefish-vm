@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["dimensions","exif","jpeg_segments","png_chunks"]};

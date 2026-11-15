@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ArtifactKind","CatalogError","ResolutionContext","Resolved"],"fn":["default_root","validate_block_name"],"struct":["AddOutcome","Catalog","Entry"]};
