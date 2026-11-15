@@ -84,8 +84,11 @@ sha2 = "0.11"
 # `parquet` pulls `arrow-array`/`arrow-schema` transitively, but they are named
 # explicitly because warehouse.rs builds schemas and arrays directly; relying on
 # a re-export would break on any parquet release that stops re-exporting.
+# Keep these versions in lockstep with the Parquet release in use: the
+# workspace must not mix `arrow-array` and `arrow-schema` crates from different
+# major versions, or rustc reports the `ArrowError` type mismatch seen in CI.
 parquet = { version = "56", default-features = false, features = ["arrow", "snap"] }
-arrow-array = "59"
+arrow-array = "56"
 arrow-schema = "56"
 
 # RFC 3339 timestamps for the catalog's index.json `created_at` field. Only the
