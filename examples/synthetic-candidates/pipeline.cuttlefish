@@ -1,0 +1,18 @@
+# Transport canary with a fixed Stub response; no Ollama request occurs.
+# To explore real wording, replace model with the pinned JSON Ollama target
+# documented in cuttlefish_host::ollama and use a fresh job-specific warehouse.
+# The fixture is deliberately fictitious, with no patient or clinical source data.
+# DVC/GCS upload and Phoenix export belong in the caller after completed status,
+# receipt/hash checks and domain acceptance. This spec does not publish datasets.
+spec synthetic_candidates = {
+  description = "A toy prior-auth candidate pipeline with deterministic traps and independently derived evidence labels.";
+  model = Stub "{\"question\":\"Which current documents for the requested patient support the required therapy duration?\"}";
+  data_policy = Local_only;
+  capabilities = [ Read "." ];
+  warehouse = "./warehouse-canary";
+  warehouse_required = true;
+  nodes = {
+    candidates = { block = "./candidate.rhai"; over = "./fixture.jsonl"; };
+    complete = { block = "./completion.rhai"; in = candidates.out; };
+  };
+}

@@ -233,12 +233,20 @@ async fn start() -> Harness {
 /// output — enough to build a multi-node graph without needing real
 /// inter-node data flow, which the resume tests below don't exercise.
 async fn start_with_nodes(names: &[&str]) -> Harness {
+    start_with_publication(names, false).await
+}
+
+async fn start_with_publication(names: &[&str], required: bool) -> Harness {
     ensure_test_cuttlefish_home();
     let dir = tempfile::tempdir().unwrap();
     let doc = dir.path().join("doc.txt");
     std::fs::write(&doc, "some document text").unwrap();
     let sock = unique_endpoint(dir.path());
 
+    let warehouse = required.then(|| dir.path().join("warehouse"));
+    if let Some(root) = &warehouse {
+        std::fs::write(root, "occupied").unwrap();
+    }
     let spec = Spec {
         name: "summarize_docs".into(),
         description: "Use when a local file needs summarizing.".into(),
@@ -246,7 +254,8 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
         data_policy: DataPolicy::LocalOnly,
         fetch_prefixes: Vec::new(),
         embedding_model: None,
-        warehouse: None,
+        warehouse,
+        warehouse_required: required,
         read_roots: vec![dir.path().to_path_buf()],
         nodes: NodeGraph::single("../blocks/echo-summarize".into()),
         branches: Branches::default(),
@@ -279,7 +288,7 @@ async fn start_with_nodes(names: &[&str]) -> Harness {
             on_fail: Vec::new(),
         })
         .collect();
-    let fingerprint = cuttlefish_host::dag::graph_fingerprint(&checked_nodes);
+    let fingerprint = cuttlefish_host::dag::job_fingerprint(&checked_nodes, &spec).unwrap();
 
     let jobs = JobStore::default();
     let state = api::AppState {
@@ -934,6 +943,7 @@ async fn shutdown_causes_serve_to_return() {
         fetch_prefixes: Vec::new(),
         embedding_model: None,
         warehouse: None,
+        warehouse_required: false,
         read_roots: vec![dir.path().to_path_buf()],
         nodes: NodeGraph::single("../blocks/echo-summarize".into()),
         branches: Branches::default(),
@@ -1579,4 +1589,127 @@ async fn draining_returns_inputs_marks_rows_and_reports_what_it_could_not_recove
         drained["drained_at"].is_string(),
         "the exported row must be stamped: {drained}"
     );
+}
+
+#[tokio::test]
+async fn publication_failure_can_be_repaired_via_resume_and_survives_restart_scan() {
+    let h = start_with_publication(&["block"], true).await;
+    let id = h
+        .submit_ok(serde_json::json!({"path":h.doc.to_str().unwrap()}))
+        .await;
+    let failed = h.await_terminal(&id).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(
+        failed["envelope"]["error"]["code"],
+        "warehouse_publication_failed"
+    );
+    let ledger = cuttlefish_host::ledger::Ledger::open(
+        &h.jobs_root.join(&id).join("ledger.sqlite"),
+        &h.fingerprint,
+    )
+    .unwrap();
+    assert_eq!(
+        ledger.job_status().unwrap(),
+        cuttlefish_host::ledger::LedgerJobStatus::Running
+    );
+    let restarted = JobStore::default();
+    cuttlefishd::scan_for_interrupted_jobs(&h.jobs_root, &h.fingerprint, &restarted)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted.get(&id).await.unwrap().status,
+        cuttlefish_abi::JobStatus::Interrupted
+    );
+    // Re-executing the block would now fail to open its source document.
+    std::fs::remove_file(&h.doc).unwrap();
+    std::fs::remove_file(h._dir.path().join("warehouse")).unwrap();
+    let response = h
+        .client
+        .post(format!("http://localhost/jobs/{id}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let completed = h.await_terminal(&id).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert!(h._dir.path().join("warehouse/publication.json").is_file());
+    let recovered = h.jobs.get(&id).await.unwrap();
+    assert_eq!(recovered.log.len(), 1);
+    let event: serde_json::Value = serde_json::from_str(&recovered.log[0]).unwrap();
+    assert_eq!(event["envelope"]["status"], "completed");
+    assert_eq!(
+        ledger.job_status().unwrap(),
+        cuttlefish_host::ledger::LedgerJobStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn publication_resume_is_atomic_and_does_not_replay_the_old_terminal_event() {
+    use cuttlefish_abi::{Envelope, JobError, JobStatus, Usage};
+    let jobs = JobStore::default();
+    let mut job = cuttlefishd::state::Job::interrupted("publication-retry".into());
+    job.status = JobStatus::Failed;
+    job.envelope = Some(Envelope {
+        status: JobStatus::Failed,
+        result: None,
+        error: Some(JobError {
+            code: "warehouse_publication_failed".into(),
+            message: "fixture".into(),
+        }),
+        usage: Usage::default(),
+    });
+    job.log.push("old terminal event".into());
+    jobs.insert(job).await;
+    let (a, b) = tokio::join!(
+        jobs.try_start_resume("publication-retry"),
+        jobs.try_start_resume("publication-retry")
+    );
+    assert_eq!(usize::from(a.is_some()) + usize::from(b.is_some()), 1);
+    let winner = a.or(b).unwrap();
+    assert!(winner.envelope.is_none());
+    assert!(winner.log.is_empty());
+    assert!(!winner.cancel.is_cancelled());
+    let mut ordinary = winner;
+    ordinary.id = "ordinary-failure".into();
+    ordinary.status = JobStatus::Failed;
+    ordinary.envelope = Some(Envelope {
+        status: JobStatus::Failed,
+        result: None,
+        error: Some(JobError {
+            code: "script_error".into(),
+            message: "fixture".into(),
+        }),
+        usage: Usage::default(),
+    });
+    jobs.insert(ordinary).await;
+    assert!(jobs.try_start_resume("ordinary-failure").await.is_none());
+}
+
+#[tokio::test]
+async fn resumed_jobs_do_not_fill_an_unconsumed_event_channel() {
+    // Each entry emits a progress event and three Stub tokens. Eighty
+    // entries exceed the resume handler's former 256-event channel capacity.
+    let names: Vec<String> = (0..80).map(|i| format!("entry_{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let h = start_with_nodes(&refs).await;
+    let id = unique_job_id("resume-many-events");
+    let job_dir = h.jobs_root.join(&id);
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(
+        job_dir.join("input.json"),
+        serde_json::json!({"path": h.doc.to_str().unwrap()}).to_string(),
+    )
+    .unwrap();
+    cuttlefish_host::ledger::Ledger::open(&job_dir.join("ledger.sqlite"), &h.fingerprint).unwrap();
+    h.jobs.mark_interrupted(id.clone()).await;
+    let response = h
+        .client
+        .post(format!("http://localhost/jobs/{id}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let completed = h.await_terminal(&id).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert_eq!(completed["envelope"]["result"]["summary"], "a stub summary");
 }

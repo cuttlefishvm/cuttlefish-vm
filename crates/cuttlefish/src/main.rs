@@ -98,7 +98,7 @@ mod cli {
             #[arg(long, alias = "socket", default_value_os_t = cuttlefishd_endpoint())]
             endpoint: PathBuf,
         },
-        /// Resume a job the daemon reports as Interrupted.
+        /// Resume an interrupted job or repair a failed warehouse publication.
         Resume {
             /// Where the daemon listens: a unix socket path, or a named
             /// pipe on Windows. Defaults per platform.
@@ -1002,7 +1002,7 @@ mod daemon {
         Ok(())
     }
 
-    /// Resume a job the daemon reports as `Interrupted`. Deliberately not
+    /// Resume an interrupted job or a failed warehouse publication. Deliberately not
     /// automatic — the daemon rejects a resume of anything else, and that
     /// rejection is surfaced here rather than swallowed.
     pub async fn resume(socket: &Path, job_id: &str) -> anyhow::Result<()> {

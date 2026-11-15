@@ -31,6 +31,26 @@ fn parses_every_field_of_the_sample() {
 }
 
 #[test]
+fn strict_warehouse_is_opt_in_and_requires_a_destination() {
+    assert!(!parse_spec(SAMPLE).unwrap().warehouse_required);
+    let strict = SAMPLE.replace(
+        "block =",
+        "warehouse_required = true; warehouse = \"out\"; block =",
+    );
+    assert!(parse_spec(&strict).unwrap().warehouse_required);
+    let absent = SAMPLE.replace("block =", "warehouse_required = true; block =");
+    assert!(parse_spec(&absent)
+        .unwrap_err()
+        .to_string()
+        .contains("requires a warehouse path"));
+    let invalid = SAMPLE.replace("block =", "warehouse_required = yes; block =");
+    assert!(parse_spec(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("true or false"));
+}
+
+#[test]
 fn accepts_several_capabilities() {
     let src = SAMPLE.replace(
         r#"[ Read "./docs" ]"#,
@@ -671,4 +691,21 @@ fn an_embedding_model_is_optional_and_separate_from_the_chat_model() {
         spec.embedding_model,
         Some(ModelRef::new("ollama", "nomic-embed-text"))
     );
+}
+
+#[test]
+fn synthetic_example_and_pinned_ollama_target_parse() {
+    let spec = parse_spec(include_str!(
+        "../../../examples/synthetic-candidates/pipeline.cuttlefish"
+    ))
+    .unwrap();
+    assert!(spec.warehouse_required);
+    let target = r#"{\"model\":\"qwen3.8:27b\",\"expected_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"seed\":42}"#;
+    let source = SAMPLE.replace(
+        r#"Path "./models/stub.gguf""#,
+        &format!("Ollama \"{target}\""),
+    );
+    let spec = parse_spec(&source).unwrap();
+    assert_eq!(spec.model.provider, "ollama");
+    assert!(spec.model.target.contains(r#""seed":42"#));
 }

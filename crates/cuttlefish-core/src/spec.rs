@@ -141,6 +141,10 @@ pub struct Spec {
     /// Relative paths resolve against the spec's own directory, like every
     /// other path in a spec.
     pub warehouse: Option<PathBuf>,
+    /// Make a missing or invalid warehouse projection fail the job. Existing
+    /// specs keep their best-effort projection unless this is explicitly true.
+    /// Requires `warehouse` so strict publication names its destination.
+    pub warehouse_required: bool,
     /// The proc-blocks implementing the job, as a graph of nodes.
     ///
     /// Each node's declared input is typechecked against the nodes feeding
@@ -354,6 +358,7 @@ impl<'a> Parser<'a> {
         let mut fetch_prefixes: Vec<String> = Vec::new();
         let mut embedding_model: Option<ModelRef> = None;
         let mut warehouse: Option<PathBuf> = None;
+        let mut warehouse_required = false;
         let (mut description, mut model, mut data_policy, mut read_roots, mut nodes, mut branches) =
             (None, None, None, None, None, None);
 
@@ -388,6 +393,17 @@ impl<'a> Parser<'a> {
                 }
                 "embedding_model" => embedding_model = Some(self.model()?),
                 "warehouse" => warehouse = Some(PathBuf::from(self.string("warehouse")?)),
+                "warehouse_required" => {
+                    warehouse_required = match self.ident()?.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        other => {
+                            return Err(SpecError::Malformed(format!(
+                                "warehouse_required must be true or false, found `{other}`"
+                            )))
+                        }
+                    };
+                }
                 "capabilities" => {
                     let (roots, fetch) = self.capabilities()?;
                     read_roots = Some(roots);
@@ -418,6 +434,11 @@ impl<'a> Parser<'a> {
 
         let read_roots = read_roots.ok_or(SpecError::MissingField("capabilities"))?;
         let nodes = nodes.ok_or(SpecError::MissingField("block"))?;
+        if warehouse_required && warehouse.is_none() {
+            return Err(SpecError::Malformed(
+                "warehouse_required = true requires a warehouse path".to_string(),
+            ));
+        }
 
         // The equivalent check on manifests and acceptance schemas lives in
         // `validate_host_read_paths`, called once these paths have been
@@ -437,6 +458,7 @@ impl<'a> Parser<'a> {
             fetch_prefixes,
             embedding_model,
             warehouse,
+            warehouse_required,
             nodes,
             branches: branches.unwrap_or_default(),
         })

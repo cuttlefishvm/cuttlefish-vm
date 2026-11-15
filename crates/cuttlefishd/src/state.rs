@@ -49,6 +49,20 @@ pub struct Job {
 }
 
 impl Job {
+    /// Checkpoint work can resume after interruption or a failed publication.
+    /// Other terminal failures require a new job rather than implicit retries.
+    pub fn can_resume(&self) -> bool {
+        self.status == JobStatus::Interrupted
+            || (self.status == JobStatus::Failed
+                && self
+                    .envelope
+                    .as_ref()
+                    .and_then(|e| e.error.as_ref())
+                    .is_some_and(|e| {
+                        e.code == cuttlefish_abi::error_codes::WAREHOUSE_PUBLICATION_FAILED
+                    }))
+    }
+
     /// Create a queued job with a fresh event channel.
     pub fn new(id: String, cancel: CancellationToken) -> Self {
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -183,8 +197,9 @@ impl JobStore {
     pub async fn cancel(&self, id: &str) -> bool {
         let mut jobs = self.jobs.lock().await;
         match jobs.get_mut(id) {
-            Some(job) if job.status == JobStatus::Interrupted => {
+            Some(job) if job.can_resume() => {
                 job.status = JobStatus::Cancelled;
+                job.envelope = None;
                 // Persist to the ledger too — otherwise a restart before
                 // this job's final disposition is otherwise resolved would
                 // silently re-mark it Interrupted, discarding this cancel
@@ -214,8 +229,8 @@ impl JobStore {
         }
     }
 
-    /// Atomically transition a job from `Interrupted` to `Running`, if and
-    /// only if it's still `Interrupted` at the moment this runs — the guard
+    /// Atomically transition a resumable job to `Running`, if and
+    /// only if [`Job::can_resume`] still holds at this moment. This is the guard
     /// against two concurrent `POST /jobs/{id}/resume` calls both winning and
     /// spawning duplicate `run_job` executions against the same ledger.
     ///
@@ -227,8 +242,13 @@ impl JobStore {
     pub async fn try_start_resume(&self, id: &str) -> Option<Job> {
         let mut jobs = self.jobs.lock().await;
         match jobs.get_mut(id) {
-            Some(job) if job.status == JobStatus::Interrupted => {
+            Some(job) if job.can_resume() => {
                 job.status = JobStatus::Running;
+                job.cancel = CancellationToken::new();
+                job.envelope = None;
+                // A new subscriber must not mistake the prior attempt's
+                // terminal event for this recovery attempt's result.
+                job.log.clear();
                 Some(job.clone())
             }
             _ => None,

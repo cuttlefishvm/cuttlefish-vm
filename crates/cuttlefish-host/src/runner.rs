@@ -374,6 +374,8 @@ fn cancelled(usage: Usage, message: &str) -> Envelope {
 pub struct WarehousePlan {
     /// The warehouse root, already resolved against the spec's directory.
     pub root: std::path::PathBuf,
+    /// Require a verified Parquet publication before reporting job completion.
+    pub required: bool,
     /// The spec's name, stamped on every row.
     pub spec_name: String,
     /// The chat model, as resolved.
@@ -417,18 +419,21 @@ impl WarehouseNode {
 /// a resumed job rewrites the projection from the complete record rather than
 /// appending to a partial one.
 ///
-/// Failures here are reported and swallowed. A warehouse is a *projection* of
-/// results the job already computed and already recorded; discarding a
-/// finished corpus because a disk filled while writing a derived file would
-/// throw away the expensive thing to protect the cheap one. Re-running the
-/// job — or simply resuming it — rewrites it.
+/// Failures are collected while attempting every layer. Optional warehouses
+/// retain the historical warning-only behavior; required warehouses fail the
+/// job's publication gate. Neither loses the completed SQLite checkpoints:
+/// resuming repairs the projection without regenerating concluded items.
 fn write_warehouse(
     plan: &WarehousePlan,
     nodes: &[WarehouseNode],
     ledger: &crate::ledger::Ledger,
     envelope: &Envelope,
-) {
+) -> Result<(), String> {
     use crate::warehouse as wh;
+    let mut errors = Vec::new();
+    if plan.required {
+        wh::invalidate_publication(&plan.root).map_err(|e| e.to_string())?;
+    }
 
     let job_id = ledger
         .job_dir()
@@ -439,8 +444,8 @@ fn write_warehouse(
     let lineage = wh::Lineage {
         job_id: job_id.clone(),
         spec_name: plan.spec_name.clone(),
-        spec_fingerprint: ledger.graph_fingerprint().unwrap_or_default(),
-        model: plan.model.clone(),
+        spec_fingerprint: ledger.graph_fingerprint().map_err(|e| e.to_string())?,
+        model: envelope.usage.model.clone(),
         embedding_model: plan.embedding_model.clone(),
         cuttlefish_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -471,7 +476,7 @@ fn write_warehouse(
                 })
                 .collect(),
             Err(e) => {
-                eprintln!("warning: warehouse: reading node `{}`: {e}", node.name);
+                errors.push(format!("reading node `{}`: {e}", node.name));
                 continue;
             }
         };
@@ -492,10 +497,10 @@ fn write_warehouse(
                             wh::Layer::Written(wh::entry_for(&plan.root, &path, &batch)),
                         );
                     }
-                    Err(e) => eprintln!("warning: warehouse: writing bronze: {e}"),
+                    Err(e) => errors.push(format!("writing bronze: {e}")),
                 }
             }
-            Err(e) => eprintln!("warning: warehouse: building bronze: {e}"),
+            Err(e) => errors.push(format!("building bronze: {e}")),
         }
 
         let item_output = node.item_output.clone().unwrap_or(cuttlefish_abi::Ty::Json);
@@ -512,7 +517,7 @@ fn write_warehouse(
                             wh::Layer::Written(wh::entry_for(&plan.root, &path, &batch)),
                         );
                     }
-                    Err(e) => eprintln!("warning: warehouse: writing silver: {e}"),
+                    Err(e) => errors.push(format!("writing silver: {e}")),
                 }
             }
             // Recorded, not omitted: a reader finding no silver table has to
@@ -532,7 +537,7 @@ fn write_warehouse(
                     },
                 );
             }
-            Err(e) => eprintln!("warning: warehouse: building silver: {e}"),
+            Err(e) => errors.push(format!("building silver: {e}")),
         }
     }
 
@@ -563,7 +568,7 @@ fn write_warehouse(
                             wh::Layer::Written(wh::entry_for(&plan.root, &path, &batch)),
                         );
                     }
-                    Err(e) => eprintln!("warning: warehouse: writing gold: {e}"),
+                    Err(e) => errors.push(format!("writing gold: {e}")),
                 }
             }
             Ok(None) => {
@@ -579,7 +584,7 @@ fn write_warehouse(
                     },
                 );
             }
-            Err(e) => eprintln!("warning: warehouse: building gold: {e}"),
+            Err(e) => errors.push(format!("building gold: {e}")),
         }
     }
 
@@ -587,7 +592,7 @@ fn write_warehouse(
         job_id,
         spec_name: plan.spec_name.clone(),
         spec_fingerprint: lineage.spec_fingerprint.clone(),
-        model: plan.model.clone(),
+        model: lineage.model.clone(),
         embedding_model: plan.embedding_model.clone(),
         cuttlefish_version: lineage.cuttlefish_version.clone(),
         written_at: wh::now_rfc3339(),
@@ -596,8 +601,15 @@ fn write_warehouse(
         gold,
     };
     if let Err(e) = wh::write_manifest(&plan.root, &manifest) {
-        eprintln!("warning: warehouse: writing the manifest: {e}");
+        errors.push(format!("writing the manifest: {e}"));
     }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    if plan.required && envelope.status == JobStatus::Completed {
+        wh::verify_and_publish(&plan.root, &manifest).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Drive one job to completion.
@@ -645,7 +657,7 @@ pub async fn run_job(
         None => Vec::new(),
     };
 
-    let envelope = 'run: {
+    let mut envelope = 'run: {
         if job.nodes.is_empty() {
             usage.duration_ms = started.elapsed().as_millis() as u64;
             break 'run fail(
@@ -1045,12 +1057,37 @@ pub async fn run_job(
         // now. Loud enough to notice, not loud enough to discard real work
         // that already succeeded or failed for its own, unrelated reason.
         eprintln!("warning: failed to record job {ledger_status} status in ledger: {e}");
+        if job_warehouse.as_ref().is_some_and(|p| p.required)
+            && envelope.status == JobStatus::Completed
+        {
+            return fail(
+                error_codes::WAREHOUSE_PUBLICATION_FAILED,
+                format!("cannot finalize authoritative checkpoint record: {e}"),
+                envelope.usage,
+            );
+        }
     }
 
     // After `finish`, so the warehouse never describes a job the ledger still
     // calls running.
     if let Some(plan) = &job_warehouse {
-        write_warehouse(plan, &warehouse_nodes, ledger, &envelope);
+        if let Err(e) = write_warehouse(plan, &warehouse_nodes, ledger, &envelope) {
+            if plan.required && envelope.status == JobStatus::Completed {
+                envelope = fail(
+                    error_codes::WAREHOUSE_PUBLICATION_FAILED,
+                    format!("{e}; completed checkpoints are retained; repair storage and resume"),
+                    envelope.usage,
+                );
+                // Publication is unfinished even though the caller receives a
+                // terminal failure. Keep it discoverable as Interrupted after
+                // a daemon restart; checkpoints already contain the real work.
+                if let Err(e) = ledger.finish("running") {
+                    eprintln!("warning: recording warehouse publication failure: {e}");
+                }
+            } else {
+                eprintln!("warning: warehouse: {e}");
+            }
+        }
     }
     envelope
 }
@@ -2253,6 +2290,7 @@ async fn run_stage(
                         ));
                     }
                     Some(Ok(r)) => {
+                        usage.model = backend.model_name();
                         usage.tokens_in += r.tokens_in;
                         usage.tokens_out += r.tokens_out;
                         Event::InferDone {
