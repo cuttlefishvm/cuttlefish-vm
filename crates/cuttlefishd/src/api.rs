@@ -632,7 +632,9 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
     tokio::spawn(async move {
         // Prior token events are not replayed after interruption. Publish the
         // new terminal event so subscribers see this attempt's actual outcome.
-        let (tx, _rx) = mpsc::channel::<JobEvent>(256);
+        // No task consumes these events. Close the receiver immediately;
+        // leaving it alive would block the runner when the buffer fills.
+        let (tx, _) = mpsc::channel::<JobEvent>(256);
         let envelope = run_job(
             engine,
             backend,

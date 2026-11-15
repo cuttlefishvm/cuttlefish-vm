@@ -1684,3 +1684,32 @@ async fn publication_resume_is_atomic_and_does_not_replay_the_old_terminal_event
     jobs.insert(ordinary).await;
     assert!(jobs.try_start_resume("ordinary-failure").await.is_none());
 }
+
+#[tokio::test]
+async fn resumed_jobs_do_not_fill_an_unconsumed_event_channel() {
+    // Each entry emits a progress event and three Stub tokens. Eighty
+    // entries exceed the resume handler's former 256-event channel capacity.
+    let names: Vec<String> = (0..80).map(|i| format!("entry_{i}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let h = start_with_nodes(&refs).await;
+    let id = unique_job_id("resume-many-events");
+    let job_dir = h.jobs_root.join(&id);
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::write(
+        job_dir.join("input.json"),
+        serde_json::json!({"path": h.doc.to_str().unwrap()}).to_string(),
+    )
+    .unwrap();
+    cuttlefish_host::ledger::Ledger::open(&job_dir.join("ledger.sqlite"), &h.fingerprint).unwrap();
+    h.jobs.mark_interrupted(id.clone()).await;
+    let response = h
+        .client
+        .post(format!("http://localhost/jobs/{id}/resume"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let completed = h.await_terminal(&id).await;
+    assert_eq!(completed["status"], "completed", "{completed}");
+    assert_eq!(completed["envelope"]["result"]["summary"], "a stub summary");
+}
