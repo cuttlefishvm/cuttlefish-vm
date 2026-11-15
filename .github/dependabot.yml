@@ -5,6 +5,18 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # Hammer links this repo, and its libduckdb-sys needs arrow 58. Arrow 59
+      # would break that link, so the arrow family moves only jointly with
+      # DuckDB, by hand. Remove this rule when DuckDB moves to arrow 59.
+      - dependency-name: arrow
+        versions: [">=59"]
+      - dependency-name: arrow-array
+        versions: [">=59"]
+      - dependency-name: arrow-schema
+        versions: [">=59"]
+      - dependency-name: parquet
+        versions: [">=59"]
     groups:
       # One PR for routine patch/minor bumps; majors still arrive separately
       # because those are the ones that need a human to read a changelog.

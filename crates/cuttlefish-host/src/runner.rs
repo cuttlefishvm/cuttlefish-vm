@@ -1077,6 +1077,11 @@ pub async fn run_job(
 /// reconcile against the ledger. Projecting at the end makes that class of
 /// bug unrepresentable: SQLite is already transactional, so let it be the
 /// thing that's true.
+// `Envelope` is large (it carries the whole job record), which trips
+// `clippy::result_large_err` on clippy 1.100. Boxing the `Err` would touch
+// dozens of `Err(fail(..))` sites here, for an error path that runs at
+// most once per job, so the lint is allowed on exactly this function.
+#[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn run_fanout_node(
     engine: &Engine,
@@ -1721,6 +1726,11 @@ impl Ladder<'_> {
     }
 }
 
+// `Envelope` is large (it carries the whole job record), which trips
+// `clippy::result_large_err` on clippy 1.100. Boxing the `Err` would touch
+// dozens of `Err(fail(..))` sites here, for an error path that runs at
+// most once per job, so the lint is allowed on exactly this function.
+#[allow(clippy::result_large_err)]
 #[allow(clippy::too_many_arguments)]
 async fn run_stage(
     engine: &Engine,
