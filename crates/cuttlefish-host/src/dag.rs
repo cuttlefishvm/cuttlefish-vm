@@ -299,6 +299,74 @@ pub fn graph_fingerprint(nodes: &[CheckedNode]) -> String {
     crate::hex::encode(hasher.finalize())
 }
 
+/// Bind opt-in publication/generation jobs to model controls and executable bytes.
+///
+/// Historical jobs keep their existing graph fingerprint. Required warehouses
+/// and JSON Ollama targets use a versioned fingerprint including model targets,
+/// script/Wasm bytes, graph wiring, loops and acceptance schema bytes. This
+/// prevents a resumed job from relabeling checkpoints after a pin or prompt edit.
+/// Fan-out manifest content is checked separately by the ledger. Other files
+/// opened by scripts still need immutable, content-addressed input manifests.
+pub fn job_fingerprint(
+    nodes: &[CheckedNode],
+    spec: &cuttlefish_core::spec::Spec,
+) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    if !spec.warehouse_required
+        && !(spec.model.provider == "ollama" && spec.model.target.trim_start().starts_with('{'))
+    {
+        return Ok(graph_fingerprint(nodes));
+    }
+    fn input_value(input: &InputExpr) -> serde_json::Value {
+        match input {
+            InputExpr::FromNode(name) => serde_json::json!({"node": name}),
+            InputExpr::List(items) => {
+                serde_json::json!({"list": items.iter().map(input_value).collect::<Vec<_>>()})
+            }
+            InputExpr::Record(fields) => {
+                serde_json::json!({"record": fields.iter().map(|(k,v)| (k.clone(), input_value(v))).collect::<BTreeMap<_,_>>()})
+            }
+        }
+    }
+    let mut hasher = Sha256::new();
+    hash_length_prefixed(&mut hasher, b"cuttlefish-generation-v1");
+    hash_length_prefixed(&mut hasher, graph_fingerprint(nodes).as_bytes());
+    let controls = serde_json::json!({
+        "model": [spec.model.provider.clone(), spec.model.target.clone()],
+        "embedding_model": spec.embedding_model.as_ref().map(|m| [&m.provider, &m.target]),
+        "branches": spec.branches.decisions,
+        "read_roots": spec.read_roots,
+        "fetch_prefixes": spec.fetch_prefixes,
+        "local_only": spec.data_policy == cuttlefish_core::spec::DataPolicy::LocalOnly,
+        "warehouse_required": spec.warehouse_required,
+    });
+    hash_length_prefixed(&mut hasher, &serde_json::to_vec(&controls)?);
+    for node in nodes {
+        hash_length_prefixed(&mut hasher, &node.module_bytes);
+        hash_length_prefixed(&mut hasher, node.script.as_deref().unwrap_or("").as_bytes());
+        let wiring = serde_json::json!({
+            "kind": node.kind,
+            "input": node.input.as_ref().map(input_value),
+            "repeat_until": node.repeat_until,
+            "max_iterations": node.max_iterations,
+            "item_output": node.item_output.as_ref().map(ToString::to_string),
+        });
+        hash_length_prefixed(&mut hasher, &serde_json::to_vec(&wiring)?);
+        for check in &node.accept {
+            if let cuttlefish_core::graph::AcceptCheck::Schema(path) = check {
+                let bytes = std::fs::read(path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "reading acceptance schema {} for resume identity: {e}",
+                        path.display()
+                    )
+                })?;
+                hash_length_prefixed(&mut hasher, &bytes);
+            }
+        }
+    }
+    Ok(crate::hex::encode(hasher.finalize()))
+}
+
 /// A node's `accept`/`on_fail` as one stable string, for fingerprinting.
 ///
 /// Written out by hand rather than via `Debug`: `Debug` output is explicitly

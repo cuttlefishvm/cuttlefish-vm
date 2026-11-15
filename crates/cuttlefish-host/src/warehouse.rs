@@ -46,6 +46,9 @@ use cuttlefish_abi::Ty;
 /// What went wrong writing a warehouse.
 #[derive(Debug, thiserror::Error)]
 pub enum WarehouseError {
+    /// A purported publication could not be read back or did not match its manifest.
+    #[error("warehouse verification: {0}")]
+    Verification(String),
     /// A directory or file could not be created.
     #[error("creating {path}: {source}")]
     Create {
@@ -532,9 +535,208 @@ pub fn entry_for(root: &Path, path: &Path, batch: &RecordBatch) -> TableEntry {
     }
 }
 
+/// Remove a prior receipt before changing a required warehouse projection.
+/// Absence is expected on the first run; other failures prevent publication.
+pub fn invalidate_publication(root: &Path) -> Result<(), WarehouseError> {
+    match std::fs::remove_file(root.join("publication.json")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(WarehouseError::Verification(format!(
+            "invalidating old receipt: {e}"
+        ))),
+    }
+}
+
+/// Read every declared Parquet table back before writing a publication receipt.
+///
+/// Required warehouses use this as a completion gate. The receipt binds the
+/// manifest and table bytes with SHA-256, after checking decoded row counts and
+/// column names. Explicitly skipped typed layers remain skipped; this verifies
+/// transport and lineage, not semantic correctness of model-generated content.
+/// Use one warehouse directory per job and a single writer. Consumers must require a completed
+/// job and match the receipt's manifest hash, never infer success from an old
+/// receipt left by an earlier run. SQLite checkpoints remain authoritative and
+/// permit a failed projection to be rebuilt without repeating concluded items.
+pub fn verify_and_publish(root: &Path, manifest: &Manifest) -> Result<(), WarehouseError> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let problem = |e: String| WarehouseError::Verification(e);
+    invalidate_publication(root)?;
+    let manifest_bytes =
+        std::fs::read(root.join("manifest.json")).map_err(|e| problem(e.to_string()))?;
+    if serde_json::from_slice::<serde_json::Value>(&manifest_bytes)?
+        != serde_json::to_value(manifest)?
+    {
+        return Err(problem("manifest changed before verification".into()));
+    }
+    let mut tables = BTreeMap::new();
+    for layer in manifest
+        .bronze
+        .values()
+        .chain(manifest.silver.values())
+        .chain(manifest.gold.values())
+    {
+        let Layer::Written(entry) = layer else {
+            continue;
+        };
+        let relative = Path::new(&entry.path);
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(problem(format!("unsafe table path: {}", entry.path)));
+        }
+        let mut path = root.to_path_buf();
+        for component in relative.components() {
+            path.push(component);
+            if std::fs::symlink_metadata(&path)
+                .map_err(|e| problem(e.to_string()))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(problem(format!("symlink table path: {}", entry.path)));
+            }
+        }
+        let file = std::fs::File::open(&path).map_err(|e| problem(e.to_string()))?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| problem(e.to_string()))?;
+        let columns: Vec<_> = builder
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        if columns != entry.columns {
+            return Err(problem(format!("column mismatch: {}", entry.path)));
+        }
+        let mut rows = 0;
+        for batch in builder.build().map_err(|e| problem(e.to_string()))? {
+            rows += batch.map_err(|e| problem(e.to_string()))?.num_rows();
+        }
+        if rows != entry.rows {
+            return Err(problem(format!("row mismatch: {}", entry.path)));
+        }
+        let mut file = std::fs::File::open(&path).map_err(|e| problem(e.to_string()))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let n = file.read(&mut buffer).map_err(|e| problem(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&buffer[..n]);
+        }
+        tables.insert(
+            entry.path.clone(),
+            serde_json::json!({"rows":rows,"sha256":crate::hex::encode(digest.finalize())}),
+        );
+    }
+    let receipt = serde_json::json!({"version":1,"job_id":manifest.job_id,
+        "spec_fingerprint":manifest.spec_fingerprint,
+        "manifest_sha256":crate::hex::encode(Sha256::digest(&manifest_bytes)),"tables":tables});
+    let staged = root.join(".publication.json.tmp");
+    std::fs::write(&staged, serde_json::to_vec_pretty(&receipt)?)
+        .map_err(|e| problem(e.to_string()))?;
+    std::fs::rename(staged, root.join("publication.json")).map_err(|e| problem(e.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn publication_fixture(root: &Path) -> Manifest {
+        let batch = bronze_batch(
+            &[row(0, Some(serde_json::json!({"title":"A"})), None)],
+            &lineage(),
+        )
+        .unwrap();
+        let path = root.join("bronze/test.parquet");
+        write_parquet(&path, &batch).unwrap();
+        let manifest = Manifest {
+            job_id: "job-1".into(),
+            spec_name: "test".into(),
+            spec_fingerprint: "abc123".into(),
+            model: "stub".into(),
+            embedding_model: None,
+            cuttlefish_version: "test".into(),
+            written_at: now_rfc3339(),
+            bronze: [(
+                "test".into(),
+                Layer::Written(entry_for(root, &path, &batch)),
+            )]
+            .into_iter()
+            .collect(),
+            silver: Default::default(),
+            gold: Default::default(),
+        };
+        write_manifest(root, &manifest).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn publication_receipt_binds_manifest_and_table_bytes() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = publication_fixture(dir.path());
+        verify_and_publish(dir.path(), &manifest).unwrap();
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("publication.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            receipt["manifest_sha256"],
+            crate::hex::encode(Sha256::digest(
+                std::fs::read(dir.path().join("manifest.json")).unwrap()
+            ))
+        );
+        assert_eq!(
+            receipt["tables"]["bronze/test.parquet"]["sha256"],
+            crate::hex::encode(Sha256::digest(
+                std::fs::read(dir.path().join("bronze/test.parquet")).unwrap()
+            ))
+        );
+        assert_eq!(receipt["tables"]["bronze/test.parquet"]["rows"], 1);
+    }
+
+    #[test]
+    fn invalid_publications_remove_stale_receipts_and_fail() {
+        for corruption in [
+            "missing",
+            "corrupt",
+            "rows",
+            "columns",
+            "manifest",
+            "traversal",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut manifest = publication_fixture(dir.path());
+            verify_and_publish(dir.path(), &manifest).unwrap();
+            let Layer::Written(entry) = manifest.bronze.get_mut("test").unwrap() else {
+                panic!()
+            };
+            match corruption {
+                "missing" => std::fs::remove_file(dir.path().join(&entry.path)).unwrap(),
+                "corrupt" => std::fs::write(dir.path().join(&entry.path), b"not parquet").unwrap(),
+                "rows" => entry.rows += 1,
+                "columns" => entry.columns.push("absent".into()),
+                "traversal" => entry.path = "../outside.parquet".into(),
+                "manifest" => std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap(),
+                _ => unreachable!(),
+            }
+            if corruption != "manifest" {
+                write_manifest(dir.path(), &manifest).unwrap();
+            }
+            assert!(
+                verify_and_publish(dir.path(), &manifest).is_err(),
+                "accepted {corruption}"
+            );
+            assert!(
+                !dir.path().join("publication.json").exists(),
+                "old receipt survived {corruption}"
+            );
+        }
+    }
 
     fn lineage() -> Lineage {
         Lineage {

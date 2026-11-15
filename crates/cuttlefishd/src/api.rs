@@ -92,6 +92,7 @@ fn warehouse_plan(st: &AppState) -> Option<cuttlefish_host::runner::WarehousePla
         .as_ref()
         .map(|root| cuttlefish_host::runner::WarehousePlan {
             root: root.clone(),
+            required: st.spec.warehouse_required,
             spec_name: st.spec.name.clone(),
             model: st.backend.model_name(),
             embedding_model: st.embedder.as_ref().map(|e| e.model_name()),
@@ -352,7 +353,16 @@ async fn submit(State(st): State<AppState>, Json(req): Json<SubmitJob>) -> impl 
         )
             .into_response();
     }
-    let fingerprint = cuttlefish_host::dag::graph_fingerprint(&st.checked_nodes);
+    let fingerprint = match cuttlefish_host::dag::job_fingerprint(&st.checked_nodes, &st.spec) {
+        Ok(value) => value,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
     let ledger =
         match cuttlefish_host::ledger::Ledger::open(&job_dir.join("ledger.sqlite"), &fingerprint) {
             Ok(ledger) => ledger,
@@ -480,19 +490,19 @@ async fn cancel_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
     }
 }
 
-/// Explicitly resume a job the startup scan found `Interrupted`.
+/// Explicitly resume an interrupted job or repair a failed warehouse publication.
 ///
 /// Deliberately not automatic: per the design's "resume is a signal, not an
 /// automatic action," an agent must see the job sitting at `Interrupted` (via
 /// `GET /jobs`) and choose to call this — a crashed job never silently starts
 /// running again on its own.
 async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    let job = match st.jobs.get(&id).await {
-        Some(job) if job.status == cuttlefish_abi::JobStatus::Interrupted => job,
+    match st.jobs.get(&id).await {
+        Some(job) if job.can_resume() => {},
         Some(_) => {
             return (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "only an Interrupted job can be resumed" })),
+                Json(serde_json::json!({ "error": "only an Interrupted job or a failed warehouse publication can be resumed" })),
             )
                 .into_response()
         }
@@ -519,7 +529,17 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
     // file). Reject before touching the ledger's checkpoints at all —
     // resuming node-by-node against a mismatched graph would run some
     // nodes' blocks against a spec they were never checked against.
-    let current_fingerprint = cuttlefish_host::dag::graph_fingerprint(&st.checked_nodes);
+    let current_fingerprint =
+        match cuttlefish_host::dag::job_fingerprint(&st.checked_nodes, &st.spec) {
+            Ok(value) => value,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response()
+            }
+        };
     let ledger = match cuttlefish_host::ledger::Ledger::open(
         &job_dir.join("ledger.sqlite"),
         &current_fingerprint,
@@ -590,13 +610,16 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
     // has already succeeded: flipping status any earlier would risk leaving
     // the job stuck in a new status with nothing running and no way to
     // resume it again, if a later check then failed.
-    if st.jobs.try_start_resume(&id).await.is_none() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "this job is already being resumed" })),
-        )
-            .into_response();
-    }
+    let job = match st.jobs.try_start_resume(&id).await {
+        Some(job) => job,
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "this job is already being resumed" })),
+            )
+                .into_response()
+        }
+    };
 
     let (engine, module_cache, backend, store, job_id) = (
         st.engine.clone(),
@@ -607,9 +630,8 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
     );
     let cancel = job.cancel.clone();
     tokio::spawn(async move {
-        // Events aren't replayed for a resume in v1 — a client watching
-        // `/jobs/{id}/events` mid-crash has already lost that stream; the
-        // result still lands durably via `finish`, same as any other job.
+        // Prior token events are not replayed after interruption. Publish the
+        // new terminal event so subscribers see this attempt's actual outcome.
         let (tx, _rx) = mpsc::channel::<JobEvent>(256);
         let envelope = run_job(
             engine,
@@ -621,6 +643,12 @@ async fn resume_job(State(st): State<AppState>, Path(id): Path<String>) -> impl 
             &module_cache,
         )
         .await;
+        store
+            .publish(
+                &job_id,
+                serde_json::json!({ "type": "result", "envelope": envelope }).to_string(),
+            )
+            .await;
         store.finish(&job_id, envelope).await;
     });
 

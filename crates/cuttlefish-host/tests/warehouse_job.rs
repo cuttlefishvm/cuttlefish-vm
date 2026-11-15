@@ -166,6 +166,7 @@ async fn a_real_fanout_job_writes_a_warehouse_a_foreign_reader_can_open() {
         embedder: None,
         warehouse: Some(WarehousePlan {
             root: root.clone(),
+            required: false,
             spec_name: "index_corpus".into(),
             model: "stub".into(),
             embedding_model: None,
@@ -374,6 +375,7 @@ async fn a_resumed_job_writes_a_whole_warehouse_not_a_partial_one() {
         embedder: None,
         warehouse: Some(WarehousePlan {
             root: root.clone(),
+            required: false,
             spec_name: "index_corpus".into(),
             model: "stub".into(),
             embedding_model: None,
@@ -421,4 +423,203 @@ async fn a_resumed_job_writes_a_whole_warehouse_not_a_partial_one() {
         (0..b.num_rows()).any(|i| sources.value(i).contains("the interrupted attempt")),
         "lineage comes from the ledger, so it survives the interruption"
     );
+}
+
+#[tokio::test]
+async fn required_warehouse_failure_is_terminal_and_resume_keeps_completed_items() {
+    strict_or_optional_warehouse(true).await;
+}
+
+#[tokio::test]
+async fn optional_warehouse_retains_warning_only_failure_behavior() {
+    strict_or_optional_warehouse(false).await;
+}
+
+async fn strict_or_optional_warehouse(required: bool) {
+    use cuttlefish_host::infer::{InferBackend, InferRequest, InferResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted(AtomicUsize);
+    #[async_trait::async_trait]
+    impl InferBackend for Counted {
+        async fn infer(
+            &self,
+            req: InferRequest<'_>,
+            on_token: &mut (dyn for<'t> FnMut(&'t str) -> bool + Send),
+        ) -> anyhow::Result<InferResult> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            StubBackend::default().infer(req, on_token).await
+        }
+        fn model_name(&self) -> String {
+            "stub".into()
+        }
+    }
+    let backend = Arc::new(Counted(AtomicUsize::new(0)));
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("input.jsonl");
+    std::fs::write(&manifest, "{\"name\":\"alpha\"}\n").unwrap();
+    let root = dir.path().join("warehouse");
+    // A file cannot hold the warehouse's subdirectories.
+    std::fs::write(&root, "occupied").unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite"), "strict-1").unwrap();
+    let make_job = || JobSpec {
+        nodes: vec![
+            {
+                let mut node = map_node(&manifest);
+                node.script = Some(format!(
+                    "let response = infer(\"counted fixture\", 8); {}",
+                    node.script.as_ref().unwrap()
+                ));
+                node
+            },
+            reduce_node(),
+        ],
+        exclusive_to: HashMap::new(),
+        input: serde_json::Value::Null,
+        caps: Capabilities::new(vec![dir.path().to_path_buf()]),
+        alternates: Default::default(),
+        embedder: None,
+        warehouse: Some(WarehousePlan {
+            root: root.clone(),
+            required,
+            spec_name: "strict".into(),
+            model: "stub".into(),
+            embedding_model: None,
+        }),
+    };
+    let (tx, _rx) = mpsc::channel(1024);
+    let engine = Arc::new(Engine::default());
+    let cache = ModuleCache::new();
+    let failed = run_job(
+        engine.clone(),
+        backend.clone(),
+        make_job(),
+        tx.clone(),
+        CancellationToken::new(),
+        &ledger,
+        &cache,
+    )
+    .await;
+    if required {
+        assert_eq!(failed.status, JobStatus::Failed);
+        assert_eq!(failed.error.unwrap().code, "warehouse_publication_failed");
+    } else {
+        assert_eq!(failed.status, JobStatus::Completed);
+        assert!(failed.error.is_none());
+        return;
+    }
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    let before = ledger.concluded_rows("extract").unwrap();
+    assert_eq!(before.len(), 1, "expensive completed work is retained");
+    std::fs::remove_file(&root).unwrap();
+    let completed = run_job(
+        engine,
+        backend.clone(),
+        make_job(),
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &cache,
+    )
+    .await;
+    assert_eq!(completed.status, JobStatus::Completed, "{completed:?}");
+    assert_eq!(
+        backend.0.load(Ordering::SeqCst),
+        1,
+        "resume must not call inference again"
+    );
+    let after = ledger.concluded_rows("extract").unwrap();
+    assert_eq!(
+        before[0].concluded_at, after[0].concluded_at,
+        "resume must reuse the item"
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("publication.json")).unwrap()).unwrap();
+    assert_eq!(receipt["spec_fingerprint"], "strict-1");
+    assert!(receipt["tables"].as_object().unwrap().contains_key(
+        &Path::new("bronze")
+            .join("extract.parquet")
+            .to_string_lossy()
+            .into_owned()
+    ));
+}
+
+#[tokio::test]
+async fn synthetic_candidate_example_preserves_grouping_and_rejects_heldout() {
+    let dir = tempfile::tempdir().unwrap();
+    let packet: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../examples/synthetic-candidates/fixture.jsonl"
+    ))
+    .unwrap();
+    for heldout in [false, true] {
+        let mut packet = packet.clone();
+        if heldout {
+            packet["split"] = "heldout".into();
+        }
+        let manifest = dir.path().join(if heldout {
+            "heldout.jsonl"
+        } else {
+            "train.jsonl"
+        });
+        std::fs::write(&manifest, format!("{packet}\n")).unwrap();
+        let mut candidate = map_node(&manifest);
+        candidate.script =
+            Some(include_str!("../../../examples/synthetic-candidates/candidate.rhai").into());
+        let declared: cuttlefish_abi::Signature = candidate
+            .script
+            .as_ref()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("//! signature: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        candidate.item_output = Some(declared.output);
+        let mut complete = reduce_node();
+        complete.script =
+            Some(include_str!("../../../examples/synthetic-candidates/completion.rhai").into());
+        complete.signature = complete
+            .script
+            .as_ref()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("//! signature: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(complete.signature.input, fanout_collection_ty());
+        let ledger = Ledger::open(
+            &dir.path().join(if heldout {
+                "heldout.sqlite"
+            } else {
+                "train.sqlite"
+            }),
+            "candidate-test",
+        )
+        .unwrap();
+        let (tx, _) = mpsc::channel(1024);
+        let result = run_job(Arc::new(Engine::default()), Arc::new(StubBackend {
+            reply: "{\"question\":\"Which current documents support the required therapy duration?\",\"reference_evidence\":[\"wrong-patient\"]}".into()
+        }), JobSpec {
+            nodes: vec![candidate,complete], exclusive_to: HashMap::new(), input: serde_json::Value::Null,
+            caps: Capabilities::new(vec![dir.path().to_path_buf()]), alternates: Default::default(), embedder: None, warehouse: None,
+        },tx,CancellationToken::new(),&ledger,&ModuleCache::new()).await;
+        if heldout {
+            assert_eq!(result.status, JobStatus::Failed, "{result:?}");
+        } else {
+            assert_eq!(result.status, JobStatus::Completed, "{result:?}");
+            let rows = ledger.concluded_rows("extract").unwrap();
+            let output = rows[0].output.as_ref().unwrap();
+            assert_eq!(output["parent_id"], packet["parent_id"]);
+            assert_eq!(output["book_id"], packet["book_id"]);
+            assert_eq!(output["documents"], packet["documents"]);
+            assert_eq!(output["patient"], packet["patient"]);
+            assert_eq!(output["required_weeks"], packet["required_weeks"]);
+            assert_eq!(output["reference_evidence"], serde_json::json!(["current"]));
+            assert_eq!(output["requires_review"], true);
+        }
+    }
 }
