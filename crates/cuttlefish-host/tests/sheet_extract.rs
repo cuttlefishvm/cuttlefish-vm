@@ -46,6 +46,21 @@ fn block_wasm() -> Vec<u8> {
     .clone()
 }
 
+#[test]
+fn the_sheet_block_needs_no_browser_or_host_imports() {
+    let engine = Engine::default();
+    let module =
+        wasmtime::Module::new(&engine, block_wasm()).expect("the sheet block must compile");
+    let imports: Vec<_> = module
+        .imports()
+        .map(|import| format!("{}::{}", import.module(), import.name()))
+        .collect();
+    assert!(
+        imports.is_empty(),
+        "unexpected sheet block imports: {imports:?}"
+    );
+}
+
 /// A stored-only zip containing `files`.
 fn zip(files: &[(&str, &str)]) -> Vec<u8> {
     fn crc32(bytes: &[u8]) -> u32 {

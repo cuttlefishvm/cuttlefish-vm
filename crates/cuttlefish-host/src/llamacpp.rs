@@ -50,7 +50,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{LlamaChatMessage, LlamaModel};
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::sampling::LlamaSampler;
 use std::num::NonZeroU32;
@@ -190,6 +190,22 @@ fn decode_rgb(bytes: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
     Ok((rgb.width(), rgb.height(), rgb.into_raw()))
 }
 
+/// Keep partial UTF-8 bytes between tokens and reserve for the decoder's
+/// pending bytes as well as this token. A byte-sized output buffer can fill
+/// before a split character is emitted, silently dropping the token's suffix.
+fn decode_piece(decoder: &mut encoding_rs::Decoder, bytes: &[u8]) -> anyhow::Result<String> {
+    let capacity = decoder
+        .max_utf8_buffer_length(bytes.len())
+        .ok_or_else(|| anyhow::anyhow!("generated token is too large to decode"))?;
+    let mut piece = String::with_capacity(capacity);
+    let (status, read, _) = decoder.decode_to_string(bytes, &mut piece, false);
+    anyhow::ensure!(
+        status == encoding_rs::CoderResult::InputEmpty && read == bytes.len(),
+        "UTF-8 decoder did not consume the complete generated token"
+    );
+    Ok(piece)
+}
+
 /// Run generation to completion on the calling (blocking) thread.
 ///
 /// Split out so the async wrapper stays about plumbing. `emit` returns whether
@@ -243,9 +259,7 @@ fn generate(
     // from, and `tokens_in` counting what the prompt cost.
     let mut batch = LlamaBatch::new(context_size as usize, 1);
     let (tokens_in, mut pos) = if images.is_empty() {
-        let tokens = model
-            .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?;
+        let tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
         let tokens_in = tokens.len() as u32;
 
         if tokens_in >= context_size {
@@ -274,7 +288,7 @@ fn generate(
             )
         })?;
 
-        let mtmd = MtmdContext::init_from_file(
+        let mut mtmd = MtmdContext::init_from_file(
             &mmproj.to_string_lossy(),
             model,
             &MtmdContextParams::default(),
@@ -313,7 +327,7 @@ fn generate(
         // text around it, leaving the context primed. It returns the position to
         // continue generating from.
         let n_past = chunks
-            .eval_chunks(&mtmd, &ctx, 0, 0, context_size as i32, true)
+            .eval_chunks(&mut mtmd, &mut ctx, 0, 0, context_size as i32, true)
             .map_err(|e| anyhow::anyhow!("evaluating the prompt with images: {e}"))?;
 
         (n_past as u32, n_past)
@@ -327,7 +341,7 @@ fn generate(
     // Temperature and top-p belong in the spec, once there is somewhere to put
     // them; until then, determinism is the better default.
     let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::penalties(64, 1.1, 0.0, 0.0),
+        LlamaSampler::penalties(model.vocab().n_tokens(), 64, 1.1, 0.0, 0.0),
         LlamaSampler::greedy(),
     ]);
 
@@ -344,7 +358,7 @@ fn generate(
         let token = sampler.sample(&ctx, -1);
         sampler.accept(token);
 
-        if model.is_eog_token(token) {
+        if model.vocab().is_eog(token) {
             break;
         }
 
@@ -352,9 +366,8 @@ fn generate(
         // indistinguishable from a token that legitimately renders to nothing,
         // so swallowing it silently truncates output mid-generation and returns
         // a shorter answer that looks complete.
-        let piece = model
-            .token_to_piece(token, &mut decoder, false, None)
-            .map_err(|e| anyhow::anyhow!("decoding generated token: {e}"))?;
+        let bytes = model.vocab().token_to_piece(token, false, None);
+        let piece = decode_piece(&mut decoder, &bytes)?;
         tokens_out += 1;
         text.push_str(&piece);
 
@@ -468,5 +481,21 @@ impl BackendFactory for LlamaCppFactory {
             anyhow::bail!("a path to a .gguf model file is required");
         }
         Ok(Arc::new(LlamaCppBackend::load(target)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_piece;
+
+    #[test]
+    fn a_character_split_across_tokens_keeps_its_suffix() {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        assert_eq!(decode_piece(&mut decoder, &[0xf0, 0x9f]).unwrap(), "");
+        assert_eq!(
+            decode_piece(&mut decoder, &[0xa6, 0x91, b'!']).unwrap(),
+            "🦑!"
+        );
+        assert_eq!(decode_piece(&mut decoder, b" next").unwrap(), " next");
     }
 }
