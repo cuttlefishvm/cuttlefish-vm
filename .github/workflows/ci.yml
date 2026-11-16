@@ -83,11 +83,8 @@ jobs:
       # Measurement only — no third-party upload. cargo-llvm-cov produces the
       # number locally, which is all a coverage figure ever required; the badge
       # is published from the docs workflow, which already owns gh-pages.
-      #
-      # `|| true` covers the legitimate case of a workspace with no test
-      # binaries, where llvm-cov exits non-zero with "no coverage data found".
-      # Replace this with a real `--fail-under-lines` threshold once there is
-      # enough code for a number to mean something.
+      # Compilation and test failures must fail this job too: nested Wasm
+      # builds run here, and swallowing their status hides guest regressions.
       - name: Coverage summary
         # `blocks/` is excluded because guest proc-blocks execute inside wasm,
         # where llvm-cov cannot instrument them — they report 0% however well
@@ -96,7 +93,7 @@ jobs:
         # log disagree about the same codebase.
         run: |
           cargo llvm-cov --workspace --locked --summary-only \
-            --ignore-filename-regex '(^|/)blocks/' || true
+            --ignore-filename-regex '(^|/)blocks/'
 
   # The `llamacpp` feature is off by default, so nothing above compiles it —
   # which is exactly how an optional feature rots unnoticed. This builds it on
@@ -124,7 +121,9 @@ jobs:
         # libclang. Neither is needed for a default build.
         run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
       - name: Clippy
-        run: cargo clippy -p cuttlefish-host --features llamacpp --all-targets --locked -- -D warnings
+        run: cargo clippy -p cuttlefish-host -p cuttlefishd --features llamacpp --all-targets --locked -- -D warnings
+      - name: Build daemon with llama.cpp
+        run: cargo build -p cuttlefishd --features llamacpp --locked
       - name: Test
         # Scoped to --lib plus the one integration binary that actually
         # touches this feature. The other 13 integration binaries under

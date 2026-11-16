@@ -84,6 +84,25 @@ fn an_unknown_provider_lists_what_is_available() {
     assert!(msg.contains("stub"), "alternatives must be listed: {msg}");
 }
 
+#[cfg(not(feature = "llamacpp"))]
+#[test]
+fn a_llamacpp_spec_without_the_feature_lists_the_available_providers() {
+    let registry = Registry::with_builtins();
+    assert!(!registry.providers().contains(&"llamacpp"));
+    let err = registry
+        .resolve(&ModelRef::new("llamacpp", "/no/such/model.gguf"))
+        .err()
+        .expect("a disabled provider must not resolve or fall back");
+    let message = err.to_string();
+    assert!(
+        message.starts_with("unknown model provider `llamacpp`. Available providers:\n"),
+        "{message}"
+    );
+    for provider in registry.providers() {
+        assert!(message.contains(&format!("\n  {provider} ")), "{message}");
+    }
+}
+
 #[test]
 fn registering_twice_replaces_rather_than_duplicates() {
     // Substituting a provider is how a test points `ollama` at a mock without a

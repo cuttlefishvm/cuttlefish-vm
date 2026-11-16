@@ -29,7 +29,7 @@ fn example_block() -> Vec<u8> {
     static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
     WASM.get_or_init(|| {
-        let status = std::process::Command::new(env!("CARGO"))
+        let status = support::cargo::clean_cargo(env!("CARGO"))
             .args([
                 "build",
                 "-p",

@@ -9,26 +9,8 @@
 
 use std::path::PathBuf;
 
-/// A `cargo` invocation with the coverage-only environment variables that
-/// break a *nested* cargo build stripped out.
-///
-/// `cargo llvm-cov` sets `RUSTC_WRAPPER`/`CARGO_LLVM_COV*` for its own
-/// instrumented build; a child `cargo build` inherits and chokes on them
-/// unless they're removed first. Invisible under a plain `cargo test`, which
-/// sets none of this — see the sibling copy of this comment in
-/// `crates/cuttlefish-host/tests/support/mod.rs` for the fuller story.
-fn clean_cargo(program: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new(program);
-    for (key, _) in std::env::vars() {
-        if key == "RUSTC_WRAPPER"
-            || key.starts_with("CARGO_LLVM_COV")
-            || key.starts_with("__CARGO_LLVM_COV")
-        {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
+#[path = "../../../../test-support/cargo.rs"]
+pub mod cargo;
 
 /// The `Cargo.toml` every one-off fixture block shares.
 fn manifest(name: &str) -> String {
@@ -66,7 +48,7 @@ pub fn block_with_source(dir: &std::path::Path, name: &str, lib_rs: &str) -> Pat
     std::fs::write(crate_dir.join("Cargo.toml"), manifest(name)).unwrap();
     std::fs::write(crate_dir.join("src/lib.rs"), lib_rs).unwrap();
 
-    let status = clean_cargo(env!("CARGO"))
+    let status = cargo::clean_cargo(env!("CARGO"))
         .current_dir(&crate_dir)
         .args(["build", "--target", "wasm32-unknown-unknown"])
         .status()

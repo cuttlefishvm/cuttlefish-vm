@@ -28,7 +28,7 @@ use wasmtime::Engine;
 fn block_wasm() -> Vec<u8> {
     static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     WASM.get_or_init(|| {
-        let status = support::clean_cargo(env!("CARGO"))
+        let status = support::cargo::clean_cargo(env!("CARGO"))
             .args([
                 "build",
                 "-p",
@@ -44,6 +44,21 @@ fn block_wasm() -> Vec<u8> {
         std::fs::read(&wasm).unwrap_or_else(|e| panic!("reading {}: {e}", wasm.display()))
     })
     .clone()
+}
+
+#[test]
+fn the_sheet_block_needs_no_browser_or_host_imports() {
+    let engine = Engine::default();
+    let module =
+        wasmtime::Module::new(&engine, block_wasm()).expect("the sheet block must compile");
+    let imports: Vec<_> = module
+        .imports()
+        .map(|import| format!("{}::{}", import.module(), import.name()))
+        .collect();
+    assert!(
+        imports.is_empty(),
+        "unexpected sheet block imports: {imports:?}"
+    );
 }
 
 /// A stored-only zip containing `files`.
