@@ -14,18 +14,8 @@
 //! exactly how it went unnoticed: CI's coverage job silently fell back to its
 //! "no data" branch and reported an "unknown" badge instead of failing loudly,
 //! and every other job runs plain `cargo test`.
-pub fn clean_cargo(program: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new(program);
-    for (key, _) in std::env::vars() {
-        if key == "RUSTC_WRAPPER"
-            || key.starts_with("CARGO_LLVM_COV")
-            || key.starts_with("__CARGO_LLVM_COV")
-        {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
+#[path = "../../../../test-support/cargo.rs"]
+pub mod cargo;
 
 use std::path::PathBuf;
 
@@ -116,7 +106,7 @@ pub fn block_with_source(dir: &std::path::Path, name: &str, lib_rs: &str) -> Pat
     std::fs::write(crate_dir.join("Cargo.toml"), manifest(name)).unwrap();
     std::fs::write(crate_dir.join("src/lib.rs"), lib_rs).unwrap();
 
-    let status = clean_cargo(env!("CARGO"))
+    let status = cargo::clean_cargo(env!("CARGO"))
         .current_dir(&crate_dir)
         .args(["build", "--target", "wasm32-unknown-unknown"])
         .status()

@@ -7,6 +7,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+#[path = "../../../test-support/cargo.rs"]
+pub mod cargo;
+
 /// A private endpoint for one test.
 ///
 /// Tests run concurrently, so each needs its own. On unix that is a socket
@@ -44,7 +47,7 @@ pub fn unique_endpoint(dir: &Path) -> PathBuf {
 pub fn cuttlefishd_binary() -> PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let status = std::process::Command::new(env!("CARGO"))
+        let status = cargo::clean_cargo(env!("CARGO"))
             .args(["build", "-p", "cuttlefishd"])
             .status()
             .expect("cargo build failed to start");
@@ -64,7 +67,7 @@ pub fn example_block() -> Vec<u8> {
     static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
     WASM.get_or_init(|| {
-        let status = std::process::Command::new(env!("CARGO"))
+        let status = cargo::clean_cargo(env!("CARGO"))
             .args([
                 "build",
                 "-p",

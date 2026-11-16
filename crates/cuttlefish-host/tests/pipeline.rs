@@ -284,7 +284,7 @@ export_block!(B);
     )
     .unwrap();
 
-    let status = crate::support::clean_cargo(env!("CARGO"))
+    let status = crate::support::cargo::clean_cargo(env!("CARGO"))
         .current_dir(&crate_dir)
         .args(["build", "--target", "wasm32-unknown-unknown"])
         .status()

@@ -28,7 +28,7 @@ use wasmtime::Engine;
 fn block_wasm() -> Vec<u8> {
     static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     WASM.get_or_init(|| {
-        let status = support::clean_cargo(env!("CARGO"))
+        let status = support::cargo::clean_cargo(env!("CARGO"))
             .args([
                 "build",
                 "-p",

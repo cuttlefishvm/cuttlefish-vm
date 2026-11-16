@@ -1,5 +1,8 @@
 //! `cuttlefish block new`, driven through the real binary.
 
+#[path = "../../../test-support/cargo.rs"]
+mod cargo;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -66,7 +69,7 @@ fn block_new_rust_scaffolds_a_working_crate() {
     // Cargo's config discovery walks up from the current directory, not
     // from --manifest-path — so the patch above is only found if cwd is
     // inside crate_dir's tree.
-    let build = Command::new(env!("CARGO"))
+    let build = cargo::clean_cargo(env!("CARGO"))
         .args(["build", "--manifest-path"])
         .arg(crate_dir.join("Cargo.toml"))
         .args(["--target", "wasm32-unknown-unknown"])
