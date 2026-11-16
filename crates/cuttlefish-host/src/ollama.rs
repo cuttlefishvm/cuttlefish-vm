@@ -22,6 +22,31 @@
 //! Token-at-a-time delivery is what makes a guest's early-stop verdict
 //! meaningful: the host can act on it while generation is still running rather
 //! than after the fact.
+//!
+//! # Pinned generation
+//!
+//! Plain targets such as `Ollama "qwen3.8:27b"` keep the original behaviour.
+//! A JSON target opts into a required digest pin and explicit generation controls:
+//!
+//! ```text
+//! model = Ollama "{\"model\":\"qwen3.8:27b\",\"expected_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"seed\":42,\"temperature\":0.2,\"format\":\"json\",\"think\":false}";
+//! ```
+//!
+//! Replace the example digest with the actual 64-digit digest from
+//! [`GET /api/tags`](https://docs.ollama.com/api/tags). Each configured generation
+//! checks that mapping before and after inference and checks the response model.
+//! Usage records the requested `tag@sha256:digest`; successful inference means
+//! those checks passed. This is tag-mapping evidence, not atomic attestation of
+//! the weights served. Resuming stored results does not re-attest their identity.
+//! Keep the server and model files stable during a campaign.
+//!
+//! Supported [`generate`](https://docs.ollama.com/api/generate) controls are
+//! integer `seed`, nonnegative finite `temperature`, `format` (`"json"` or a JSON
+//! Schema object), and boolean `think`. Omitted controls retain Ollama defaults;
+//! `num_predict` always comes from the request budget. Unknown fields fail.
+//! Thinking and schema support remain model/server dependent; server errors
+//! propagate. A seed does not guarantee identical output across versions or
+//! hardware. Schema output still needs independent acceptance validation.
 
 use crate::infer::{InferBackend, InferRequest, InferResult};
 use async_trait::async_trait;
@@ -40,6 +65,8 @@ pub const DEFAULT_HOST: &str = "http://localhost:11434";
 #[derive(Debug, Deserialize)]
 struct Chunk {
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     response: String,
     #[serde(default)]
     done: bool,
@@ -57,6 +84,27 @@ pub struct OllamaBackend {
     client: reqwest::Client,
     host: String,
     model: String,
+    config: Option<GenerationConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationConfig {
+    model: String,
+    expected_digest: String,
+    seed: Option<i64>,
+    temperature: Option<f64>,
+    format: Option<serde_json::Value>,
+    think: Option<bool>,
+}
+
+fn canonical_digest(value: &str) -> anyhow::Result<String> {
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    anyhow::ensure!(
+        value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit()),
+        "Ollama digest must contain exactly 64 hexadecimal digits"
+    );
+    Ok(value.to_ascii_lowercase())
 }
 
 impl OllamaBackend {
@@ -70,7 +118,92 @@ impl OllamaBackend {
             // rejects — easy to introduce via an environment variable.
             host: host.into().trim_end_matches('/').to_string(),
             model: model.into(),
+            config: None,
         }
+    }
+
+    /// Build a legacy model tag or a validated JSON generation target.
+    /// No network requests occur until inference.
+    pub fn from_target(host: impl Into<String>, target: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !target.trim().is_empty(),
+            "an Ollama model name is required"
+        );
+        if !target.trim_start().starts_with('{') {
+            return Ok(Self::new(host, target));
+        }
+        let mut config: GenerationConfig = serde_json::from_str(target)
+            .map_err(|e| anyhow::anyhow!("invalid Ollama generation configuration: {e}"))?;
+        // Exact tag names avoid silently pinning one spelling while the server
+        // resolves a different default tag in the generation request.
+        anyhow::ensure!(
+            !config.model.chars().any(char::is_whitespace)
+                && config.model.rsplit('/').next().is_some_and(|last| {
+                    last.split_once(':')
+                        .is_some_and(|(name, tag)| !name.is_empty() && !tag.is_empty())
+                }),
+            "configured Ollama model requires an explicit name:tag"
+        );
+        config.expected_digest = canonical_digest(&config.expected_digest)?;
+        if let Some(temperature) = config.temperature {
+            anyhow::ensure!(
+                temperature.is_finite() && temperature >= 0.0,
+                "Ollama temperature must be finite and nonnegative"
+            );
+        }
+        if let Some(format) = &config.format {
+            if format.is_object() {
+                jsonschema::validator_for(format)
+                    .map_err(|e| anyhow::anyhow!("invalid Ollama format schema: {e}"))?;
+            } else {
+                anyhow::ensure!(
+                    format.as_str() == Some("json"),
+                    "Ollama format must be 'json' or a JSON Schema object"
+                );
+            }
+        }
+        let mut backend = Self::new(host, config.model.clone());
+        backend.config = Some(config);
+        Ok(backend)
+    }
+
+    async fn verify_digest(&self, config: &GenerationConfig) -> anyhow::Result<()> {
+        let response = self
+            .client
+            .get(format!("{}/api/tags", self.host))
+            .send()
+            .await?
+            .error_for_status()?;
+        let body: serde_json::Value = response.json().await?;
+        let models = body
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Ollama /api/tags response has no models array"))?;
+        let matches: Vec<_> = models
+            .iter()
+            .filter(|entry| {
+                entry.get("name").and_then(serde_json::Value::as_str) == Some(self.model.as_str())
+            })
+            .collect();
+        anyhow::ensure!(
+            matches.len() == 1,
+            "Ollama /api/tags must contain exactly one entry named {} (found {})",
+            self.model,
+            matches.len()
+        );
+        let digest = matches[0]
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Ollama tag {} has no digest", self.model))?;
+        let digest = canonical_digest(digest)?;
+        anyhow::ensure!(
+            digest == config.expected_digest,
+            "Ollama digest mismatch for {}: expected {}, observed {}",
+            self.model,
+            config.expected_digest,
+            digest
+        );
+        Ok(())
     }
 
     /// Read `OLLAMA_HOST` if set, otherwise [`DEFAULT_HOST`].
@@ -103,16 +236,32 @@ impl InferBackend for OllamaBackend {
             })
             .collect();
 
+        let mut payload = serde_json::json!({
+            "model": self.model,
+            "prompt": req.prompt,
+            "stream": true,
+            "images": images,
+            "options": { "num_predict": req.max_tokens },
+        });
+        if let Some(config) = &self.config {
+            self.verify_digest(config).await?;
+            if let Some(seed) = config.seed {
+                payload["options"]["seed"] = seed.into();
+            }
+            if let Some(temperature) = config.temperature {
+                payload["options"]["temperature"] = temperature.into();
+            }
+            if let Some(format) = &config.format {
+                payload["format"] = format.clone();
+            }
+            if let Some(think) = config.think {
+                payload["think"] = think.into();
+            }
+        }
         let response = self
             .client
             .post(format!("{}/api/generate", self.host))
-            .json(&serde_json::json!({
-                "model": self.model,
-                "prompt": req.prompt,
-                "stream": true,
-                "images": images,
-                "options": { "num_predict": req.max_tokens },
-            }))
+            .json(&payload)
             .send()
             .await
             .map_err(|e| {
@@ -134,6 +283,8 @@ impl InferBackend for OllamaBackend {
         let mut text = String::new();
         let mut tokens_in = 0;
         let mut tokens_out = 0;
+        let mut terminal = false;
+        let mut stopped = false;
 
         // Responses are newline-delimited JSON, and a chunk boundary need not
         // fall on a newline — a line can arrive split across two chunks, and one
@@ -161,11 +312,20 @@ impl InferBackend for OllamaBackend {
                 if let Some(error) = chunk.error {
                     anyhow::bail!("Ollama error: {error}");
                 }
+                if self.config.is_some() {
+                    anyhow::ensure!(
+                        chunk.model.as_deref() == Some(self.model.as_str()),
+                        "Ollama response model {:?} does not match configured {}",
+                        chunk.model,
+                        self.model
+                    );
+                }
 
                 if !chunk.response.is_empty() {
                     text.push_str(&chunk.response);
                     tokens_out += 1;
                     if !on_token(&chunk.response) {
+                        stopped = true;
                         // The guest asked to stop. Dropping the stream closes
                         // the connection, which is how Ollama learns to stop
                         // generating — there is no separate cancel call.
@@ -174,6 +334,7 @@ impl InferBackend for OllamaBackend {
                 }
 
                 if chunk.done {
+                    terminal = true;
                     // The final message carries authoritative counts; prefer
                     // them over the tokens counted above, which only sees
                     // non-empty responses.
@@ -184,6 +345,14 @@ impl InferBackend for OllamaBackend {
             }
         }
 
+        if let Some(config) = &self.config {
+            anyhow::ensure!(
+                terminal || stopped,
+                "Ollama stream ended without a terminal response"
+            );
+            self.verify_digest(config).await?;
+        }
+
         Ok(InferResult {
             text,
             tokens_in,
@@ -192,7 +361,10 @@ impl InferBackend for OllamaBackend {
     }
 
     fn model_name(&self) -> String {
-        self.model.clone()
+        match &self.config {
+            Some(config) => format!("{}@sha256:{}", self.model, config.expected_digest),
+            None => self.model.clone(),
+        }
     }
 
     /// True, but the honest claim is narrower than the signature allows:
@@ -211,6 +383,8 @@ impl InferBackend for OllamaBackend {
     }
 
     async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(self.config.is_none(),
+            "Ollama generation configuration is not an embedding target; use a plain embedding model tag");
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -279,7 +453,7 @@ impl InferBackend for OllamaBackend {
     }
 
     fn supports_embeddings(&self) -> bool {
-        true
+        self.config.is_none()
     }
 }
 
@@ -292,7 +466,7 @@ impl crate::backend::BackendFactory for OllamaFactory {
     }
 
     fn describe(&self) -> &'static str {
-        "a local Ollama instance; target is a model tag such as `llama3.2:1b`"
+        "a local Ollama instance; target is a model tag or a JSON generation configuration with expected_digest"
     }
 
     fn build(&self, target: &str) -> anyhow::Result<std::sync::Arc<dyn InferBackend>> {
@@ -300,9 +474,9 @@ impl crate::backend::BackendFactory for OllamaFactory {
             anyhow::bail!("an Ollama model name is required, e.g. `llama3.2:1b`");
         }
         // Reachability is deliberately not checked here — see `BackendFactory`.
-        Ok(std::sync::Arc::new(OllamaBackend::new(
+        Ok(std::sync::Arc::new(OllamaBackend::from_target(
             OllamaBackend::host_from_env(),
             target,
-        )))
+        )?))
     }
 }

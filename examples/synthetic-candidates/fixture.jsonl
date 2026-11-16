@@ -1,0 +1,1 @@
+{"parent_id":"toy-parent-1","book_id":"toy-book-1","split":"train","patient":"toy-a","required_weeks":6,"documents":[{"id":"current","patient":"toy-a","current":true,"weeks":6},{"id":"stale","patient":"toy-a","current":false,"weeks":8},{"id":"wrong-patient","patient":"toy-b","current":true,"weeks":12}]}

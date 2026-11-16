@@ -771,6 +771,8 @@ pub struct JobError {
 pub mod error_codes {
     /// The job's model could not be loaded or served.
     pub const MODEL_LOAD_FAILED: &str = "model_load_failed";
+    /// A required warehouse could not be written and verified. Checkpoints remain available for resume.
+    pub const WAREHOUSE_PUBLICATION_FAILED: &str = "warehouse_publication_failed";
     /// A guest tried to reach something its spec does not grant.
     pub const CAPABILITY_DENIED: &str = "capability_denied";
     /// Job input did not match the spec's declared shape.
