@@ -65,7 +65,7 @@ rusqlite = { workspace = true }
 base64 = "0.23"
 # Document reading. Pure Rust and always on — extraction is the cheap path that
 # works with any text model.
-lopdf = "0.44"
+lopdf = "0.47"
 pdf-extract = "0.12"
 # Pinned to a pdfium API version rather than `latest`. pdfium is loaded at
 # runtime, so the crate's expected symbol set has to be no newer than the
