@@ -46,6 +46,10 @@
       in
       {
         devShells.default = pkgs.mkShell {
+          # libclang loads bindgen, but it does not teach it where Nix keeps
+          # libc's headers. The hook supplies the target's include paths so
+          # the optional llama.cpp bindings also build outside an FHS host.
+          nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
           buildInputs = [
             pkgs.python312
             pkgs.uv          # python env / runner
