@@ -336,6 +336,18 @@ impl RhaiBlock {
             );
         }
 
+        // Rhai's map formatter without its metadata feature uses Rust
+        // debug escapes such as `\u{2009}`, which JSON parsers reject.
+        // Keep stage-boundary strings genuine JSON without rewriting the
+        // strings themselves or enabling unrelated metadata machinery.
+        engine.register_fn(
+            "to_json",
+            |map: &mut rhai::Map| -> Result<String, Box<rhai::EvalAltResult>> {
+                serde_json::to_string(map)
+                    .map_err(|e| format!("to_json: serializing script map: {e}").into())
+            },
+        );
+
         engine.register_fn(
             "parse_json",
             |text: &str| -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
@@ -970,6 +982,38 @@ mod tests {
                 assert!(message.contains("diverged"), "{message}");
             }
             other => panic!("expected a nondeterministic_replay Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_to_json_preserves_unicode_and_nested_json_values() {
+        let input = serde_json::json!({
+            "thin\u{2009}key": "two\u{2009}words",
+            "nested": {
+                "array": ["snowman \u{2603}", "astral \u{1f680}", "\"quoted\"", "back\\slash"],
+                "controls": "nul\0 tab\t newline\n return\r backspace\u{8} formfeed\u{c}",
+                "literal_escape": "\\u{2009}",
+                "empty": "",
+                "truth": true,
+                "nothing": null,
+                "count": 7,
+                "fraction": 1.25
+            }
+        });
+        let block = RhaiBlock {
+            script: "#{ encoded: input.to_json(), decoded: parse_json(input.to_json()) }".into(),
+            input: input.clone(),
+            log: Vec::new(),
+            pending_command: None,
+        };
+        match block.run() {
+            Command::Done { result } => {
+                let decoded: serde_json::Value =
+                    serde_json::from_str(result["encoded"].as_str().unwrap()).unwrap();
+                assert_eq!(decoded, input);
+                assert_eq!(result["decoded"], input);
+            }
+            other => panic!("expected a lossless JSON round trip, got {other:?}"),
         }
     }
 
