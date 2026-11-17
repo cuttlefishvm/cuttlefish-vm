@@ -110,6 +110,42 @@ async fn a_rhai_scripted_block_computes_pure_output_through_the_real_host() {
 }
 
 #[tokio::test]
+async fn a_script_map_survives_a_json_stage_boundary_without_changing_unicode() {
+    let input = serde_json::json!({
+        "thin\u{2009}key": "one\u{2009}two",
+        "nested": [
+            {"text": "\"quoted\"\n\t\0\\", "emoji": "\u{1f680}"},
+            {"literal": "\\u{2009}", "value": null, "enabled": true}
+        ]
+    });
+    let (tx, _rx) = mpsc::channel(64);
+    let job = JobSpec {
+        nodes: vec![script_node("parse_json(input.to_json())")],
+        exclusive_to: HashMap::new(),
+        input: input.clone(),
+        caps: Capabilities::new(Vec::new()),
+        alternates: Default::default(),
+        embedder: None,
+        warehouse: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ledger =
+        cuttlefish_host::ledger::Ledger::open(&dir.path().join("ledger.sqlite"), "fp").unwrap();
+    let envelope = run_job(
+        Arc::new(Engine::default()),
+        Arc::new(StubBackend::default()),
+        job,
+        tx,
+        CancellationToken::new(),
+        &ledger,
+        &ModuleCache::new(),
+    )
+    .await;
+    assert_eq!(envelope.status, JobStatus::Completed, "{envelope:?}");
+    assert_eq!(envelope.result, Some(input));
+}
+
+#[tokio::test]
 async fn a_rhai_script_can_round_trip_an_infer_call_through_the_real_host() {
     let script = "#{ summary: infer(\"summarize: \" + input.text, 32) }";
     let (tx, _rx) = mpsc::channel(64);
